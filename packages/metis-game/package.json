@@ -1,0 +1,16 @@
+{
+    "name": "metis-game",
+    "module": "src/index.ts",
+    "type": "module",
+    "private": true,
+    "devDependencies": {
+        "@types/bun": "latest"
+    },
+    "peerDependencies": {
+        "typescript": "^5"
+    },
+    "dependencies": {
+        "bun-webgpu-rs": "workspace:*",
+        "wgpu-matrix": "^3.4.2"
+    }
+}

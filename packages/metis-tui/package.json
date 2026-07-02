@@ -1,0 +1,22 @@
+{
+    "name": "metis-tui",
+    "module": "src/index.tsx",
+    "type": "module",
+    "private": true,
+    "scripts": {
+        "dev": "bun run --watch src/index.tsx"
+    },
+    "devDependencies": {
+        "@types/bun": "latest",
+        "@types/react": "^19.2.17"
+    },
+    "peerDependencies": {
+        "typescript": "^6"
+    },
+    "dependencies": {
+        "@opentui/core": "^0.4.2",
+        "@opentui/keymap": "^0.4.2",
+        "@opentui/react": "^0.4.2",
+        "react": "^19.2.7"
+    }
+}

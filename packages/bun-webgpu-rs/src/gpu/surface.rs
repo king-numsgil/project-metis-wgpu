@@ -1,0 +1,307 @@
+﻿use super::adapter::GpuAdapter;
+use super::convert;
+use super::device::GpuDevice;
+use super::texture::GpuTextureView;
+use crate::sdl::window::SdlWindow;
+use napi_derive::napi;
+use std::sync::{Arc, Mutex};
+
+// ── Platform-specific raw handle extraction via SDL3's property API ───────────
+
+#[cfg(target_os = "windows")]
+pub(crate) fn get_raw_handles(
+    raw: *mut sdl3_sys::video::SDL_Window,
+) -> napi::Result<(raw_window_handle::RawWindowHandle, raw_window_handle::RawDisplayHandle)> {
+    use raw_window_handle::{RawDisplayHandle, RawWindowHandle, Win32WindowHandle, WindowsDisplayHandle};
+    use sdl3_sys::properties::SDL_GetPointerProperty;
+    use sdl3_sys::video::SDL_GetWindowProperties;
+
+    let props = unsafe { SDL_GetWindowProperties(raw) };
+    let hwnd = unsafe {
+        SDL_GetPointerProperty(
+            props,
+            c"SDL.window.win32.hwnd".as_ptr(),
+            std::ptr::null_mut(),
+        )
+    };
+    if hwnd.is_null() {
+        return Err(napi::Error::new(
+            napi::Status::GenericFailure,
+            "SDL3 did not provide a Win32 HWND for this window",
+        ));
+    }
+    // Try SDL3's property first; fall back to the process HINSTANCE via
+    // GetModuleHandleW(NULL), which Vulkan's WSI requires and is always valid.
+    extern "system" { fn GetModuleHandleW(lp: *const u16) -> *mut core::ffi::c_void; }
+    let hinstance = unsafe {
+        let sdl_inst = SDL_GetPointerProperty(
+            props,
+            c"SDL.window.win32.hinstance".as_ptr(),
+            std::ptr::null_mut(),
+        );
+        if sdl_inst.is_null() { GetModuleHandleW(std::ptr::null()) } else { sdl_inst }
+    };
+    let mut handle = Win32WindowHandle::new(
+        std::num::NonZeroIsize::new(hwnd as isize)
+            .ok_or_else(|| napi::Error::new(napi::Status::GenericFailure, "Win32 HWND is zero"))?,
+    );
+    handle.hinstance = std::num::NonZeroIsize::new(hinstance as isize);
+    Ok((
+        RawWindowHandle::Win32(handle),
+        RawDisplayHandle::Windows(WindowsDisplayHandle::new()),
+    ))
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn get_raw_handles(
+    raw: *mut sdl3_sys::video::SDL_Window,
+) -> napi::Result<(raw_window_handle::RawWindowHandle, raw_window_handle::RawDisplayHandle)> {
+    use raw_window_handle::{AppKitDisplayHandle, AppKitWindowHandle, RawDisplayHandle, RawWindowHandle};
+    use sdl3_sys::properties::SDL_GetPointerProperty;
+    use sdl3_sys::video::SDL_GetWindowProperties;
+
+    let props = unsafe { SDL_GetWindowProperties(raw) };
+    let ns_window = unsafe {
+        SDL_GetPointerProperty(
+            props,
+            c"SDL.window.cocoa.window".as_ptr(),
+            std::ptr::null_mut(),
+        )
+    };
+    let ns_window = std::ptr::NonNull::new(ns_window).ok_or_else(|| {
+        napi::Error::new(napi::Status::GenericFailure, "SDL3 did not provide an NSWindow for this window")
+    })?;
+    Ok((
+        RawWindowHandle::AppKit(AppKitWindowHandle::new(ns_window.cast())),
+        RawDisplayHandle::AppKit(AppKitDisplayHandle::new()),
+    ))
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn get_raw_handles(
+    raw: *mut sdl3_sys::video::SDL_Window,
+) -> napi::Result<(raw_window_handle::RawWindowHandle, raw_window_handle::RawDisplayHandle)> {
+    use raw_window_handle::{
+        RawDisplayHandle, RawWindowHandle,
+        WaylandDisplayHandle, WaylandWindowHandle,
+        XlibDisplayHandle, XlibWindowHandle,
+    };
+    use sdl3_sys::properties::{SDL_GetNumberProperty, SDL_GetPointerProperty};
+    use sdl3_sys::video::SDL_GetWindowProperties;
+
+    let props = unsafe { SDL_GetWindowProperties(raw) };
+
+    // Prefer Wayland when available.
+    let wl_display = unsafe {
+        SDL_GetPointerProperty(props, c"SDL.window.wayland.display".as_ptr(), std::ptr::null_mut())
+    };
+    if !wl_display.is_null() {
+        let wl_surface = unsafe {
+            SDL_GetPointerProperty(props, c"SDL.window.wayland.surface".as_ptr(), std::ptr::null_mut())
+        };
+        let wl_surface = std::ptr::NonNull::new(wl_surface).ok_or_else(|| {
+            napi::Error::new(napi::Status::GenericFailure, "SDL3 Wayland surface pointer is null")
+        })?;
+        let wl_display = std::ptr::NonNull::new(wl_display).unwrap();
+        return Ok((
+            RawWindowHandle::Wayland(WaylandWindowHandle::new(wl_surface)),
+            RawDisplayHandle::Wayland(WaylandDisplayHandle::new(wl_display)),
+        ));
+    }
+
+    // Fall back to X11.
+    let x11_display = unsafe {
+        SDL_GetPointerProperty(props, c"SDL.window.x11.display".as_ptr(), std::ptr::null_mut())
+    };
+    let x11_display = std::ptr::NonNull::new(x11_display).ok_or_else(|| {
+        napi::Error::new(napi::Status::GenericFailure, "SDL3 did not provide an X11 Display for this window")
+    })?;
+    let x11_window =
+        unsafe { SDL_GetNumberProperty(props, c"SDL.window.x11.window".as_ptr(), 0) } as u64;
+    Ok((
+        RawWindowHandle::Xlib(XlibWindowHandle::new(x11_window)),
+        RawDisplayHandle::Xlib(XlibDisplayHandle::new(Some(x11_display.cast()), 0)),
+    ))
+}
+
+// ── Surface configuration ─────────────────────────────────────────────────────
+
+#[napi(object)]
+pub struct SurfaceConfiguration {
+    pub width: u32,
+    pub height: u32,
+    pub format: Option<String>,
+    #[napi(ts_type = "GPUPresentMode")]
+    pub present_mode: Option<String>,
+    #[napi(ts_type = "GPUAlphaMode")]
+    pub alpha_mode: Option<String>,
+}
+
+// ── GpuSurface ────────────────────────────────────────────────────────────────
+
+#[napi]
+pub struct GpuSurface {
+    pub(crate) inner: wgpu::Surface<'static>,
+    pub(crate) adapter: Arc<wgpu::Adapter>,
+}
+
+// wgpu explicitly unsafe-impl's Send+Sync for Surface on native targets.
+unsafe impl Send for GpuSurface {}
+unsafe impl Sync for GpuSurface {}
+
+#[napi]
+impl GpuSurface {
+    /// Returns the adapter's preferred texture format for this surface.
+    #[napi(ts_return_type = "GPUTextureFormat")]
+    pub fn get_preferred_format(&self) -> napi::Result<String> {
+        let caps = self.inner.get_capabilities(&self.adapter);
+        caps.formats
+            .first()
+            .map(|f| convert::texture_format_to_str(*f).to_string())
+            .ok_or_else(|| {
+                napi::Error::new(napi::Status::GenericFailure, "No supported surface formats")
+            })
+    }
+
+    /// Configure the swapchain. Must be called before the first `getCurrentTexture()` and
+    /// again whenever the window is resized.
+    #[napi]
+    pub fn configure(&self, device: &GpuDevice, config: SurfaceConfiguration) -> napi::Result<()> {
+        if config.width == 0 || config.height == 0 {
+            return Err(napi::Error::new(
+                napi::Status::InvalidArg,
+                "Surface width and height must be > 0",
+            ));
+        }
+
+        let caps = self.inner.get_capabilities(&self.adapter);
+
+        let format = if let Some(ref f) = config.format {
+            convert::texture_format(f)?
+        } else {
+            *caps.formats.first().ok_or_else(|| {
+                napi::Error::new(napi::Status::GenericFailure, "No supported surface formats")
+            })?
+        };
+
+        let present_mode = match config.present_mode.as_deref() {
+            Some("fifo") => wgpu::PresentMode::Fifo,
+            Some("mailbox") => wgpu::PresentMode::Mailbox,
+            Some("immediate") => wgpu::PresentMode::Immediate,
+            Some("auto-no-vsync") => wgpu::PresentMode::AutoNoVsync,
+            _ => wgpu::PresentMode::AutoVsync,
+        };
+
+        let alpha_mode = match config.alpha_mode.as_deref() {
+            Some("premultiplied") => wgpu::CompositeAlphaMode::PreMultiplied,
+            Some("postmultiplied") => wgpu::CompositeAlphaMode::PostMultiplied,
+            Some("inherit") => wgpu::CompositeAlphaMode::Inherit,
+            _ => *caps.alpha_modes.first().unwrap_or(&wgpu::CompositeAlphaMode::Auto),
+        };
+
+        self.inner.configure(
+            &device.inner,
+            &wgpu::SurfaceConfiguration {
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                format,
+                width: config.width,
+                height: config.height,
+                present_mode,
+                alpha_mode,
+                view_formats: Vec::new(),
+                desired_maximum_frame_latency: 2,
+            },
+        );
+        Ok(())
+    }
+
+    /// Acquire the next swapchain image. Call `present()` on the returned
+    /// `GpuSurfaceTexture` after submitting your render commands.
+    #[napi]
+    pub fn get_current_texture(&self) -> napi::Result<GpuSurfaceTexture> {
+        let frame = self
+            .inner
+            .get_current_texture()
+            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
+        Ok(GpuSurfaceTexture {
+            inner: Mutex::new(Some(frame)),
+        })
+    }
+}
+
+// ── GpuSurfaceTexture ─────────────────────────────────────────────────────────
+
+#[napi]
+pub struct GpuSurfaceTexture {
+    inner: Mutex<Option<wgpu::SurfaceTexture>>,
+}
+
+// SurfaceTexture is Send on native wgpu backends; we need the unsafe impl
+// because the Box<dyn Any> detail field lacks an explicit Send bound in wgpu's
+// public API even though all native impls are Send.
+unsafe impl Send for GpuSurfaceTexture {}
+unsafe impl Sync for GpuSurfaceTexture {}
+
+#[napi]
+impl GpuSurfaceTexture {
+    /// Create a view into the surface texture for use as a render attachment.
+    #[napi]
+    pub fn create_view(&self) -> napi::Result<GpuTextureView> {
+        let guard = self.inner.lock().unwrap();
+        let frame = guard.as_ref().ok_or_else(|| {
+            napi::Error::new(napi::Status::GenericFailure, "Surface texture already presented")
+        })?;
+        let view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        Ok(GpuTextureView {
+            inner: Arc::new(view),
+        })
+    }
+
+    /// Present the frame to the window. Must be called after queue.submit().
+    #[napi]
+    pub fn present(&self) -> napi::Result<()> {
+        let frame = self.inner.lock().unwrap().take().ok_or_else(|| {
+            napi::Error::new(napi::Status::GenericFailure, "Surface texture already presented")
+        })?;
+        frame.present();
+        Ok(())
+    }
+
+    /// `true` when the swapchain is still functional but reconfiguring it would
+    /// improve performance (e.g. after a resize).
+    #[napi(getter)]
+    pub fn suboptimal(&self) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|f| f.suboptimal)
+            .unwrap_or(false)
+    }
+}
+
+// ── Factory function ──────────────────────────────────────────────────────────
+
+/// Create a wgpu rendering surface backed by an SDL3 window.
+///
+/// The `SdlWindow` must remain alive (and unclosed) for the entire lifetime of
+/// the returned `GpuSurface`.
+#[napi]
+pub fn create_surface(adapter: &GpuAdapter, window: &SdlWindow) -> napi::Result<GpuSurface> {
+    let (raw_window_handle, raw_display_handle) = get_raw_handles(window.raw_ptr())?;
+    let surface = unsafe {
+        adapter
+            .instance
+            .create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
+                raw_window_handle,
+                raw_display_handle,
+            })
+    }
+        .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
+    Ok(GpuSurface {
+        inner: surface,
+        adapter: Arc::clone(&adapter.inner),
+    })
+}
