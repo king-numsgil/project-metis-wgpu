@@ -3,6 +3,7 @@ import { useRenderer } from "@opentui/react";
 import { type ReactNode } from "react";
 import { CapacitorPanel } from "./panels/Capacitor.tsx";
 import { CoolingPanel } from "./panels/Cooling.tsx";
+import { DrivePanel } from "./panels/Drive.tsx";
 import { ReactorPanel } from "./panels/Reactor.tsx";
 import { REAL_MINUTES_PER_TICK_SECOND } from "./physics/time.ts";
 import { ShipProvider } from "./state/ship.tsx";
@@ -42,6 +43,7 @@ export function App(): ReactNode {
                 <CapacitorPanel/>
                 <CoolingPanel/>
                 <ReactorPanel/>
+                <DrivePanel/>
             </box>
             <box alignItems="flex-end">
                 <text fg="#444444">1s = {REAL_MINUTES_PER_TICK_SECOND}min ship time</text>

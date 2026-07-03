@@ -1,4 +1,4 @@
-import type { MouseEvent } from "@opentui/core";
+import { MouseButton, type MouseEvent } from "@opentui/core";
 import { type ReactNode, useCallback, useState } from "react";
 
 interface KnobMode {
@@ -29,7 +29,8 @@ function Knob({modes, initialIndex = 0, onChange, label, width = 14}: KnobProps)
     const [hovered, setHovered] = useState<boolean>(false);
 
     const handleClick = useCallback((event: MouseEvent): void => {
-        const nextIndex = (index + 1) % modes.length;
+        const step = event.button === MouseButton.RIGHT ? -1 : 1;
+        const nextIndex = (index + step + modes.length) % modes.length;
         setIndex(nextIndex);
         onChange?.(nextIndex, modes[nextIndex]!);
         event.stopPropagation();

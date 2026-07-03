@@ -23,4 +23,19 @@ function formatFlowKgS(kgS: number): string {
     return `${Math.round(kgS).toLocaleString()} kg/s`;
 }
 
-export {formatFlowKgS, formatFluxWm2, formatKelvin, formatPJPerSecond, formatTW};
+function formatThrustN(newtons: number): string {
+    if (newtons >= 1e9) return `${(newtons / 1e9).toFixed(2)} GN`;
+    if (newtons >= 1e6) return `${(newtons / 1e6).toFixed(2)} MN`;
+    if (newtons >= 1e3) return `${(newtons / 1e3).toFixed(2)} kN`;
+    return `${newtons.toFixed(1)} N`;
+}
+
+function formatVelocityKmS(mPerS: number): string {
+    return `${Math.round(mPerS / 1000).toLocaleString()} km/s`;
+}
+
+function formatMassKg(kg: number): string {
+    return `${(kg / 1000).toLocaleString(undefined, {maximumFractionDigits: 1})} t`;
+}
+
+export {formatFlowKgS, formatFluxWm2, formatKelvin, formatMassKg, formatPJPerSecond, formatThrustN, formatTW, formatVelocityKmS};

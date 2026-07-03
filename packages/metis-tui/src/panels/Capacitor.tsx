@@ -8,7 +8,7 @@ import { NoPower } from "../components/NoPower.tsx";
 import { Switch } from "../components/Switch.tsx";
 import { formatPJPerSecond } from "../format.ts";
 import { FOLD_REFERENCE, pjFromPercent } from "../physics/fold.ts";
-import { reactorPowerWatts } from "../physics/torch.ts";
+import { grossJetPowerWatts, INDUCTION_COIL_POWER_SKIM_FRACTION, LASER_DRIVER_FRACTION, reactorPowerWatts } from "../physics/torch.ts";
 import {
     AUX_CAPACITY_PJ,
     AUX_RECHARGE_SKIM,
@@ -41,7 +41,14 @@ export function CapacitorPanel(): ReactNode {
     const fedByReactor = state.reactorState === "running" && state.reactorCoupled;
     const primaryBlocked = !state.primaryBusConnected && state.primaryCap < PRIMARY_BUS_MIN_CHARGE;
 
-    const primaryInW = fedByReactor ? reactorPowerWatts(state.fuelFlowGramsPerSec) : 0;
+    // Matches shipSim.ts's tick handler exactly: thrust engaged means the
+    // plasma's going out the nozzle, so only the induction coil's skim
+    // reaches the primary cap instead of the full net-of-driver-tax rate.
+    const primaryInW = fedByReactor
+        ? state.thrustEngaged
+            ? grossJetPowerWatts(state.fuelFlowGramsPerSec) * INDUCTION_COIL_POWER_SKIM_FRACTION
+            : reactorPowerWatts(state.fuelFlowGramsPerSec) * (1 - LASER_DRIVER_FRACTION)
+        : 0;
     const primaryOutW =
         (state.primaryPumpPowered ? PUMP_DRAW_W : 0) +
         (state.secondaryPumpPowered ? PUMP_DRAW_W : 0) +
@@ -49,7 +56,9 @@ export function CapacitorPanel(): ReactNode {
         (state.secondaryPumpPriming ? PUMP_PRIME_DRAW_W : 0) +
         (state.reactorState === "starting" ? IGNITION_DRAW_W : 0);
 
-    const auxInW = fedByReactor ? reactorPowerWatts(state.fuelFlowGramsPerSec) * AUX_RECHARGE_SKIM : 0;
+    // Aux gets a skim of whatever the primary actually receives, not of raw
+    // reactor output — so it drops in step with the primary during thrust too.
+    const auxInW = fedByReactor ? primaryInW * AUX_RECHARGE_SKIM : 0;
     const auxOutW = activeAux * AUX_SYSTEM_DRAW_W;
 
     return <box
