@@ -4,10 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-A Bun/TypeScript game-engine monorepo backed by a Rust native addon. The two packages are:
+A Bun/TypeScript game-engine monorepo backed by a Rust native addon. The packages are:
 
 - **`packages/bun-webgpu-rs`** — Rust napi-rs crate that exposes WebGPU (wgpu 24) and SDL3 to Bun/Node. See its own [`CLAUDE.md`](packages/bun-webgpu-rs/CLAUDE.md) for detailed build rules, napi-rs constraints, SDL3 quirks, and GPU pitfalls.
 - **`packages/metis-game`** — TypeScript game that consumes `bun-webgpu-rs` via the `workspace:*` dependency.
+- **`packages/metis-tui`** — standalone OpenTUI (`@opentui/core`/`@opentui/react`) terminal-UI ship-systems sim; doesn't depend on the other two packages. See its own [`CLAUDE.md`](packages/metis-tui/CLAUDE.md).
 
 ## Commands
 

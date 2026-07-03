@@ -2,7 +2,10 @@ import { useBindings } from "@opentui/keymap/react";
 import { useRenderer } from "@opentui/react";
 import { type ReactNode } from "react";
 import { CapacitorPanel } from "./panels/Capacitor.tsx";
+import { CoolingPanel } from "./panels/Cooling.tsx";
 import { ReactorPanel } from "./panels/Reactor.tsx";
+import { REAL_MINUTES_PER_TICK_SECOND } from "./physics/time.ts";
+import { ShipProvider } from "./state/ship.tsx";
 
 export function App(): ReactNode {
     const renderer = useRenderer();
@@ -28,13 +31,21 @@ export function App(): ReactNode {
         ],
     }), [renderer]);
 
-    return <box
-        alignItems="flex-start"
-        justifyContent="flex-start"
-        flexGrow={1}
-        flexDirection="row"
-    >
-        <CapacitorPanel/>
-        <ReactorPanel/>
-    </box>;
+    return <ShipProvider>
+        <box flexDirection="column" flexGrow={1}>
+            <box
+                alignItems="flex-start"
+                justifyContent="flex-start"
+                flexGrow={1}
+                flexDirection="row"
+            >
+                <CapacitorPanel/>
+                <CoolingPanel/>
+                <ReactorPanel/>
+            </box>
+            <box alignItems="flex-end">
+                <text fg="#444444">1s = {REAL_MINUTES_PER_TICK_SECOND}min ship time</text>
+            </box>
+        </box>
+    </ShipProvider>;
 }

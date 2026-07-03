@@ -4,7 +4,8 @@
     "type": "module",
     "private": true,
     "scripts": {
-        "dev": "bun run --watch src/index.tsx"
+        "dev": "bun run --watch src/index.tsx",
+        "fixture": "bun run test/fixture.tsx"
     },
     "devDependencies": {
         "@types/bun": "latest",
