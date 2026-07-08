@@ -11,7 +11,7 @@ export interface Environment {
     /** Direction the light *travels* (sun -> scene), normalized. */
     sunDirection: Vec3Arg;
     sunColor: [number, number, number];
-    /** Radiance scale (arbitrary linear units — tune against `math/Tonemapping and exposure formulas.md`'s EV100 reference table). */
+    /** Radiance scale (arbitrary linear units). The auto-exposure pass meters the scene to middle grey (`math/Tonemapping and exposure formulas.md`, Formula 2), so absolute magnitude mostly sets brightness *relative* to the ambient/point-light terms rather than final screen brightness. */
     sunIntensity: number;
     ambientColor: [number, number, number];
     ambientIntensity: number;

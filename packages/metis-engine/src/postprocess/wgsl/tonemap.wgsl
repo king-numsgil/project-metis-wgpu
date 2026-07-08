@@ -1,7 +1,7 @@
 // Fullscreen-triangle pass: exposure * ACES filmic tonemap. No sampler is
 // needed since output resolution always matches the HDR input 1:1 —
 // textureLoad reads the exact texel. See math/Tonemapping and exposure
-// formulas.md (Formula 2, Narkowicz 2015 ACES fit) for the curve derivation.
+// formulas.md (Formula 4, Narkowicz 2015 ACES fit) for the curve derivation.
 
 @group(0) @binding(0) var hdrTex: texture_2d<f32>;
 @group(0) @binding(1) var<storage, read> exposureBuf: array<f32>;

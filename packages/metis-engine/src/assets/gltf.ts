@@ -19,8 +19,10 @@ import type { MeshData } from "./primitives";
  * triangle-list primitives with `POSITION` + `NORMAL` (required) and
  * `TEXCOORD_0` (optional, defaults to (0,0)) as `f32` accessors; `u16` or
  * `u32` indices; and `pbrMetallicRoughness` factors only — any texture
- * reference is ignored with a warning, since `Material` doesn't support
- * textures (see math/PBR shading formulas.md).
+ * reference is ignored with a warning. `Material` itself *does* support
+ * textures (see math/PBR shading formulas.md); this loader simply reads no
+ * image data, samplers, or `TANGENT` accessor yet, so glTF textures aren't
+ * wired through.
  */
 
 interface GltfAccessor {
