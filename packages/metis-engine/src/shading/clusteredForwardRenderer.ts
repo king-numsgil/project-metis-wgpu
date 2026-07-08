@@ -20,6 +20,8 @@ import forwardWgsl from "./wgsl/forward.wgsl" with { type: "text" };
 import lightCullWgsl from "./wgsl/light_cull.wgsl" with { type: "text" };
 import shadowWgsl from "./wgsl/shadow.wgsl" with { type: "text" };
 import shadowResolveWgsl from "./wgsl/shadow_resolve.wgsl" with { type: "text" };
+import { AmbientOcclusion } from "../ao/ambientOcclusion";
+import { AoTechnique } from "../ao/aoConfig";
 import { DEPTH_FORMAT, HDR_COLOR_FORMAT, MSAA_SAMPLE_COUNT, type RenderTargets } from "../rhi/targets";
 import { MESH_VERTEX_LAYOUT } from "../scene/mesh";
 import type { Scene } from "../scene/scene";
@@ -92,7 +94,9 @@ export class ClusteredForwardRenderer {
 
     private readonly cameraBuffer: GpuBuffer;
     private readonly environmentBuffer: GpuBuffer;
-    private readonly frameBindGroup: GpuBindGroup;
+
+    /** Screen-space ambient occlusion (None/SSAO/HBAO). Set `.technique` to switch; applied to the ambient term only. */
+    readonly ao: AmbientOcclusion;
 
     // Clustered light culling — see math/Clustered forward formulas.md.
     private readonly clusterParamsBuffer: GpuBuffer;
@@ -136,6 +140,7 @@ export class ClusteredForwardRenderer {
                 { binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "unfilterable-float" } },
                 { binding: 3, visibility: GPUShaderStage.FRAGMENT, sampler: { samplerType: "non-filtering" } },
                 { binding: 4, visibility: GPUShaderStage.FRAGMENT, buffer: { bindingType: "uniform" } },
+                { binding: 5, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "unfilterable-float" } }, // AO
             ],
         });
         this.materialBindGroupLayout = device.createBindGroupLayout({
@@ -235,17 +240,10 @@ export class ClusteredForwardRenderer {
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
 
-        this.frameBindGroup = device.createBindGroup({
-            label: "metis-engine/frame-bind-group",
-            layout: this.frameBindGroupLayout,
-            entries: [
-                { binding: 0, buffer: { buffer: this.cameraBuffer } },
-                { binding: 1, buffer: { buffer: this.environmentBuffer } },
-                { binding: 2, textureView: this.shadowMapView },
-                { binding: 3, sampler: this.shadowSampler },
-                { binding: 4, buffer: { buffer: this.shadowUniformBuffer } },
-            ],
-        });
+        // The frame bind group is rebuilt each frame because binding 5 (the AO
+        // result) changes on resize; the AO subsystem owns the geometry prepass
+        // + SSAO/HBAO + blur that feed it. See src/ao/ambientOcclusion.ts.
+        this.ao = new AmbientOcclusion(device, this.modelBindGroupLayout);
 
         const shadowFrameBGL = device.createBindGroupLayout({
             label: "metis-engine/shadow-frame-bgl",
@@ -538,6 +536,28 @@ export class ClusteredForwardRenderer {
         this.renderShadowPass(encoder, scene);
         this.cullLights(encoder);
 
+        // Ambient occlusion (feeds the forward pass's ambient term). `None`
+        // clears the result to white so the forward multiply is a no-op.
+        this.ao.ensureSize(targets.width, targets.height);
+        if (this.ao.technique === AoTechnique.None) {
+            this.ao.clearToWhite(encoder);
+        } else {
+            this.ao.render(encoder, scene, targets);
+        }
+
+        const frameBindGroup = this.device.createBindGroup({
+            label: "metis-engine/frame-bind-group",
+            layout: this.frameBindGroupLayout,
+            entries: [
+                { binding: 0, buffer: { buffer: this.cameraBuffer } },
+                { binding: 1, buffer: { buffer: this.environmentBuffer } },
+                { binding: 2, textureView: this.shadowMapView },
+                { binding: 3, sampler: this.shadowSampler },
+                { binding: 4, buffer: { buffer: this.shadowUniformBuffer } },
+                { binding: 5, textureView: this.ao.resultView },
+            ],
+        });
+
         const pass = encoder.beginRenderPass({
             label: "metis-engine/forward-pass",
             colorAttachments: [
@@ -558,7 +578,7 @@ export class ClusteredForwardRenderer {
         });
 
         pass.setPipeline(this.pipeline);
-        pass.setBindGroup(0, this.frameBindGroup);
+        pass.setBindGroup(0, frameBindGroup);
         pass.setBindGroup(3, this.clusterLightsBindGroup);
 
         for (const instance of scene.instances) {
@@ -582,5 +602,6 @@ export class ClusteredForwardRenderer {
         this.shadowMap.destroy();
         this.shadowDepthMap.destroy();
         this.shadowUniformBuffer.destroy();
+        this.ao.destroy();
     }
 }

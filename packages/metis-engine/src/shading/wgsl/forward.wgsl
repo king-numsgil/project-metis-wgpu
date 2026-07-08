@@ -6,6 +6,7 @@
 @group(0) @binding(2) var shadowMap: texture_2d<f32>; // moments: E[z], E[z^2], E[z^3], E[z^4]
 @group(0) @binding(3) var shadowSampler: sampler; // non-filtering — rgba32float has no linear-filter support
 @group(0) @binding(4) var<uniform> shadowUniforms: ShadowUniforms;
+@group(0) @binding(5) var aoTex: texture_2d<f32>; // screen-space ambient occlusion (r8, 1 = fully open)
 
 @group(1) @binding(0) var<uniform> material: Material;
 @group(1) @binding(1) var matSampler: sampler;
@@ -216,8 +217,15 @@ fn fs(input: VertexOutput) -> @location(0) vec4<f32> {
     let sunVisibility = sampleSunShadow(input.worldPosition, geometricNormal);
     color += shadeLight(N, V, sunL, sunRadiance, albedo, metallic, roughness) * sunVisibility;
 
-    // Flat ambient fill (the documented handwave for bounce light indoors).
-    color += environment.ambientColorIntensity.rgb * environment.ambientColorIntensity.a * albedo;
+    // Flat ambient fill (the documented handwave for bounce light indoors),
+    // attenuated by screen-space ambient occlusion. AO approximates how much of
+    // the surrounding hemisphere is blocked by nearby geometry, so it modulates
+    // *only* this indirect/ambient term — never the sun or point lights, whose
+    // occlusion is the shadow map's job. The AO buffer is full-res single-sample
+    // (the forward pass is MSAA); fragCoord indexes it 1:1. When AO is disabled
+    // the renderer clears this buffer to white, so this is a no-op multiply.
+    let ao = textureLoad(aoTex, vec2<i32>(input.clipPosition.xy), 0).r;
+    color += environment.ambientColorIntensity.rgb * environment.ambientColorIntensity.a * albedo * ao;
 
     // Clustered point lights — look up this fragment's cluster and shade
     // only the lights the culling compute pass assigned to it.

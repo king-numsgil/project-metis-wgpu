@@ -64,6 +64,13 @@ src/
                 std140.ts     — hand-rolled uniform/storage buffer byte-packing (WGSL's std140-ish
                                  alignment rules: vec3 pads to 16 bytes, a following scalar packs into
                                  that gap, mat4 is 4 vec4 columns)
+  ao/           ambientOcclusion.ts — screen-space AO subsystem owned by the forward
+                                 renderer: a geometry prepass (view-space normals + depth) ->
+                                 SSAO or HBAO -> box blur, feeding the forward pass's ambient term
+                aoConfig.ts   — the AoTechnique enum (None/SSAO/HBAO) + per-technique tunables
+                aoKernel.ts   — deterministic SSAO hemisphere kernel + rotation-noise generators
+                                 (pure, unit-tested); wgsl/ao_prepass|ssao|hbao|ao_blur.wgsl
+                                 — see math/Ambient occlusion formulas.md
   postprocess/  pipeline.ts   — PostProcessPass interface + PostProcessPipeline; createDefaultPostProcessPipeline()
                                  wires the three passes below into the standard chain
                 luminanceAverage.ts, autoExposure.ts, tonemap.ts — HDR forward output -> measure
@@ -96,6 +103,10 @@ math/           formula references cited by the shading code, following the same
 ### Exterior vs. interior is data, not code
 
 There's no `if (interior)` branch anywhere in the shading code. `Environment.ambientIntensity` (near 0 for `createExteriorEnvironment()`, a small nonzero value for `createInteriorEnvironment()`) is the only lighting-model difference between the two; the visual difference between the exterior and interior demos comes from geometry (a room shell with an actual hole cut into one wall — `assets/primitives.ts`'s `roomBox()`) and the directional shadow map actually occluding the sun everywhere except through that hole. See `math/PBR shading formulas.md`'s "ambient / exterior vs. interior" section.
+
+### Ambient occlusion is a swappable enum, and only touches the ambient term
+
+`ClusteredForwardRenderer` owns an `AmbientOcclusion` (`src/ao/`); set `renderer.ao.technique` to `AoTechnique.None`, `.SSAO`, or `.HBAO` (a runtime quality dial — the interior demo cycles it with the `O` key). When active it runs three passes *before* the forward pass — a geometry prepass (view-space normals + depth), the chosen occlusion technique (`ssao.wgsl`/`hbao.wgsl`, fullscreen), and a box blur — and `forward.wgsl` multiplies the result into **only** the flat ambient term. That last part is the load-bearing correctness point: AO approximates occlusion of *indirect/bounce* light, so it must never darken the sun or point lights (their occlusion is the shadow map's job). Multiplying the whole lit image by AO — which some engines do — double-darkens shadowed creases and is wrong. `None` is branchless: the renderer clears the AO buffer to white so the forward multiply is a no-op, mirroring the always-bound-placeholder pattern the material textures already use. Both techniques' math (and the deliberate normal-oriented HBAO tangent simplification) is in `math/Ambient occlusion formulas.md`; `test/ao.test.ts` validates the kernel generators on the CPU and, via GPU readback + a `pushErrorScope`, that each technique darkens a box's contact creases without any swallowed WGSL validation error. The prepass is a *second* geometry pass (a production engine would share a depth prepass); at this engine's scale the duplicate draw is cheap and keeps AO decoupled from the forward path.
 
 ### Why MSAA — and a misdiagnosis worth knowing about
 

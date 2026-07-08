@@ -26,6 +26,19 @@ export { ClusteredForwardRenderer } from "./shading/clusteredForwardRenderer";
 export * from "./shading/clusterConfig";
 export { Std140Writer } from "./shading/std140";
 
+export { AmbientOcclusion } from "./ao/ambientOcclusion";
+export {
+    AoTechnique,
+    AO_NOISE_DIM,
+    HBAO_DEFAULTS,
+    HBAO_DIRECTIONS,
+    HBAO_STEPS,
+    SSAO_DEFAULTS,
+    SSAO_KERNEL_SIZE,
+} from "./ao/aoConfig";
+export type { AoTuning } from "./ao/aoConfig";
+export { generateAoNoise, generateSsaoKernel, mulberry32 } from "./ao/aoKernel";
+
 export {
     createDefaultPostProcessPipeline,
     PostProcessPipeline,

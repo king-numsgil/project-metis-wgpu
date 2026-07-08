@@ -11,6 +11,7 @@ import { Material } from "../src/scene/material";
 import { Mesh } from "../src/scene/mesh";
 import { Scene } from "../src/scene/scene";
 import { createDefaultPostProcessPipeline } from "../src/postprocess/pipeline";
+import { AoTechnique } from "../src/ao/aoConfig";
 import { RenderContext } from "../src/rhi/context";
 import { ClusteredForwardRenderer } from "../src/shading/clusteredForwardRenderer";
 import { VectorText } from "../src/text/vectorText";
@@ -22,6 +23,10 @@ const FONT_PATH = new URL("../../../assets/JetBrainsMono-Regular.ttf", import.me
 
 const ctx = await RenderContext.createWindowed("metis-engine — interior demo", { width: 1280, height: 720 });
 const forward = new ClusteredForwardRenderer(ctx.device);
+// Ambient occlusion quality dial — press O to cycle None / SSAO / HBAO.
+const AO_CYCLE = [AoTechnique.None, AoTechnique.SSAO, AoTechnique.HBAO];
+let aoIndex = 2; // start on HBAO
+forward.ao.technique = AO_CYCLE[aoIndex]!;
 const post = createDefaultPostProcessPipeline(ctx.device);
 const hud = new VectorText(ctx.device, ctx.outputFormat);
 hud.loadFont("mono", FONT_PATH);
@@ -90,7 +95,12 @@ while (running) {
         if (e.type === SdlEventType.WindowCloseRequested || e.type === SdlEventType.Quit) running = false;
         if (e.type === SdlEventType.KeyDown) {
             if (e.keycode === SdlKeycode.Escape) running = false;
-            else if (e.keycode !== undefined) keys.add(e.keycode);
+            // Cycle AO on the leading edge only (ignore key-repeat).
+            else if (e.keycode === SdlKeycode.O && !keys.has(SdlKeycode.O)) {
+                aoIndex = (aoIndex + 1) % AO_CYCLE.length;
+                forward.ao.technique = AO_CYCLE[aoIndex]!;
+                keys.add(e.keycode);
+            } else if (e.keycode !== undefined) keys.add(e.keycode);
         }
         if (e.type === SdlEventType.KeyUp && e.keycode !== undefined) keys.delete(e.keycode);
     }
@@ -125,7 +135,13 @@ while (running) {
         height: ctx.height,
         deltaTime: dt,
     });
-    hud.drawText("METIS-ENGINE // INTERIOR — WASD+QE fly, arrows look, Esc quit", "mono", 16, 12, 24);
+    hud.drawText(
+        `METIS-ENGINE // INTERIOR — WASD+QE fly, arrows look, O: AO=${AO_CYCLE[aoIndex]!.toUpperCase()}, Esc quit`,
+        "mono",
+        16,
+        12,
+        24,
+    );
     hud.render(encoder, frame.view, ctx.width, ctx.height, [0.85, 0.95, 1.0, 1.0]);
     ctx.device.queue.submit([encoder.finish()]);
     frame.present();
