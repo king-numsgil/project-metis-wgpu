@@ -1,0 +1,21 @@
+{
+    "name": "metis-engine",
+    "module": "src/index.ts",
+    "type": "module",
+    "private": true,
+    "scripts": {
+        "fixture": "bun run test/fixture.ts",
+        "demo:exterior": "bun run examples/exterior-demo.ts",
+        "demo:interior": "bun run examples/interior-demo.ts"
+    },
+    "devDependencies": {
+        "@types/bun": "latest"
+    },
+    "peerDependencies": {
+        "typescript": "^6"
+    },
+    "dependencies": {
+        "bun-webgpu-rs": "workspace:*",
+        "wgpu-matrix": "^3.4.2"
+    }
+}

@@ -1,0 +1,4 @@
+node_modules
+# Downloaded third-party sample assets — re-fetched on demand.
+test/assets-cache/
+examples/.asset-cache/

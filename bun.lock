@@ -24,6 +24,19 @@
         "typescript": "^6.0.0",
       },
     },
+    "packages/metis-engine": {
+      "name": "metis-engine",
+      "dependencies": {
+        "bun-webgpu-rs": "workspace:*",
+        "wgpu-matrix": "^3.4.2",
+      },
+      "devDependencies": {
+        "@types/bun": "latest",
+      },
+      "peerDependencies": {
+        "typescript": "^6",
+      },
+    },
     "packages/metis-game": {
       "name": "metis-game",
       "dependencies": {
@@ -336,6 +349,8 @@
     "json-with-bigint": ["json-with-bigint@3.5.8", "", {}, "sha512-eq/4KP6K34kwa7TcFdtvnftvHCD9KvHOGGICWwMFc4dOOKF5t4iYqnfLK8otCRCRv06FXOzGGyqE8h8ElMvvdw=="],
 
     "marked": ["marked@17.0.1", "", { "bin": { "marked": "bin/marked.js" } }, "sha512-boeBdiS0ghpWcSwoNm/jJBwdpFaMnZWRzjA6SkUMYb40SVaN1x7mmfGKp0jvexGcx+7y2La5zRZsYFZI6Qpypg=="],
+
+    "metis-engine": ["metis-engine@workspace:packages/metis-engine"],
 
     "metis-game": ["metis-game@workspace:packages/metis-game"],
 

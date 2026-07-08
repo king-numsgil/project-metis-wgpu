@@ -1,0 +1,242 @@
+// Depth-tested forward vertex+fragment pass. Concatenated after common.wgsl
+// by clusteredForwardRenderer.ts (WGSL has no #include — see that file).
+
+@group(0) @binding(0) var<uniform> camera: Camera;
+@group(0) @binding(1) var<uniform> environment: Environment;
+@group(0) @binding(2) var shadowMap: texture_2d<f32>; // moments: E[z], E[z^2], E[z^3], E[z^4]
+@group(0) @binding(3) var shadowSampler: sampler; // non-filtering — rgba32float has no linear-filter support
+@group(0) @binding(4) var<uniform> shadowUniforms: ShadowUniforms;
+
+@group(1) @binding(0) var<uniform> material: Material;
+@group(1) @binding(1) var matSampler: sampler;
+@group(1) @binding(2) var albedoTex: texture_2d<f32>;
+@group(1) @binding(3) var normalTex: texture_2d<f32>;
+@group(1) @binding(4) var metallicTex: texture_2d<f32>;
+@group(1) @binding(5) var roughnessTex: texture_2d<f32>;
+@group(1) @binding(6) var emissiveTex: texture_2d<f32>;
+
+@group(2) @binding(0) var<uniform> modelUniform: Model;
+
+@group(3) @binding(0) var<uniform> clusterParams: ClusterParams;
+@group(3) @binding(1) var<storage, read> pointLights: array<GpuPointLight>;
+@group(3) @binding(2) var<storage, read> clusterLightCounts: array<u32>;
+@group(3) @binding(3) var<storage, read> clusterLightIndices: array<u32>;
+
+struct VertexInput {
+    @location(0) position: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) tangent: vec4<f32>, // xyz = tangent, w = bitangent sign
+    @location(3) uv: vec2<f32>,
+};
+
+struct VertexOutput {
+    @builtin(position) clipPosition: vec4<f32>,
+    @location(0) worldPosition: vec3<f32>,
+    @location(1) worldNormal: vec3<f32>,
+    @location(2) uv: vec2<f32>,
+    @location(3) viewZ: f32,
+    @location(4) worldTangent: vec4<f32>,
+};
+
+// Shadow map is SHADOW_MAP_SIZE x SHADOW_MAP_SIZE (clusteredForwardRenderer.ts) — keep in sync.
+const SHADOW_TEXEL_SIZE: f32 = 1.0 / 2048.0;
+
+// Hausdorff 4-moment shadow mapping (Peters & Klein 2015, Algorithm 4 /
+// supplementary Listing 4): reconstructs an occlusion estimate from the first
+// four power moments of the light-space occluder depth distribution
+// (E[z]..E[z^4], written by shadow.wgsl's fragment shader) via a Cholesky
+// factorization of their Hankel matrix, then evaluates the sharpest lower
+// bound on the CDF at the query depth — *constrained to distributions
+// supported on [0,1]*.
+//
+// That constraint is the entire reason this is the Hausdorff variant and not
+// the paper's default Hamburger variant (support on all of R, previously used
+// here): for the single-occluder texels this renderer's unfiltered shadow map
+// always produces, the Hamburger bound "explains" the moments with phantom
+// mass at *negative* depth, which yields the infamous VSM-style light-bleeding
+// tail — reconstructed visibility falls off only as ~var/gap^2, so a sun
+// bright enough to blow out through a window (as in the interior scene) makes
+// even 0.1% residual visibility glow, producing meters-long bleed gradients
+// hugging every concave corner. Depths outside [0,1] cannot exist in a shadow
+// map, and forbidding them makes the bound collapse to an exact step for a
+// delta-distribution texel: working Algorithm 4's four-support-point branch
+// through by hand for moments b = (z0, z0², z0³, z0⁴), the free root lands
+// exactly at zFree = z0 and the intensity term reduces to exactly 1 for
+// query > z0 and exactly 0 for query < z0, independent of the gap size —
+// verified in fp32 emulation against real GPU-readback corner data (gaps down
+// to 3.4e-4 reconstruct occlusion 1.00000, lit surfaces 0.00002). Genuinely
+// mixed-surface moments (e.g. from PCF-footprint averaging) still take the
+// smooth three-support-point path, identical to Hamburger.
+fn computeMsmOcclusion(rawMoments: vec4<f32>, queryDepth: f32) -> f32 {
+    // Moment bias: blend a hair toward (0.5,0.5,0.5,0.5) so the Hankel matrix
+    // below is never exactly singular (a texel with ~zero variance — which is
+    // every texel here, since nothing is prefiltered before this point —
+    // would otherwise divide by ~0). The (0.5,...) target is verbatim from
+    // the reference listings — an earlier version used the *true* moments of
+    // a uniform [0,1] distribution ((0.5, 1/3, 0.5, 0.2)) instead, which was
+    // a real, user-visible regression: the asymmetric target skews the
+    // reconstruction wherever the true depth sits far from 0.5 (most of this
+    // scene). 1e-5 rather than the paper's 3e-5 (theirs compensates 16-bit
+    // quantization this rgba32float map doesn't have): the smaller bias
+    // halves the width of the residual not-yet-shadowed band at a concave
+    // corner, and fp32 emulation puts the numerical cliff (Cholesky NaN) two
+    // orders of magnitude lower, at ~3e-7.
+    let momentBias = 1e-5;
+    let b = mix(rawMoments, vec4<f32>(0.5, 0.5, 0.5, 0.5), momentBias);
+    let zx = queryDepth;
+
+    // Cholesky factorization of the Hankel matrix built from the moments,
+    // producing the coefficients of a quadratic whose roots (zy, zz) are the
+    // other support points of the canonical distribution through (zx, b).
+    let l32d22 = b.x * -b.y + b.z;
+    let d22 = -b.x * b.x + b.y;
+    let squaredDepthVariance = -b.y * b.y + b.w;
+    let d33d22 = dot(vec2<f32>(squaredDepthVariance, -l32d22), vec2<f32>(d22, l32d22));
+    let invD22 = 1.0 / d22;
+    let l32 = l32d22 * invD22;
+
+    var c: vec3<f32> = vec3<f32>(1.0, zx, zx * zx);
+    c.y = c.y - b.x;
+    c.z = c.z - b.y - l32 * c.y;
+    c.y = c.y * invD22;
+    c.z = c.z * (d22 / d33d22);
+    c.y = c.y - l32 * c.z;
+    c.x = c.x - dot(c.yz, b.xy);
+
+    let invC2 = 1.0 / c.z;
+    let p = c.y * invC2;
+    let q = c.x * invC2;
+    let discriminant = max((p * p * 0.25) - q, 0.0);
+    let r = sqrt(discriminant);
+    let zy = -p * 0.5 - r;
+    let zz = -p * 0.5 + r;
+
+    var shadowIntensity: f32;
+    if (zy < 0.0 || zz > 1.0) {
+        // The three-support solution needs mass outside [0,1] — impossible
+        // for shadow-map depths. Use the four-support solution with points
+        // {0, zFree, zx, 1} instead (paper Proposition 11 / Algorithm 4 step
+        // 6). This is the branch every hard single-occluder texel takes, and
+        // the one that eliminates the light-bleeding tail.
+        let zFree = ((b.z - b.y) * zx + b.z - b.w) / ((b.y - b.x) * zx + b.y - b.z);
+        let w1Factor = select(0.0, 1.0, zx > zFree);
+        shadowIntensity = (b.y - b.x + (b.z - b.x - (zFree + 1.0) * (b.y - b.x)) * (zFree - w1Factor - zx) / (zx * (zx - zFree))) / (zFree - w1Factor) + 1.0 - b.x;
+    } else {
+        // Well-posed three-support solution — the smooth path genuinely
+        // mixed-depth moments take.
+        var switchVal: vec4<f32>;
+        if (zz < zx) {
+            switchVal = vec4<f32>(zy, zx, 1.0, 1.0);
+        } else if (zy < zx) {
+            switchVal = vec4<f32>(zx, zy, 0.0, 1.0);
+        } else {
+            switchVal = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+        }
+        let quotient = (switchVal.x * zz - b.x * (switchVal.x + zz) + b.y) / ((zz - switchVal.y) * (zx - zy));
+        shadowIntensity = switchVal.z + switchVal.w * quotient;
+    }
+    return clamp(shadowIntensity, 0.0, 1.0);
+}
+
+// Fragments outside the shadow frustum default to fully lit — the frustum is
+// fit to the scene's bounding sphere each frame (see
+// clusteredForwardRenderer.ts), so this only matters for stray geometry well
+// outside it.
+fn sampleSunShadow(worldPosition: vec3<f32>, N: vec3<f32>) -> f32 {
+    // Normal offset: insurance against self-shadowing on sloped/curved
+    // receivers. Sized in *shadow texels*, not absolute units: the 3x3 PCF
+    // taps sample texels up to sqrt(2) texels away but compare against this
+    // fragment's own query depth, so on a sloped receiver the neighbors'
+    // stored depths differ by up to ~1.4 texel-footprints of surface slope —
+    // the offset must clear that. 0.04 ≈ 2.5 texels at 2048 over this
+    // scene's ~17.5-unit shadow frustum (the old 0.02 was tuned at 4096 and
+    // measurably failed at 2048: a sunlit 60°-lit floor read 0.81 visibility
+    // because the diagonal taps' slope delta exceeded the offset's depth
+    // margin). If SHADOW_MAP_SIZE or the scene scale changes, rescale this.
+    let offsetPosition = worldPosition + N * 0.04;
+    let lightClip = shadowUniforms.lightViewProj * vec4<f32>(offsetPosition, 1.0);
+    let shadowUV = lightClip.xy * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5, 0.5);
+    let depth = lightClip.z;
+
+    if (shadowUV.x < 0.0 || shadowUV.x > 1.0 || shadowUV.y < 0.0 || shadowUV.y > 1.0 || depth < 0.0 || depth > 1.0) {
+        return 1.0;
+    }
+
+    var sum = 0.0;
+    for (var dy = -1; dy <= 1; dy++) {
+        for (var dx = -1; dx <= 1; dx++) {
+            let offset = vec2<f32>(f32(dx), f32(dy)) * SHADOW_TEXEL_SIZE;
+            let moments = textureSampleLevel(shadowMap, shadowSampler, shadowUV + offset, 0.0);
+            sum += 1.0 - computeMsmOcclusion(moments, depth);
+        }
+    }
+    return sum / 9.0;
+}
+
+@vertex
+fn vs(input: VertexInput) -> VertexOutput {
+    var out: VertexOutput;
+    let worldPos4 = modelUniform.model * vec4<f32>(input.position, 1.0);
+    out.worldPosition = worldPos4.xyz;
+    out.worldNormal = normalize(modelUniform.normalMat * input.normal);
+    out.worldTangent = vec4<f32>(normalize(modelUniform.normalMat * input.tangent.xyz), input.tangent.w);
+    out.uv = input.uv;
+    out.viewZ = (camera.view * worldPos4).z;
+    out.clipPosition = camera.viewProj * worldPos4;
+    return out;
+}
+
+@fragment
+fn fs(input: VertexOutput) -> @location(0) vec4<f32> {
+    let geometricNormal = normalize(input.worldNormal);
+    let V = normalize(camera.position - input.worldPosition);
+
+    // Tangent-space normal map -> world space, via the per-vertex TBN basis.
+    // `albedoTex`/`normalTex`/etc. default to neutral 1x1 placeholders when a
+    // material has no texture of that kind (see scene/material.ts), so this
+    // is a no-op for factor-only materials.
+    let T = normalize(input.worldTangent.xyz);
+    let B = cross(geometricNormal, T) * input.worldTangent.w;
+    let tbn = mat3x3<f32>(T, B, geometricNormal);
+    let normalSample = textureSample(normalTex, matSampler, input.uv).rgb * 2.0 - 1.0;
+    let N = normalize(tbn * normalSample);
+
+    let albedo = material.baseColor.rgb * textureSample(albedoTex, matSampler, input.uv).rgb;
+    let metallic = clamp(material.metallicRoughness.x * textureSample(metallicTex, matSampler, input.uv).r, 0.0, 1.0);
+    let roughness = clamp(material.metallicRoughness.y * textureSample(roughnessTex, matSampler, input.uv).r, 0.045, 1.0);
+    let emissive = material.emissive * textureSample(emissiveTex, matSampler, input.uv).rgb;
+
+    var color = vec3<f32>(0.0);
+
+    // Directional sun — always present; "interior" vs "exterior" is purely
+    // ambientIntensity + whether geometry (now including real shadowing)
+    // lets the sun reach the fragment.
+    let sunL = normalize(-environment.sunDirection);
+    let sunRadiance = environment.sunColorIntensity.rgb * environment.sunColorIntensity.a;
+    let sunVisibility = sampleSunShadow(input.worldPosition, geometricNormal);
+    color += shadeLight(N, V, sunL, sunRadiance, albedo, metallic, roughness) * sunVisibility;
+
+    // Flat ambient fill (the documented handwave for bounce light indoors).
+    color += environment.ambientColorIntensity.rgb * environment.ambientColorIntensity.a * albedo;
+
+    // Clustered point lights — look up this fragment's cluster and shade
+    // only the lights the culling compute pass assigned to it.
+    let linearDepth = -input.viewZ;
+    let clusterIndex = clusterIndexFromFragment(input.clipPosition.xy, linearDepth, clusterParams);
+    let maxPerCluster = clusterParams.clusterCounts.w;
+    let lightCountInCluster = clusterLightCounts[clusterIndex];
+    for (var i: u32 = 0u; i < lightCountInCluster; i = i + 1u) {
+        let lightIndex = clusterLightIndices[clusterIndex * maxPerCluster + i];
+        let light = pointLights[lightIndex];
+        let toLight = light.worldPosition - input.worldPosition;
+        let dist = length(toLight);
+        let L = toLight / max(dist, 1e-5);
+        let attenuation = pointLightAttenuation(dist, light.range);
+        let radiance = light.color * light.intensity * attenuation;
+        color += shadeLight(N, V, L, radiance, albedo, metallic, roughness);
+    }
+
+    color += emissive;
+
+    return vec4<f32>(color, material.baseColor.a);
+}

@@ -8,7 +8,8 @@ A Bun/TypeScript game-engine monorepo backed by a Rust native addon. The package
 
 - **`packages/bun-webgpu-rs`** — Rust napi-rs crate that exposes WebGPU (wgpu 24) and SDL3 to Bun/Node. See its own [`CLAUDE.md`](packages/bun-webgpu-rs/CLAUDE.md) for detailed build rules, napi-rs constraints, SDL3 quirks, and GPU pitfalls.
 - **`packages/metis-game`** — TypeScript game that consumes `bun-webgpu-rs` via the `workspace:*` dependency.
-- **`packages/metis-tui`** — standalone OpenTUI (`@opentui/core`/`@opentui/react`) terminal-UI ship-systems sim; doesn't depend on the other two packages. See its own [`CLAUDE.md`](packages/metis-tui/CLAUDE.md).
+- **`packages/metis-engine`** — WebGPU clustered-forward PBR renderer (HDR + auto-exposure post-processing, directional shadow mapping, HUD text via `bun-webgpu-rs`'s `VectorContext`), built on `bun-webgpu-rs`; standalone, no dependency on `metis-game` or `metis-tui` yet. See its own [`CLAUDE.md`](packages/metis-engine/CLAUDE.md).
+- **`packages/metis-tui`** — standalone OpenTUI (`@opentui/core`/`@opentui/react`) terminal-UI ship-systems sim; doesn't depend on the other packages. See its own [`CLAUDE.md`](packages/metis-tui/CLAUDE.md).
 
 ## Commands
 
