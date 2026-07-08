@@ -1,8 +1,8 @@
-import type { GPUTextureFormat, GpuCommandEncoder, GpuDevice, GpuTextureView } from "bun-webgpu-rs";
-import { AutoExposurePass } from "./autoExposure";
-import { ExposureState } from "./exposureState";
-import { LuminanceAveragePass } from "./luminanceAverage";
-import { TonemapPass } from "./tonemap";
+import type { GpuCommandEncoder, GpuDevice, GPUTextureFormat, GpuTextureView } from "bun-webgpu-rs";
+import { AutoExposurePass } from "./autoExposure.ts";
+import { ExposureState } from "./exposureState.ts";
+import { LuminanceAveragePass } from "./luminanceAverage.ts";
+import { TonemapPass } from "./tonemap.ts";
 
 export interface PostProcessFrameContext {
     device: GpuDevice;
@@ -27,12 +27,15 @@ export interface PostProcessFrameContext {
  */
 export interface PostProcessPass {
     readonly name: string;
+
     execute(encoder: GpuCommandEncoder, ctx: PostProcessFrameContext): void;
+
     destroy?(): void;
 }
 
 export class PostProcessPipeline {
-    constructor(private passes: PostProcessPass[]) {}
+    constructor(private passes: PostProcessPass[]) {
+    }
 
     run(encoder: GpuCommandEncoder, ctx: PostProcessFrameContext) {
         for (const pass of this.passes) {
@@ -41,7 +44,9 @@ export class PostProcessPipeline {
     }
 
     destroy() {
-        for (const pass of this.passes) pass.destroy?.();
+        for (const pass of this.passes) {
+            pass.destroy?.();
+        }
     }
 }
 

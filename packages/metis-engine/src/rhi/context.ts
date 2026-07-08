@@ -1,21 +1,21 @@
 import {
     createSurface,
-    GPUTextureUsage,
-    type GPUTextureFormat,
     type GpuAdapter,
     type GpuDevice,
     type GpuSurface,
     type GpuTexture,
+    type GPUTextureFormat,
+    GPUTextureUsage,
     type GpuTextureView,
     requestAdapter,
     requestAdapterForWindow,
-    type SdlWindow,
     sdlCreateWindow,
     sdlInit,
     SdlInitFlag,
     sdlQuit,
+    type SdlWindow,
 } from "bun-webgpu-rs";
-import { RenderTargets } from "./targets";
+import { RenderTargets } from "./targets.ts";
 
 export type PowerPreference = "low-power" | "high-performance";
 export type Backend = "vulkan" | "dx12" | "metal" | "gl";
@@ -31,6 +31,7 @@ export interface RenderContextOptions {
 export interface FrameTarget {
     view: GpuTextureView;
     format: GPUTextureFormat;
+
     present(): void;
 }
 
@@ -70,14 +71,36 @@ export class RenderContext {
         this.window = window;
         this.surface = surface;
         this.targets = new RenderTargets(device, width, height);
-        if (!surface) this.createOffscreenTarget();
+        if (!surface) {
+            this.createOffscreenTarget();
+        }
+    }
+
+    get sdlWindow(): SdlWindow | null {
+        return this.window;
+    }
+
+    get isWindowed(): boolean {
+        return this.surface !== null;
+    }
+
+    /** Format the final post-process pass must target this frame. */
+    get outputFormat(): GPUTextureFormat {
+        return this.surface ? this.surface.getPreferredFormat() : this.offscreenFormat;
+    }
+
+    /** The texture backing the offscreen target — `null` in windowed mode. Read this back with `takeScreenshot`. */
+    get captureTexture(): GpuTexture | null {
+        return this.offscreenTarget;
     }
 
     /** Headless target for the fixture / any automated screenshot check — no SDL window. */
     static async createOffscreen(options: RenderContextOptions): Promise<RenderContext> {
-        const adapter = await requestAdapter({ powerPreference: options.powerPreference });
-        if (!adapter) throw new Error("metis-engine: no GPU adapter available");
-        const device = await adapter.requestDevice({ label: options.label ?? "metis-engine-offscreen" });
+        const adapter = await requestAdapter({powerPreference: options.powerPreference});
+        if (!adapter) {
+            throw new Error("metis-engine: no GPU adapter available");
+        }
+        const device = await adapter.requestDevice({label: options.label ?? "metis-engine-offscreen"});
         return new RenderContext(device, adapter, options.width, options.height, null, null);
     }
 
@@ -99,38 +122,10 @@ export class RenderContext {
             sdlQuit();
             throw new Error("metis-engine: no GPU adapter compatible with this window");
         }
-        const device = await adapter.requestDevice({ label: options.label ?? "metis-engine-windowed" });
+        const device = await adapter.requestDevice({label: options.label ?? "metis-engine-windowed"});
         const surface = createSurface(adapter, window);
-        surface.configure(device, { width: window.width, height: window.height });
+        surface.configure(device, {width: window.width, height: window.height});
         return new RenderContext(device, adapter, window.width, window.height, window, surface);
-    }
-
-    get sdlWindow(): SdlWindow | null {
-        return this.window;
-    }
-
-    get isWindowed(): boolean {
-        return this.surface !== null;
-    }
-
-    /** Format the final post-process pass must target this frame. */
-    get outputFormat(): GPUTextureFormat {
-        return this.surface ? this.surface.getPreferredFormat() : this.offscreenFormat;
-    }
-
-    /** The texture backing the offscreen target — `null` in windowed mode. Read this back with `takeScreenshot`. */
-    get captureTexture(): GpuTexture | null {
-        return this.offscreenTarget;
-    }
-
-    private createOffscreenTarget() {
-        this.offscreenTarget = this.device.createTexture({
-            label: "metis-engine/offscreen-capture",
-            size: { width: this.width, height: this.height },
-            format: this.offscreenFormat,
-            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
-        });
-        this.offscreenView = this.offscreenTarget.createView();
     }
 
     /**
@@ -142,7 +137,7 @@ export class RenderContext {
         if (this.surface) {
             const frame = this.surface.getCurrentTexture();
             if (frame.suboptimal) {
-                this.surface.configure(this.device, { width: this.width, height: this.height });
+                this.surface.configure(this.device, {width: this.width, height: this.height});
             }
             return {
                 view: frame.createView(),
@@ -154,18 +149,21 @@ export class RenderContext {
         return {
             view: this.offscreenView!,
             format: this.outputFormat,
-            present: () => {},
+            present: () => {
+            },
         };
     }
 
     /** Resize the swapchain (windowed) or the offscreen capture texture, plus the shared HDR/depth targets. */
     resize(width: number, height: number) {
-        if (width === this.width && height === this.height) return;
+        if (width === this.width && height === this.height) {
+            return;
+        }
         this.width = width;
         this.height = height;
         this.targets.resize(this.device, width, height);
         if (this.surface) {
-            this.surface.configure(this.device, { width, height });
+            this.surface.configure(this.device, {width, height});
         } else {
             this.offscreenTarget?.destroy();
             this.createOffscreenTarget();
@@ -180,5 +178,15 @@ export class RenderContext {
             this.window.destroy();
             sdlQuit();
         }
+    }
+
+    private createOffscreenTarget() {
+        this.offscreenTarget = this.device.createTexture({
+            label: "metis-engine/offscreen-capture",
+            size: {width: this.width, height: this.height},
+            format: this.offscreenFormat,
+            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+        });
+        this.offscreenView = this.offscreenTarget.createView();
     }
 }

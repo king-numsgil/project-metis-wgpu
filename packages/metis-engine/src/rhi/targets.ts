@@ -1,4 +1,4 @@
-import { GPUTextureUsage, type GpuDevice, type GpuTexture, type GpuTextureView } from "bun-webgpu-rs";
+import { type GpuDevice, type GpuTexture, GPUTextureUsage, type GpuTextureView } from "bun-webgpu-rs";
 
 /** Renderer-owned formats — fixed, not user-tunable (changing them means touching every shader that reads them). */
 export const HDR_COLOR_FORMAT = "rgba16float" as const;
@@ -33,38 +33,10 @@ export class RenderTargets {
         this.create(device);
     }
 
-    private create(device: GpuDevice) {
-        this.hdrColorMultisampled = device.createTexture({
-            label: "metis-engine/hdr-color-msaa",
-            size: { width: this.width, height: this.height },
-            format: HDR_COLOR_FORMAT,
-            sampleCount: MSAA_SAMPLE_COUNT,
-            usage: GPUTextureUsage.RENDER_ATTACHMENT,
-        });
-        this.hdrColorMultisampledView = this.hdrColorMultisampled.createView();
-
-        this.hdrColorResolved = device.createTexture({
-            label: "metis-engine/hdr-color-resolved",
-            size: { width: this.width, height: this.height },
-            format: HDR_COLOR_FORMAT,
-            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
-        });
-        this.hdrColorResolvedView = this.hdrColorResolved.createView();
-
-        this.depth = device.createTexture({
-            label: "metis-engine/depth",
-            size: { width: this.width, height: this.height },
-            format: DEPTH_FORMAT,
-            sampleCount: MSAA_SAMPLE_COUNT,
-            // TEXTURE_BINDING so LuminanceAveragePass can mask out background
-            // (depth == far) pixels when metering exposure.
-            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
-        });
-        this.depthView = this.depth.createView();
-    }
-
     resize(device: GpuDevice, width: number, height: number) {
-        if (width === this.width && height === this.height) return;
+        if (width === this.width && height === this.height) {
+            return;
+        }
         this.hdrColorMultisampled.destroy();
         this.hdrColorResolved.destroy();
         this.depth.destroy();
@@ -77,5 +49,35 @@ export class RenderTargets {
         this.hdrColorMultisampled.destroy();
         this.hdrColorResolved.destroy();
         this.depth.destroy();
+    }
+
+    private create(device: GpuDevice) {
+        this.hdrColorMultisampled = device.createTexture({
+            label: "metis-engine/hdr-color-msaa",
+            size: {width: this.width, height: this.height},
+            format: HDR_COLOR_FORMAT,
+            sampleCount: MSAA_SAMPLE_COUNT,
+            usage: GPUTextureUsage.RENDER_ATTACHMENT,
+        });
+        this.hdrColorMultisampledView = this.hdrColorMultisampled.createView();
+
+        this.hdrColorResolved = device.createTexture({
+            label: "metis-engine/hdr-color-resolved",
+            size: {width: this.width, height: this.height},
+            format: HDR_COLOR_FORMAT,
+            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+        });
+        this.hdrColorResolvedView = this.hdrColorResolved.createView();
+
+        this.depth = device.createTexture({
+            label: "metis-engine/depth",
+            size: {width: this.width, height: this.height},
+            format: DEPTH_FORMAT,
+            sampleCount: MSAA_SAMPLE_COUNT,
+            // TEXTURE_BINDING so LuminanceAveragePass can mask out background
+            // (depth == far) pixels when metering exposure.
+            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+        });
+        this.depthView = this.depth.createView();
     }
 }

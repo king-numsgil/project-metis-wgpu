@@ -2,29 +2,23 @@ import {
     type GpuBindGroup,
     type GpuBindGroupLayout,
     type GpuBuffer,
+    GPUBufferUsage,
     type GpuCommandEncoder,
     type GpuComputePipeline,
     type GpuDevice,
     type GpuRenderPipeline,
     type GpuSampler,
-    type GpuTexture,
-    type GpuTextureView,
-    GPUBufferUsage,
     GPUShaderStage,
+    type GpuTexture,
     GPUTextureUsage,
+    type GpuTextureView,
 } from "bun-webgpu-rs";
 import { mat4, type Mat4Arg, vec3 } from "wgpu-matrix";
-import clusterBuildWgsl from "./wgsl/cluster_build.wgsl" with { type: "text" };
-import commonWgsl from "./wgsl/common.wgsl" with { type: "text" };
-import forwardWgsl from "./wgsl/forward.wgsl" with { type: "text" };
-import lightCullWgsl from "./wgsl/light_cull.wgsl" with { type: "text" };
-import shadowWgsl from "./wgsl/shadow.wgsl" with { type: "text" };
-import shadowResolveWgsl from "./wgsl/shadow_resolve.wgsl" with { type: "text" };
-import { AmbientOcclusion } from "../ao/ambientOcclusion";
-import { AoTechnique } from "../ao/aoConfig";
-import { DEPTH_FORMAT, HDR_COLOR_FORMAT, MSAA_SAMPLE_COUNT, type RenderTargets } from "../rhi/targets";
-import { MESH_VERTEX_LAYOUT } from "../scene/mesh";
-import type { Scene } from "../scene/scene";
+import { AmbientOcclusion } from "../ao/ambientOcclusion.ts";
+import { AoTechnique } from "../ao/aoConfig.ts";
+import { DEPTH_FORMAT, HDR_COLOR_FORMAT, MSAA_SAMPLE_COUNT, type RenderTargets } from "../rhi/targets.ts";
+import { MESH_VERTEX_LAYOUT } from "../scene/mesh.ts";
+import type { Scene } from "../scene/scene.ts";
 import {
     CLUSTER_COUNT_X,
     CLUSTER_COUNT_Y,
@@ -33,8 +27,14 @@ import {
     MAX_LIGHTS_PER_CLUSTER,
     MAX_POINT_LIGHTS,
     NUM_CLUSTERS,
-} from "./clusterConfig";
-import { Std140Writer } from "./std140";
+} from "./clusterConfig.ts";
+import { Std140Writer } from "./std140.ts";
+import clusterBuildWgsl from "./wgsl/cluster_build.wgsl" with { type: "text" };
+import commonWgsl from "./wgsl/common.wgsl" with { type: "text" };
+import forwardWgsl from "./wgsl/forward.wgsl" with { type: "text" };
+import lightCullWgsl from "./wgsl/light_cull.wgsl" with { type: "text" };
+import shadowWgsl from "./wgsl/shadow.wgsl" with { type: "text" };
+import shadowResolveWgsl from "./wgsl/shadow_resolve.wgsl" with { type: "text" };
 
 const CLUSTER_PARAMS_SIZE = 112; // mat4 invProj + vec4 + vec4<u32> + vec4<u32>
 const POINT_LIGHT_STRIDE = 48; // vec3+f32, vec3+f32, vec3+f32(pad)
@@ -85,19 +85,15 @@ const SHADOW_MIN_RADIUS = 4;
  * never go beyond a hardcoded no-vertex-buffer triangle.
  */
 export class ClusteredForwardRenderer {
-    private readonly device: GpuDevice;
-    private readonly pipeline: GpuRenderPipeline;
-
     readonly frameBindGroupLayout: GpuBindGroupLayout;
     readonly materialBindGroupLayout: GpuBindGroupLayout;
     readonly modelBindGroupLayout: GpuBindGroupLayout;
-
-    private readonly cameraBuffer: GpuBuffer;
-    private readonly environmentBuffer: GpuBuffer;
-
     /** Screen-space ambient occlusion (None/SSAO/HBAO). Set `.technique` to switch; applied to the ambient term only. */
     readonly ao: AmbientOcclusion;
-
+    private readonly device: GpuDevice;
+    private readonly pipeline: GpuRenderPipeline;
+    private readonly cameraBuffer: GpuBuffer;
+    private readonly environmentBuffer: GpuBuffer;
     // Clustered light culling — see math/Clustered forward formulas.md.
     private readonly clusterParamsBuffer: GpuBuffer;
     private readonly lightsBuffer: GpuBuffer;
@@ -134,38 +130,38 @@ export class ClusteredForwardRenderer {
                 {
                     binding: 0,
                     visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
-                    buffer: { bindingType: "uniform" },
+                    buffer: {bindingType: "uniform"},
                 },
-                { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { bindingType: "uniform" } },
-                { binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "unfilterable-float" } },
-                { binding: 3, visibility: GPUShaderStage.FRAGMENT, sampler: { samplerType: "non-filtering" } },
-                { binding: 4, visibility: GPUShaderStage.FRAGMENT, buffer: { bindingType: "uniform" } },
-                { binding: 5, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "unfilterable-float" } }, // AO
+                {binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: {bindingType: "uniform"}},
+                {binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: {sampleType: "unfilterable-float"}},
+                {binding: 3, visibility: GPUShaderStage.FRAGMENT, sampler: {samplerType: "non-filtering"}},
+                {binding: 4, visibility: GPUShaderStage.FRAGMENT, buffer: {bindingType: "uniform"}},
+                {binding: 5, visibility: GPUShaderStage.FRAGMENT, texture: {sampleType: "unfilterable-float"}}, // AO
             ],
         });
         this.materialBindGroupLayout = device.createBindGroupLayout({
             label: "metis-engine/material-bgl",
             entries: [
-                { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { bindingType: "uniform" } },
-                { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: { samplerType: "filtering" } },
-                { binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } }, // albedo
-                { binding: 3, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } }, // normal
-                { binding: 4, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } }, // metallic
-                { binding: 5, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } }, // roughness
-                { binding: 6, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } }, // emissive
+                {binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: {bindingType: "uniform"}},
+                {binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: {samplerType: "filtering"}},
+                {binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: {sampleType: "float"}}, // albedo
+                {binding: 3, visibility: GPUShaderStage.FRAGMENT, texture: {sampleType: "float"}}, // normal
+                {binding: 4, visibility: GPUShaderStage.FRAGMENT, texture: {sampleType: "float"}}, // metallic
+                {binding: 5, visibility: GPUShaderStage.FRAGMENT, texture: {sampleType: "float"}}, // roughness
+                {binding: 6, visibility: GPUShaderStage.FRAGMENT, texture: {sampleType: "float"}}, // emissive
             ],
         });
         this.modelBindGroupLayout = device.createBindGroupLayout({
             label: "metis-engine/model-bgl",
-            entries: [{ binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { bindingType: "uniform" } }],
+            entries: [{binding: 0, visibility: GPUShaderStage.VERTEX, buffer: {bindingType: "uniform"}}],
         });
         const clusterLightsBindGroupLayout = device.createBindGroupLayout({
             label: "metis-engine/cluster-lights-bgl",
             entries: [
-                { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { bindingType: "uniform" } },
-                { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { bindingType: "read-only-storage" } },
-                { binding: 2, visibility: GPUShaderStage.FRAGMENT, buffer: { bindingType: "read-only-storage" } },
-                { binding: 3, visibility: GPUShaderStage.FRAGMENT, buffer: { bindingType: "read-only-storage" } },
+                {binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: {bindingType: "uniform"}},
+                {binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: {bindingType: "read-only-storage"}},
+                {binding: 2, visibility: GPUShaderStage.FRAGMENT, buffer: {bindingType: "read-only-storage"}},
+                {binding: 3, visibility: GPUShaderStage.FRAGMENT, buffer: {bindingType: "read-only-storage"}},
             ],
         });
 
@@ -187,11 +183,11 @@ export class ClusteredForwardRenderer {
         this.pipeline = device.createRenderPipeline({
             label: "metis-engine/forward-pipeline",
             layout: pipelineLayout,
-            vertex: { module, entryPoint: "vs", buffers: [MESH_VERTEX_LAYOUT] },
-            fragment: { module, entryPoint: "fs", targets: [{ format: HDR_COLOR_FORMAT }] },
-            primitive: { topology: "triangle-list", cullMode: "back" },
-            depthStencil: { format: DEPTH_FORMAT, depthWriteEnabled: true, depthCompare: "less" },
-            multisample: { count: MSAA_SAMPLE_COUNT },
+            vertex: {module, entryPoint: "vs", buffers: [MESH_VERTEX_LAYOUT]},
+            fragment: {module, entryPoint: "fs", targets: [{format: HDR_COLOR_FORMAT}]},
+            primitive: {topology: "triangle-list", cullMode: "back"},
+            depthStencil: {format: DEPTH_FORMAT, depthWriteEnabled: true, depthCompare: "less"},
+            multisample: {count: MSAA_SAMPLE_COUNT},
         });
 
         this.cameraBuffer = device.createBuffer({
@@ -208,7 +204,7 @@ export class ClusteredForwardRenderer {
         // ── Directional shadow map (moments) ────────────────────────────────
         this.shadowMap = device.createTexture({
             label: "metis-engine/shadow-map-moments",
-            size: { width: SHADOW_MAP_SIZE, height: SHADOW_MAP_SIZE },
+            size: {width: SHADOW_MAP_SIZE, height: SHADOW_MAP_SIZE},
             format: SHADOW_MOMENTS_FORMAT,
             usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
         });
@@ -218,7 +214,7 @@ export class ClusteredForwardRenderer {
         // pass.
         this.shadowDepthMap = device.createTexture({
             label: "metis-engine/shadow-map-depth",
-            size: { width: SHADOW_MAP_SIZE, height: SHADOW_MAP_SIZE },
+            size: {width: SHADOW_MAP_SIZE, height: SHADOW_MAP_SIZE},
             format: SHADOW_DEPTH_FORMAT,
             sampleCount: SHADOW_MSAA_SAMPLES,
             usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
@@ -247,12 +243,12 @@ export class ClusteredForwardRenderer {
 
         const shadowFrameBGL = device.createBindGroupLayout({
             label: "metis-engine/shadow-frame-bgl",
-            entries: [{ binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { bindingType: "uniform" } }],
+            entries: [{binding: 0, visibility: GPUShaderStage.VERTEX, buffer: {bindingType: "uniform"}}],
         });
         this.shadowFrameBindGroup = device.createBindGroup({
             label: "metis-engine/shadow-frame-bind-group",
             layout: shadowFrameBGL,
-            entries: [{ binding: 0, buffer: { buffer: this.shadowUniformBuffer } }],
+            entries: [{binding: 0, buffer: {buffer: this.shadowUniformBuffer}}],
         });
         const shadowModule = device.createShaderModule({
             label: "metis-engine/shadow-shader",
@@ -260,8 +256,8 @@ export class ClusteredForwardRenderer {
         });
         this.shadowPipeline = device.createRenderPipeline({
             label: "metis-engine/shadow-pipeline",
-            layout: device.createPipelineLayout({ bindGroupLayouts: [shadowFrameBGL, this.modelBindGroupLayout] }),
-            vertex: { module: shadowModule, entryPoint: "vs", buffers: [MESH_VERTEX_LAYOUT] },
+            layout: device.createPipelineLayout({bindGroupLayouts: [shadowFrameBGL, this.modelBindGroupLayout]}),
+            vertex: {module: shadowModule, entryPoint: "vs", buffers: [MESH_VERTEX_LAYOUT]},
             // Depth-only (no fragment stage): moments are computed from the
             // multisampled depth by the resolve pass below.
             // No culling: the light's viewpoint has nothing to do with the
@@ -270,9 +266,9 @@ export class ClusteredForwardRenderer {
             // triangles that are front-facing to the camera but back-facing
             // to the light (e.g. viewed from outside/above through a
             // window) — exactly the geometry a shadow pass most needs.
-            primitive: { topology: "triangle-list", cullMode: "none" },
-            depthStencil: { format: SHADOW_DEPTH_FORMAT, depthWriteEnabled: true, depthCompare: "less" },
-            multisample: { count: SHADOW_MSAA_SAMPLES },
+            primitive: {topology: "triangle-list", cullMode: "none"},
+            depthStencil: {format: SHADOW_DEPTH_FORMAT, depthWriteEnabled: true, depthCompare: "less"},
+            multisample: {count: SHADOW_MSAA_SAMPLES},
         });
 
         // Moment-resolve: multisampled shadow depth -> per-texel averaged
@@ -280,13 +276,13 @@ export class ClusteredForwardRenderer {
         const shadowResolveBGL = device.createBindGroupLayout({
             label: "metis-engine/shadow-resolve-bgl",
             entries: [
-                { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "depth", multisampled: true } },
+                {binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: {sampleType: "depth", multisampled: true}},
             ],
         });
         this.shadowResolveBindGroup = device.createBindGroup({
             label: "metis-engine/shadow-resolve-bind-group",
             layout: shadowResolveBGL,
-            entries: [{ binding: 0, textureView: this.shadowDepthMapView }],
+            entries: [{binding: 0, textureView: this.shadowDepthMapView}],
         });
         const shadowResolveModule = device.createShaderModule({
             label: "metis-engine/shadow-resolve-shader",
@@ -294,10 +290,10 @@ export class ClusteredForwardRenderer {
         });
         this.shadowResolvePipeline = device.createRenderPipeline({
             label: "metis-engine/shadow-resolve-pipeline",
-            layout: device.createPipelineLayout({ bindGroupLayouts: [shadowResolveBGL] }),
-            vertex: { module: shadowResolveModule, entryPoint: "vs" },
-            fragment: { module: shadowResolveModule, entryPoint: "fs", targets: [{ format: SHADOW_MOMENTS_FORMAT }] },
-            primitive: { topology: "triangle-list" },
+            layout: device.createPipelineLayout({bindGroupLayouts: [shadowResolveBGL]}),
+            vertex: {module: shadowResolveModule, entryPoint: "vs"},
+            fragment: {module: shadowResolveModule, entryPoint: "fs", targets: [{format: SHADOW_MOMENTS_FORMAT}]},
+            primitive: {topology: "triangle-list"},
         });
 
         // ── Clustered light culling resources ──────────────────────────────
@@ -330,21 +326,21 @@ export class ClusteredForwardRenderer {
         const clusterBuildBGL = device.createBindGroupLayout({
             label: "metis-engine/cluster-build-bgl",
             entries: [
-                { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { bindingType: "uniform" } },
-                { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { bindingType: "storage" } },
+                {binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: {bindingType: "uniform"}},
+                {binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: {bindingType: "storage"}},
             ],
         });
         this.clusterBuildBindGroup = device.createBindGroup({
             label: "metis-engine/cluster-build-bind-group",
             layout: clusterBuildBGL,
             entries: [
-                { binding: 0, buffer: { buffer: this.clusterParamsBuffer } },
-                { binding: 1, buffer: { buffer: this.clusterAABBsBuffer } },
+                {binding: 0, buffer: {buffer: this.clusterParamsBuffer}},
+                {binding: 1, buffer: {buffer: this.clusterAABBsBuffer}},
             ],
         });
         this.clusterBuildPipeline = device.createComputePipeline({
             label: "metis-engine/cluster-build-pipeline",
-            layout: device.createPipelineLayout({ bindGroupLayouts: [clusterBuildBGL] }),
+            layout: device.createPipelineLayout({bindGroupLayouts: [clusterBuildBGL]}),
             compute: {
                 module: device.createShaderModule({
                     label: "metis-engine/cluster-build-shader",
@@ -357,27 +353,27 @@ export class ClusteredForwardRenderer {
         const lightCullBGL = device.createBindGroupLayout({
             label: "metis-engine/light-cull-bgl",
             entries: [
-                { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { bindingType: "uniform" } },
-                { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { bindingType: "read-only-storage" } },
-                { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { bindingType: "read-only-storage" } },
-                { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { bindingType: "storage" } },
-                { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { bindingType: "storage" } },
+                {binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: {bindingType: "uniform"}},
+                {binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: {bindingType: "read-only-storage"}},
+                {binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: {bindingType: "read-only-storage"}},
+                {binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: {bindingType: "storage"}},
+                {binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: {bindingType: "storage"}},
             ],
         });
         this.lightCullBindGroup = device.createBindGroup({
             label: "metis-engine/light-cull-bind-group",
             layout: lightCullBGL,
             entries: [
-                { binding: 0, buffer: { buffer: this.clusterParamsBuffer } },
-                { binding: 1, buffer: { buffer: this.lightsBuffer } },
-                { binding: 2, buffer: { buffer: this.clusterAABBsBuffer } },
-                { binding: 3, buffer: { buffer: this.clusterLightCountsBuffer } },
-                { binding: 4, buffer: { buffer: this.clusterLightIndicesBuffer } },
+                {binding: 0, buffer: {buffer: this.clusterParamsBuffer}},
+                {binding: 1, buffer: {buffer: this.lightsBuffer}},
+                {binding: 2, buffer: {buffer: this.clusterAABBsBuffer}},
+                {binding: 3, buffer: {buffer: this.clusterLightCountsBuffer}},
+                {binding: 4, buffer: {buffer: this.clusterLightIndicesBuffer}},
             ],
         });
         this.lightCullPipeline = device.createComputePipeline({
             label: "metis-engine/light-cull-pipeline",
-            layout: device.createPipelineLayout({ bindGroupLayouts: [lightCullBGL] }),
+            layout: device.createPipelineLayout({bindGroupLayouts: [lightCullBGL]}),
             compute: {
                 module: device.createShaderModule({
                     label: "metis-engine/light-cull-shader",
@@ -391,12 +387,87 @@ export class ClusteredForwardRenderer {
             label: "metis-engine/cluster-lights-bind-group",
             layout: clusterLightsBindGroupLayout,
             entries: [
-                { binding: 0, buffer: { buffer: this.clusterParamsBuffer } },
-                { binding: 1, buffer: { buffer: this.lightsBuffer } },
-                { binding: 2, buffer: { buffer: this.clusterLightCountsBuffer } },
-                { binding: 3, buffer: { buffer: this.clusterLightIndicesBuffer } },
+                {binding: 0, buffer: {buffer: this.clusterParamsBuffer}},
+                {binding: 1, buffer: {buffer: this.lightsBuffer}},
+                {binding: 2, buffer: {buffer: this.clusterLightCountsBuffer}},
+                {binding: 3, buffer: {buffer: this.clusterLightIndicesBuffer}},
             ],
         });
+    }
+
+    render(encoder: GpuCommandEncoder, targets: RenderTargets, scene: Scene) {
+        this.writeFrameUniforms(scene);
+        this.writeClusterData(targets, scene);
+        this.renderShadowPass(encoder, scene);
+        this.cullLights(encoder);
+
+        // Ambient occlusion (feeds the forward pass's ambient term). `None`
+        // clears the result to white so the forward multiply is a no-op.
+        this.ao.ensureSize(targets.width, targets.height);
+        if (this.ao.technique === AoTechnique.None) {
+            this.ao.clearToWhite(encoder);
+        } else {
+            this.ao.render(encoder, scene, targets);
+        }
+
+        const frameBindGroup = this.device.createBindGroup({
+            label: "metis-engine/frame-bind-group",
+            layout: this.frameBindGroupLayout,
+            entries: [
+                {binding: 0, buffer: {buffer: this.cameraBuffer}},
+                {binding: 1, buffer: {buffer: this.environmentBuffer}},
+                {binding: 2, textureView: this.shadowMapView},
+                {binding: 3, sampler: this.shadowSampler},
+                {binding: 4, buffer: {buffer: this.shadowUniformBuffer}},
+                {binding: 5, textureView: this.ao.resultView},
+            ],
+        });
+
+        const pass = encoder.beginRenderPass({
+            label: "metis-engine/forward-pass",
+            colorAttachments: [
+                {
+                    view: targets.hdrColorMultisampledView,
+                    resolveTarget: targets.hdrColorResolvedView,
+                    loadOp: "clear",
+                    storeOp: "discard", // multisampled data is only needed until it's resolved above
+                    clearValue: {r: 0, g: 0, b: 0, a: 1},
+                },
+            ],
+            depthStencilAttachment: {
+                view: targets.depthView,
+                depthLoadOp: "clear",
+                depthStoreOp: "store",
+                depthClearValue: 1.0,
+            },
+        });
+
+        pass.setPipeline(this.pipeline);
+        pass.setBindGroup(0, frameBindGroup);
+        pass.setBindGroup(3, this.clusterLightsBindGroup);
+
+        for (const instance of scene.instances) {
+            pass.setBindGroup(1, instance.material.getBindGroup(this.device, this.materialBindGroupLayout));
+            pass.setBindGroup(2, instance.getModelBindGroup(this.device, this.modelBindGroupLayout));
+            instance.mesh.bind(pass);
+            instance.mesh.draw(pass);
+        }
+
+        pass.end();
+    }
+
+    destroy() {
+        this.cameraBuffer.destroy();
+        this.environmentBuffer.destroy();
+        this.clusterParamsBuffer.destroy();
+        this.lightsBuffer.destroy();
+        this.clusterAABBsBuffer.destroy();
+        this.clusterLightCountsBuffer.destroy();
+        this.clusterLightIndicesBuffer.destroy();
+        this.shadowMap.destroy();
+        this.shadowDepthMap.destroy();
+        this.shadowUniformBuffer.destroy();
+        this.ao.destroy();
     }
 
     private writeFrameUniforms(scene: Scene) {
@@ -440,7 +511,7 @@ export class ClusteredForwardRenderer {
         if (scene.pointLights.length > MAX_POINT_LIGHTS) {
             console.warn(
                 `metis-engine: scene has ${scene.pointLights.length} point lights, ` +
-                    `only the first ${MAX_POINT_LIGHTS} are rendered (MAX_POINT_LIGHTS).`,
+                `only the first ${MAX_POINT_LIGHTS} are rendered (MAX_POINT_LIGHTS).`,
             );
         }
     }
@@ -449,8 +520,12 @@ export class ClusteredForwardRenderer {
     private computeShadowViewProj(scene: Scene): Mat4Arg {
         const instances = scene.instances;
         const center = vec3.create(0, 0, 0);
-        for (const instance of instances) vec3.add(center, instance.transform.position, center);
-        if (instances.length > 0) vec3.scale(center, 1 / instances.length, center);
+        for (const instance of instances) {
+            vec3.add(center, instance.transform.position, center);
+        }
+        if (instances.length > 0) {
+            vec3.scale(center, 1 / instances.length, center);
+        }
 
         let radius = SHADOW_MIN_RADIUS;
         for (const instance of instances) {
@@ -506,7 +581,7 @@ export class ClusteredForwardRenderer {
                     view: this.shadowMapView,
                     loadOp: "clear", // fully overwritten by the fullscreen triangle
                     storeOp: "store",
-                    clearValue: { r: 1, g: 1, b: 1, a: 1 },
+                    clearValue: {r: 1, g: 1, b: 1, a: 1},
                 },
             ],
         });
@@ -517,91 +592,16 @@ export class ClusteredForwardRenderer {
     }
 
     private cullLights(encoder: GpuCommandEncoder) {
-        const buildPass = encoder.beginComputePass({ label: "metis-engine/cluster-build-pass" });
+        const buildPass = encoder.beginComputePass({label: "metis-engine/cluster-build-pass"});
         buildPass.setPipeline(this.clusterBuildPipeline);
         buildPass.setBindGroup(0, this.clusterBuildBindGroup);
         buildPass.dispatchWorkgroups(DISPATCH_GROUPS);
         buildPass.end();
 
-        const cullPass = encoder.beginComputePass({ label: "metis-engine/light-cull-pass" });
+        const cullPass = encoder.beginComputePass({label: "metis-engine/light-cull-pass"});
         cullPass.setPipeline(this.lightCullPipeline);
         cullPass.setBindGroup(0, this.lightCullBindGroup);
         cullPass.dispatchWorkgroups(DISPATCH_GROUPS);
         cullPass.end();
-    }
-
-    render(encoder: GpuCommandEncoder, targets: RenderTargets, scene: Scene) {
-        this.writeFrameUniforms(scene);
-        this.writeClusterData(targets, scene);
-        this.renderShadowPass(encoder, scene);
-        this.cullLights(encoder);
-
-        // Ambient occlusion (feeds the forward pass's ambient term). `None`
-        // clears the result to white so the forward multiply is a no-op.
-        this.ao.ensureSize(targets.width, targets.height);
-        if (this.ao.technique === AoTechnique.None) {
-            this.ao.clearToWhite(encoder);
-        } else {
-            this.ao.render(encoder, scene, targets);
-        }
-
-        const frameBindGroup = this.device.createBindGroup({
-            label: "metis-engine/frame-bind-group",
-            layout: this.frameBindGroupLayout,
-            entries: [
-                { binding: 0, buffer: { buffer: this.cameraBuffer } },
-                { binding: 1, buffer: { buffer: this.environmentBuffer } },
-                { binding: 2, textureView: this.shadowMapView },
-                { binding: 3, sampler: this.shadowSampler },
-                { binding: 4, buffer: { buffer: this.shadowUniformBuffer } },
-                { binding: 5, textureView: this.ao.resultView },
-            ],
-        });
-
-        const pass = encoder.beginRenderPass({
-            label: "metis-engine/forward-pass",
-            colorAttachments: [
-                {
-                    view: targets.hdrColorMultisampledView,
-                    resolveTarget: targets.hdrColorResolvedView,
-                    loadOp: "clear",
-                    storeOp: "discard", // multisampled data is only needed until it's resolved above
-                    clearValue: { r: 0, g: 0, b: 0, a: 1 },
-                },
-            ],
-            depthStencilAttachment: {
-                view: targets.depthView,
-                depthLoadOp: "clear",
-                depthStoreOp: "store",
-                depthClearValue: 1.0,
-            },
-        });
-
-        pass.setPipeline(this.pipeline);
-        pass.setBindGroup(0, frameBindGroup);
-        pass.setBindGroup(3, this.clusterLightsBindGroup);
-
-        for (const instance of scene.instances) {
-            pass.setBindGroup(1, instance.material.getBindGroup(this.device, this.materialBindGroupLayout));
-            pass.setBindGroup(2, instance.getModelBindGroup(this.device, this.modelBindGroupLayout));
-            instance.mesh.bind(pass);
-            instance.mesh.draw(pass);
-        }
-
-        pass.end();
-    }
-
-    destroy() {
-        this.cameraBuffer.destroy();
-        this.environmentBuffer.destroy();
-        this.clusterParamsBuffer.destroy();
-        this.lightsBuffer.destroy();
-        this.clusterAABBsBuffer.destroy();
-        this.clusterLightCountsBuffer.destroy();
-        this.clusterLightIndicesBuffer.destroy();
-        this.shadowMap.destroy();
-        this.shadowDepthMap.destroy();
-        this.shadowUniformBuffer.destroy();
-        this.ao.destroy();
     }
 }

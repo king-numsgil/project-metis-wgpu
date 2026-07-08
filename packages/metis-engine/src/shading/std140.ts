@@ -11,13 +11,6 @@ export class Std140Writer {
     private words: number[] = [];
     private kinds: Array<"f32" | "u32"> = [];
 
-    private align(toWords: number) {
-        while (this.words.length % toWords !== 0) {
-            this.words.push(0);
-            this.kinds.push("f32");
-        }
-    }
-
     f32(v: number): this {
         this.words.push(v);
         this.kinds.push("f32");
@@ -59,14 +52,18 @@ export class Std140Writer {
 
     mat4(m: Mat4Arg): this {
         this.align(4);
-        for (let i = 0; i < 16; i++) this.f32(m[i]!);
+        for (let i = 0; i < 16; i++) {
+            this.f32(m[i]!);
+        }
         return this;
     }
 
     /** `m` must be a wgpu-matrix `Mat3Arg` (12 floats: 3 columns already padded to vec4). */
     mat3(m: Float32Array | Float64Array): this {
         this.align(4);
-        for (let i = 0; i < 12; i++) this.f32(m[i]!);
+        for (let i = 0; i < 12; i++) {
+            this.f32(m[i]!);
+        }
         return this;
     }
 
@@ -84,9 +81,19 @@ export class Std140Writer {
         const buf = new ArrayBuffer(this.words.length * 4);
         const dv = new DataView(buf);
         for (let i = 0; i < this.words.length; i++) {
-            if (this.kinds[i] === "u32") dv.setUint32(i * 4, this.words[i]!, true);
-            else dv.setFloat32(i * 4, this.words[i]!, true);
+            if (this.kinds[i] === "u32") {
+                dv.setUint32(i * 4, this.words[i]!, true);
+            } else {
+                dv.setFloat32(i * 4, this.words[i]!, true);
+            }
         }
         return new Uint8Array(buf);
+    }
+
+    private align(toWords: number) {
+        while (this.words.length % toWords !== 0) {
+            this.words.push(0);
+            this.kinds.push("f32");
+        }
     }
 }

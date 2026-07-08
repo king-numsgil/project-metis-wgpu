@@ -1,6 +1,13 @@
-import { GPUBufferUsage, type GpuBindGroup, type GpuBindGroupLayout, type GpuBuffer, type GpuDevice, type GpuTextureView } from "bun-webgpu-rs";
-import { getMaterialDefaults } from "../assets/texture";
-import { Std140Writer } from "../shading/std140";
+import {
+    type GpuBindGroup,
+    type GpuBindGroupLayout,
+    type GpuBuffer,
+    GPUBufferUsage,
+    type GpuDevice,
+    type GpuTextureView,
+} from "bun-webgpu-rs";
+import { getMaterialDefaults } from "../assets/texture.ts";
+import { Std140Writer } from "../shading/std140.ts";
 
 export interface MaterialParams {
     baseColor?: [number, number, number, number];
@@ -72,13 +79,13 @@ export class Material {
                 label: "metis-engine/material-bind-group",
                 layout,
                 entries: [
-                    { binding: 0, buffer: { buffer: this.buffer } },
-                    { binding: 1, sampler: defaults.sampler },
-                    { binding: 2, textureView: this.albedoTexture ?? defaults.albedo },
-                    { binding: 3, textureView: this.normalTexture ?? defaults.normal },
-                    { binding: 4, textureView: this.metallicTexture ?? defaults.metallic },
-                    { binding: 5, textureView: this.roughnessTexture ?? defaults.roughness },
-                    { binding: 6, textureView: this.emissiveTexture ?? defaults.emissive },
+                    {binding: 0, buffer: {buffer: this.buffer}},
+                    {binding: 1, sampler: defaults.sampler},
+                    {binding: 2, textureView: this.albedoTexture ?? defaults.albedo},
+                    {binding: 3, textureView: this.normalTexture ?? defaults.normal},
+                    {binding: 4, textureView: this.metallicTexture ?? defaults.metallic},
+                    {binding: 5, textureView: this.roughnessTexture ?? defaults.roughness},
+                    {binding: 6, textureView: this.emissiveTexture ?? defaults.emissive},
                 ],
             });
         }

@@ -2,24 +2,20 @@ import {
     type GpuBindGroup,
     type GpuBindGroupLayout,
     type GpuBuffer,
+    GPUBufferUsage,
     type GpuCommandEncoder,
     type GpuDevice,
     type GpuRenderPipeline,
-    type GpuTexture,
-    type GpuTextureView,
-    GPUBufferUsage,
     GPUShaderStage,
+    type GpuTexture,
     GPUTextureUsage,
+    type GpuTextureView,
 } from "bun-webgpu-rs";
 import { mat4 } from "wgpu-matrix";
-import aoBlurWgsl from "./wgsl/ao_blur.wgsl" with { type: "text" };
-import aoPrepassWgsl from "./wgsl/ao_prepass.wgsl" with { type: "text" };
-import hbaoWgsl from "./wgsl/hbao.wgsl" with { type: "text" };
-import ssaoWgsl from "./wgsl/ssao.wgsl" with { type: "text" };
-import { MESH_VERTEX_LAYOUT } from "../scene/mesh";
-import type { RenderTargets } from "../rhi/targets";
-import type { Scene } from "../scene/scene";
-import { Std140Writer } from "../shading/std140";
+import type { RenderTargets } from "../rhi/targets.ts";
+import { MESH_VERTEX_LAYOUT } from "../scene/mesh.ts";
+import type { Scene } from "../scene/scene.ts";
+import { Std140Writer } from "../shading/std140.ts";
 import {
     AO_NOISE_DIM,
     AoTechnique,
@@ -27,8 +23,12 @@ import {
     HBAO_DEFAULTS,
     SSAO_DEFAULTS,
     SSAO_KERNEL_SIZE,
-} from "./aoConfig";
-import { generateAoNoise, generateSsaoKernel } from "./aoKernel";
+} from "./aoConfig.ts";
+import { generateAoNoise, generateSsaoKernel } from "./aoKernel.ts";
+import aoBlurWgsl from "./wgsl/ao_blur.wgsl" with { type: "text" };
+import aoPrepassWgsl from "./wgsl/ao_prepass.wgsl" with { type: "text" };
+import hbaoWgsl from "./wgsl/hbao.wgsl" with { type: "text" };
+import ssaoWgsl from "./wgsl/ssao.wgsl" with { type: "text" };
 
 const NORMAL_FORMAT = "rgba16float" as const;
 const DEPTH_FORMAT = "depth32float" as const;
@@ -49,33 +49,14 @@ const NOISE_BUFFER_SIZE = AO_NOISE_DIM * AO_NOISE_DIM * 16; // vec4 per texel
  * white (`clearToWhite`) so the forward shader can multiply unconditionally.
  */
 export class AmbientOcclusion {
-    private readonly device: GpuDevice;
-
-    private _technique: AoTechnique = AoTechnique.None;
     /** Occlusion radius (world units), self-occlusion bias, strength, and contrast — seeded per technique; see aoConfig.ts. */
     radius = SSAO_DEFAULTS.radius;
     bias = SSAO_DEFAULTS.bias;
     intensity = SSAO_DEFAULTS.intensity;
     power = SSAO_DEFAULTS.power;
-
-    get technique(): AoTechnique {
-        return this._technique;
-    }
-    /** Switching technique reseeds the tunable fields with that technique's defaults (they mean different things per technique — the bias especially). */
-    set technique(t: AoTechnique) {
-        this._technique = t;
-        const defaults: AoTuning | null = t === AoTechnique.SSAO ? SSAO_DEFAULTS : t === AoTechnique.HBAO ? HBAO_DEFAULTS : null;
-        if (defaults) {
-            this.radius = defaults.radius;
-            this.bias = defaults.bias;
-            this.intensity = defaults.intensity;
-            this.power = defaults.power;
-        }
-    }
-
+    private readonly device: GpuDevice;
     private width = 0;
     private height = 0;
-
     // Resized targets.
     private normalTex!: GpuTexture;
     private normalView!: GpuTextureView;
@@ -85,23 +66,19 @@ export class AmbientOcclusion {
     private aoRawView!: GpuTextureView;
     private aoResultTex!: GpuTexture;
     private aoResultView!: GpuTextureView;
-
     // Static resources.
     private readonly uniforms: GpuBuffer;
     private readonly kernelBuffer: GpuBuffer;
     private readonly noiseBuffer: GpuBuffer;
-
     private readonly prepassPipeline: GpuRenderPipeline;
     private readonly ssaoPipeline: GpuRenderPipeline;
     private readonly hbaoPipeline: GpuRenderPipeline;
     private readonly blurPipeline: GpuRenderPipeline;
-
     private readonly prepassCameraLayout: GpuBindGroupLayout;
     private readonly prepassCameraBindGroup: GpuBindGroup;
     private readonly modelBindGroupLayout: GpuBindGroupLayout;
     private readonly samplingLayout: GpuBindGroupLayout;
     private readonly blurLayout: GpuBindGroupLayout;
-
     // Rebuilt on resize (they reference the sized textures).
     private samplingBindGroup!: GpuBindGroup;
     private blurBindGroup!: GpuBindGroup;
@@ -131,65 +108,83 @@ export class AmbientOcclusion {
         // ── Geometry prepass pipeline ───────────────────────────────────────
         this.prepassCameraLayout = device.createBindGroupLayout({
             label: "metis-engine/ao-prepass-camera-bgl",
-            entries: [{ binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { bindingType: "uniform" } }],
+            entries: [{binding: 0, visibility: GPUShaderStage.VERTEX, buffer: {bindingType: "uniform"}}],
         });
         this.prepassCameraBindGroup = device.createBindGroup({
             label: "metis-engine/ao-prepass-camera-bind-group",
             layout: this.prepassCameraLayout,
-            entries: [{ binding: 0, buffer: { buffer: this.uniforms } }],
+            entries: [{binding: 0, buffer: {buffer: this.uniforms}}],
         });
-        const prepassModule = device.createShaderModule({ label: "metis-engine/ao-prepass-shader", code: aoPrepassWgsl });
+        const prepassModule = device.createShaderModule({label: "metis-engine/ao-prepass-shader", code: aoPrepassWgsl});
         this.prepassPipeline = device.createRenderPipeline({
             label: "metis-engine/ao-prepass-pipeline",
-            layout: device.createPipelineLayout({ bindGroupLayouts: [this.prepassCameraLayout, modelBindGroupLayout] }),
-            vertex: { module: prepassModule, entryPoint: "vs", buffers: [MESH_VERTEX_LAYOUT] },
-            fragment: { module: prepassModule, entryPoint: "fs", targets: [{ format: NORMAL_FORMAT }] },
-            primitive: { topology: "triangle-list", cullMode: "back" },
-            depthStencil: { format: DEPTH_FORMAT, depthWriteEnabled: true, depthCompare: "less" },
+            layout: device.createPipelineLayout({bindGroupLayouts: [this.prepassCameraLayout, modelBindGroupLayout]}),
+            vertex: {module: prepassModule, entryPoint: "vs", buffers: [MESH_VERTEX_LAYOUT]},
+            fragment: {module: prepassModule, entryPoint: "fs", targets: [{format: NORMAL_FORMAT}]},
+            primitive: {topology: "triangle-list", cullMode: "back"},
+            depthStencil: {format: DEPTH_FORMAT, depthWriteEnabled: true, depthCompare: "less"},
         });
 
         // ── AO sampling pipelines (SSAO / HBAO) ─────────────────────────────
         this.samplingLayout = device.createBindGroupLayout({
             label: "metis-engine/ao-sampling-bgl",
             entries: [
-                { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { bindingType: "uniform" } },
-                { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "depth" } },
-                { binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "unfilterable-float" } },
-                { binding: 3, visibility: GPUShaderStage.FRAGMENT, buffer: { bindingType: "uniform" } },
-                { binding: 4, visibility: GPUShaderStage.FRAGMENT, buffer: { bindingType: "uniform" } },
+                {binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: {bindingType: "uniform"}},
+                {binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: {sampleType: "depth"}},
+                {binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: {sampleType: "unfilterable-float"}},
+                {binding: 3, visibility: GPUShaderStage.FRAGMENT, buffer: {bindingType: "uniform"}},
+                {binding: 4, visibility: GPUShaderStage.FRAGMENT, buffer: {bindingType: "uniform"}},
             ],
         });
-        const samplingPipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [this.samplingLayout] });
-        const ssaoModule = device.createShaderModule({ label: "metis-engine/ssao-shader", code: ssaoWgsl });
+        const samplingPipelineLayout = device.createPipelineLayout({bindGroupLayouts: [this.samplingLayout]});
+        const ssaoModule = device.createShaderModule({label: "metis-engine/ssao-shader", code: ssaoWgsl});
         this.ssaoPipeline = device.createRenderPipeline({
             label: "metis-engine/ssao-pipeline",
             layout: samplingPipelineLayout,
-            vertex: { module: ssaoModule, entryPoint: "vs" },
-            fragment: { module: ssaoModule, entryPoint: "fs", targets: [{ format: AO_FORMAT }] },
-            primitive: { topology: "triangle-list" },
+            vertex: {module: ssaoModule, entryPoint: "vs"},
+            fragment: {module: ssaoModule, entryPoint: "fs", targets: [{format: AO_FORMAT}]},
+            primitive: {topology: "triangle-list"},
         });
-        const hbaoModule = device.createShaderModule({ label: "metis-engine/hbao-shader", code: hbaoWgsl });
+        const hbaoModule = device.createShaderModule({label: "metis-engine/hbao-shader", code: hbaoWgsl});
         this.hbaoPipeline = device.createRenderPipeline({
             label: "metis-engine/hbao-pipeline",
             layout: samplingPipelineLayout,
-            vertex: { module: hbaoModule, entryPoint: "vs" },
-            fragment: { module: hbaoModule, entryPoint: "fs", targets: [{ format: AO_FORMAT }] },
-            primitive: { topology: "triangle-list" },
+            vertex: {module: hbaoModule, entryPoint: "vs"},
+            fragment: {module: hbaoModule, entryPoint: "fs", targets: [{format: AO_FORMAT}]},
+            primitive: {topology: "triangle-list"},
         });
 
         // ── Blur pipeline ───────────────────────────────────────────────────
         this.blurLayout = device.createBindGroupLayout({
             label: "metis-engine/ao-blur-bgl",
-            entries: [{ binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "unfilterable-float" } }],
+            entries: [{binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: {sampleType: "unfilterable-float"}}],
         });
-        const blurModule = device.createShaderModule({ label: "metis-engine/ao-blur-shader", code: aoBlurWgsl });
+        const blurModule = device.createShaderModule({label: "metis-engine/ao-blur-shader", code: aoBlurWgsl});
         this.blurPipeline = device.createRenderPipeline({
             label: "metis-engine/ao-blur-pipeline",
-            layout: device.createPipelineLayout({ bindGroupLayouts: [this.blurLayout] }),
-            vertex: { module: blurModule, entryPoint: "vs" },
-            fragment: { module: blurModule, entryPoint: "fs", targets: [{ format: AO_FORMAT }] },
-            primitive: { topology: "triangle-list" },
+            layout: device.createPipelineLayout({bindGroupLayouts: [this.blurLayout]}),
+            vertex: {module: blurModule, entryPoint: "vs"},
+            fragment: {module: blurModule, entryPoint: "fs", targets: [{format: AO_FORMAT}]},
+            primitive: {topology: "triangle-list"},
         });
+    }
+
+    private _technique: AoTechnique = AoTechnique.None;
+
+    get technique(): AoTechnique {
+        return this._technique;
+    }
+
+    /** Switching technique reseeds the tunable fields with that technique's defaults (they mean different things per technique — the bias especially). */
+    set technique(t: AoTechnique) {
+        this._technique = t;
+        const defaults: AoTuning | null = t === AoTechnique.SSAO ? SSAO_DEFAULTS : t === AoTechnique.HBAO ? HBAO_DEFAULTS : null;
+        if (defaults) {
+            this.radius = defaults.radius;
+            this.bias = defaults.bias;
+            this.intensity = defaults.intensity;
+            this.power = defaults.power;
+        }
     }
 
     /** The blurred occlusion factor (r8unorm), sampled by the forward pass. Valid after the first `ensureSize`. */
@@ -199,11 +194,13 @@ export class AmbientOcclusion {
 
     /** (Re)allocates the screen-sized targets when the viewport changes. */
     ensureSize(width: number, height: number) {
-        if (width === this.width && height === this.height && this.normalTex) return;
+        if (width === this.width && height === this.height && this.normalTex) {
+            return;
+        }
         this.destroyTextures();
         this.width = width;
         this.height = height;
-        const size = { width, height };
+        const size = {width, height};
 
         this.normalTex = this.device.createTexture({
             label: "metis-engine/ao-view-normal",
@@ -238,30 +235,18 @@ export class AmbientOcclusion {
             label: "metis-engine/ao-sampling-bind-group",
             layout: this.samplingLayout,
             entries: [
-                { binding: 0, buffer: { buffer: this.uniforms } },
-                { binding: 1, textureView: this.depthView },
-                { binding: 2, textureView: this.normalView },
-                { binding: 3, buffer: { buffer: this.kernelBuffer } },
-                { binding: 4, buffer: { buffer: this.noiseBuffer } },
+                {binding: 0, buffer: {buffer: this.uniforms}},
+                {binding: 1, textureView: this.depthView},
+                {binding: 2, textureView: this.normalView},
+                {binding: 3, buffer: {buffer: this.kernelBuffer}},
+                {binding: 4, buffer: {buffer: this.noiseBuffer}},
             ],
         });
         this.blurBindGroup = this.device.createBindGroup({
             label: "metis-engine/ao-blur-bind-group",
             layout: this.blurLayout,
-            entries: [{ binding: 0, textureView: this.aoRawView }],
+            entries: [{binding: 0, textureView: this.aoRawView}],
         });
-    }
-
-    private writeUniforms(scene: Scene) {
-        const proj = scene.camera.projectionMatrix();
-        const w = new Std140Writer();
-        w.mat4(scene.camera.viewMatrix());
-        w.mat4(scene.camera.viewProjectionMatrix());
-        w.mat4(proj);
-        w.mat4(mat4.invert(proj));
-        w.vec4(this.width, this.height, scene.camera.near, scene.camera.far);
-        w.vec4(this.radius, this.bias, this.intensity, this.power);
-        this.device.queue.writeBuffer(this.uniforms, 0, w.toBytes());
     }
 
     /** Clears `resultView` to white (fully open) — used when the technique is `None`. */
@@ -269,7 +254,7 @@ export class AmbientOcclusion {
         const pass = encoder.beginRenderPass({
             label: "metis-engine/ao-clear",
             colorAttachments: [
-                { view: this.aoResultView, loadOp: "clear", storeOp: "store", clearValue: { r: 1, g: 1, b: 1, a: 1 } },
+                {view: this.aoResultView, loadOp: "clear", storeOp: "store", clearValue: {r: 1, g: 1, b: 1, a: 1}},
             ],
         });
         pass.end();
@@ -283,7 +268,7 @@ export class AmbientOcclusion {
         const prepass = encoder.beginRenderPass({
             label: "metis-engine/ao-prepass",
             colorAttachments: [
-                { view: this.normalView, loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 0 } },
+                {view: this.normalView, loadOp: "clear", storeOp: "store", clearValue: {r: 0, g: 0, b: 0, a: 0}},
             ],
             depthStencilAttachment: {
                 view: this.depthView,
@@ -305,7 +290,7 @@ export class AmbientOcclusion {
         const aoPass = encoder.beginRenderPass({
             label: "metis-engine/ao-compute",
             colorAttachments: [
-                { view: this.aoRawView, loadOp: "clear", storeOp: "store", clearValue: { r: 1, g: 1, b: 1, a: 1 } },
+                {view: this.aoRawView, loadOp: "clear", storeOp: "store", clearValue: {r: 1, g: 1, b: 1, a: 1}},
             ],
         });
         aoPass.setPipeline(this._technique === AoTechnique.HBAO ? this.hbaoPipeline : this.ssaoPipeline);
@@ -317,7 +302,7 @@ export class AmbientOcclusion {
         const blur = encoder.beginRenderPass({
             label: "metis-engine/ao-blur",
             colorAttachments: [
-                { view: this.aoResultView, loadOp: "clear", storeOp: "store", clearValue: { r: 1, g: 1, b: 1, a: 1 } },
+                {view: this.aoResultView, loadOp: "clear", storeOp: "store", clearValue: {r: 1, g: 1, b: 1, a: 1}},
             ],
         });
         blur.setPipeline(this.blurPipeline);
@@ -326,18 +311,30 @@ export class AmbientOcclusion {
         blur.end();
     }
 
-    private destroyTextures() {
-        this.normalTex?.destroy();
-        this.depthTex?.destroy();
-        this.aoRawTex?.destroy();
-        this.aoResultTex?.destroy();
-    }
-
     destroy() {
         this.destroyTextures();
         this.uniforms.destroy();
         this.kernelBuffer.destroy();
         this.noiseBuffer.destroy();
+    }
+
+    private writeUniforms(scene: Scene) {
+        const proj = scene.camera.projectionMatrix();
+        const w = new Std140Writer();
+        w.mat4(scene.camera.viewMatrix());
+        w.mat4(scene.camera.viewProjectionMatrix());
+        w.mat4(proj);
+        w.mat4(mat4.invert(proj));
+        w.vec4(this.width, this.height, scene.camera.near, scene.camera.far);
+        w.vec4(this.radius, this.bias, this.intensity, this.power);
+        this.device.queue.writeBuffer(this.uniforms, 0, w.toBytes());
+    }
+
+    private destroyTextures() {
+        this.normalTex?.destroy();
+        this.depthTex?.destroy();
+        this.aoRawTex?.destroy();
+        this.aoResultTex?.destroy();
     }
 }
 

@@ -1,18 +1,18 @@
 import {
-    type GPUTextureFormat,
     type GpuBindGroup,
     type GpuBuffer,
+    GPUBufferUsage,
     type GpuCommandEncoder,
     type GpuDevice,
     type GpuRenderPipeline,
-    type GpuTextureView,
-    GPUBufferUsage,
     GPUShaderStage,
+    type GPUTextureFormat,
+    type GpuTextureView,
     VectorContext,
 } from "bun-webgpu-rs";
 import { mat4 } from "wgpu-matrix";
+import { Std140Writer } from "../shading/std140.ts";
 import vectorWgsl from "./wgsl/vector.wgsl" with { type: "text" };
-import { Std140Writer } from "../shading/std140";
 
 /**
  * Thin wrapper over bun-webgpu-rs's `VectorContext` for screen-space HUD
@@ -36,12 +36,16 @@ export class VectorText {
 
         const bindGroupLayout = device.createBindGroupLayout({
             label: "metis-engine/vector-text-bgl",
-            entries: [{ binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { bindingType: "uniform" } }],
+            entries: [{
+                binding: 0,
+                visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+                buffer: {bindingType: "uniform"},
+            }],
         });
-        const module = device.createShaderModule({ label: "metis-engine/vector-text-shader", code: vectorWgsl });
+        const module = device.createShaderModule({label: "metis-engine/vector-text-shader", code: vectorWgsl});
         this.pipeline = device.createRenderPipeline({
             label: "metis-engine/vector-text-pipeline",
-            layout: device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] }),
+            layout: device.createPipelineLayout({bindGroupLayouts: [bindGroupLayout]}),
             vertex: {
                 module,
                 entryPoint: "vs",
@@ -49,8 +53,8 @@ export class VectorText {
                     {
                         arrayStride: 16,
                         attributes: [
-                            { shaderLocation: 0, offset: 0, format: "float32x2" },
-                            { shaderLocation: 1, offset: 8, format: "float32x2" },
+                            {shaderLocation: 0, offset: 0, format: "float32x2"},
+                            {shaderLocation: 1, offset: 8, format: "float32x2"},
                         ],
                     },
                 ],
@@ -62,13 +66,13 @@ export class VectorText {
                     {
                         format: outputFormat,
                         blend: {
-                            color: { srcFactor: "src-alpha", dstFactor: "one-minus-src-alpha" },
-                            alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha" },
+                            color: {srcFactor: "src-alpha", dstFactor: "one-minus-src-alpha"},
+                            alpha: {srcFactor: "one", dstFactor: "one-minus-src-alpha"},
                         },
                     },
                 ],
             },
-            primitive: { topology: "triangle-list" },
+            primitive: {topology: "triangle-list"},
         });
 
         this.uniformBuffer = device.createBuffer({
@@ -79,7 +83,7 @@ export class VectorText {
         this.bindGroup = device.createBindGroup({
             label: "metis-engine/vector-text-bind-group",
             layout: bindGroupLayout,
-            entries: [{ binding: 0, buffer: { buffer: this.uniformBuffer } }],
+            entries: [{binding: 0, buffer: {buffer: this.uniformBuffer}}],
         });
     }
 
@@ -114,7 +118,9 @@ export class VectorText {
     ) {
         this.context.flush();
         const calls = this.context.drawCalls;
-        if (calls.length === 0) return;
+        if (calls.length === 0) {
+            return;
+        }
 
         const proj = mat4.ortho(0, width, height, 0, -1, 1);
         const w = new Std140Writer();
@@ -129,7 +135,7 @@ export class VectorText {
                     view,
                     loadOp,
                     storeOp: "store",
-                    clearValue: { r: 0, g: 0, b: 0, a: 1 },
+                    clearValue: {r: 0, g: 0, b: 0, a: 1},
                 },
             ],
         });

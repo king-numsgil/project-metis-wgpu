@@ -63,5 +63,5 @@ export interface AoTuning {
     power: number;
 }
 
-export const SSAO_DEFAULTS: AoTuning = { radius: 0.5, bias: 0.025, intensity: 1.0, power: 1.5 };
-export const HBAO_DEFAULTS: AoTuning = { radius: 0.5, bias: 0.1, intensity: 1.0, power: 1.5 };
+export const SSAO_DEFAULTS: AoTuning = {radius: 0.5, bias: 0.025, intensity: 1.0, power: 1.5};
+export const HBAO_DEFAULTS: AoTuning = {radius: 0.5, bias: 0.1, intensity: 1.0, power: 1.5};

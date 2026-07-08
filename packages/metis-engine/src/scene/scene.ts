@@ -1,12 +1,18 @@
-import { GPUBufferUsage, type GpuBindGroup, type GpuBindGroupLayout, type GpuBuffer, type GpuDevice } from "bun-webgpu-rs";
+import {
+    type GpuBindGroup,
+    type GpuBindGroupLayout,
+    type GpuBuffer,
+    GPUBufferUsage,
+    type GpuDevice,
+} from "bun-webgpu-rs";
 import type { Mat4Arg } from "wgpu-matrix";
-import { Camera } from "../math/camera";
-import { createTransform, normalMatrixFromModel, type Transform, transformToMat4 } from "../math/transform";
-import { Std140Writer } from "../shading/std140";
-import { createExteriorEnvironment, type Environment } from "./environment";
-import type { PointLight } from "./light";
-import type { Material } from "./material";
-import type { Mesh } from "./mesh";
+import { Camera } from "../math/camera.ts";
+import { createTransform, normalMatrixFromModel, type Transform, transformToMat4 } from "../math/transform.ts";
+import { Std140Writer } from "../shading/std140.ts";
+import { createExteriorEnvironment, type Environment } from "./environment.ts";
+import type { PointLight } from "./light.ts";
+import type { Material } from "./material.ts";
+import type { Mesh } from "./mesh.ts";
 
 /** One drawable: a mesh + material pairing, placed in the world by `transform`. Owns its own per-instance model uniform buffer. */
 export class SceneInstance {
@@ -49,7 +55,7 @@ export class SceneInstance {
             this.bindGroup = device.createBindGroup({
                 label: "metis-engine/model-bind-group",
                 layout,
-                entries: [{ binding: 0, buffer: { buffer: this.buffer } }],
+                entries: [{binding: 0, buffer: {buffer: this.buffer}}],
             });
         }
 

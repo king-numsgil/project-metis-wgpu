@@ -75,7 +75,7 @@ class MeshBuilder {
     }
 
     build(): MeshData {
-        return { vertices: new Float32Array(this.verts), indices: new Uint32Array(this.idx) };
+        return {vertices: new Float32Array(this.verts), indices: new Uint32Array(this.idx)};
     }
 }
 

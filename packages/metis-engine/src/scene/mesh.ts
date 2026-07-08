@@ -1,11 +1,11 @@
 import {
-    GPUBufferUsage,
     type GpuBuffer,
+    GPUBufferUsage,
     type GpuDevice,
     type GpuRenderPassEncoder,
     type GpuVertexBufferLayout,
 } from "bun-webgpu-rs";
-import type { MeshData } from "../assets/primitives";
+import type { MeshData } from "../assets/primitives.ts";
 
 /**
  * `[px,py,pz, nx,ny,nz, tx,ty,tz,tw, u,v]` per vertex, stride 48 bytes —
@@ -16,10 +16,10 @@ import type { MeshData } from "../assets/primitives";
 export const MESH_VERTEX_LAYOUT: GpuVertexBufferLayout = {
     arrayStride: 48,
     attributes: [
-        { shaderLocation: 0, offset: 0, format: "float32x3" },
-        { shaderLocation: 1, offset: 12, format: "float32x3" },
-        { shaderLocation: 2, offset: 24, format: "float32x4" },
-        { shaderLocation: 3, offset: 40, format: "float32x2" },
+        {shaderLocation: 0, offset: 0, format: "float32x3"},
+        {shaderLocation: 1, offset: 12, format: "float32x3"},
+        {shaderLocation: 2, offset: 24, format: "float32x4"},
+        {shaderLocation: 3, offset: 40, format: "float32x2"},
     ],
 };
 
@@ -41,7 +41,9 @@ export class Mesh {
             const y = data.vertices[i + 1]!;
             const z = data.vertices[i + 2]!;
             const distSq = x * x + y * y + z * z;
-            if (distSq > maxDistSq) maxDistSq = distSq;
+            if (distSq > maxDistSq) {
+                maxDistSq = distSq;
+            }
         }
         this.boundingRadius = Math.sqrt(maxDistSq);
 

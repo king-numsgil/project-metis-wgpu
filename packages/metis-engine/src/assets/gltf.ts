@@ -1,10 +1,10 @@
-import { dirname, join } from "node:path";
 import type { GpuDevice } from "bun-webgpu-rs";
+import { dirname, join } from "node:path";
 import { mat4, type Mat4Arg, quat, vec3 } from "wgpu-matrix";
-import { Material, type MaterialParams } from "../scene/material";
-import { Mesh } from "../scene/mesh";
-import { SceneInstance } from "../scene/scene";
-import type { MeshData } from "./primitives";
+import { Material, type MaterialParams } from "../scene/material.ts";
+import { Mesh } from "../scene/mesh.ts";
+import { SceneInstance } from "../scene/scene.ts";
+import type { MeshData } from "./primitives.ts";
 
 /**
  * A deliberately small glTF 2.0 subset — just enough to load one of the
@@ -67,11 +67,13 @@ interface GltfDocument {
     materials?: { pbrMetallicRoughness?: Record<string, unknown> }[];
 }
 
-const COMPONENT_SIZE: Record<number, number> = { 5121: 1, 5123: 2, 5125: 4, 5126: 4 };
-const TYPE_COMPONENT_COUNT: Record<string, number> = { SCALAR: 1, VEC2: 2, VEC3: 3, VEC4: 4 };
+const COMPONENT_SIZE: Record<number, number> = {5121: 1, 5123: 2, 5125: 4, 5126: 4};
+const TYPE_COMPONENT_COUNT: Record<string, number> = {SCALAR: 1, VEC2: 2, VEC3: 3, VEC4: 4};
 
 function nodeLocalMatrix(node: GltfNode): Mat4Arg {
-    if (node.matrix) return mat4.clone(new Float32Array(node.matrix));
+    if (node.matrix) {
+        return mat4.clone(new Float32Array(node.matrix));
+    }
     const t = node.translation ?? [0, 0, 0];
     const r = node.rotation ?? [0, 0, 0, 1];
     const s = node.scale ?? [1, 1, 1];
@@ -90,7 +92,10 @@ export async function loadGltf(device: GpuDevice, gltfPath: string): Promise<Sce
     }
     const binary = await Bun.file(join(dir, doc.buffers[0]!.uri)).arrayBuffer();
 
-    const readAccessor = (index: number): { data: Float32Array | Uint16Array | Uint32Array; componentCount: number } => {
+    const readAccessor = (index: number): {
+        data: Float32Array | Uint16Array | Uint32Array;
+        componentCount: number
+    } => {
         const accessor = doc.accessors[index]!;
         const view = doc.bufferViews[accessor.bufferView]!;
         const componentCount = TYPE_COMPONENT_COUNT[accessor.type]!;
@@ -106,7 +111,7 @@ export async function loadGltf(device: GpuDevice, gltfPath: string): Promise<Sce
             const src = new Ctor(binary, elementOffset, componentCount);
             out.set(src, i * componentCount);
         }
-        return { data: out, componentCount };
+        return {data: out, componentCount};
     };
 
     const meshCache = new Map<number, Mesh>();
@@ -114,7 +119,9 @@ export async function loadGltf(device: GpuDevice, gltfPath: string): Promise<Sce
 
     const getMesh = (meshIndex: number): Mesh => {
         let mesh = meshCache.get(meshIndex);
-        if (mesh) return mesh;
+        if (mesh) {
+            return mesh;
+        }
 
         const primitive = doc.meshes[meshIndex]!.primitives[0]!;
         if (primitive.mode !== undefined && primitive.mode !== 4) {
@@ -156,7 +163,7 @@ export async function loadGltf(device: GpuDevice, gltfPath: string): Promise<Sce
         }
         const indices = indicesRaw instanceof Uint32Array ? indicesRaw : Uint32Array.from(indicesRaw);
 
-        const data: MeshData = { vertices, indices };
+        const data: MeshData = {vertices, indices};
         mesh = new Mesh(device, data, `gltf-mesh-${meshIndex}`);
         meshCache.set(meshIndex, mesh);
         return mesh;
@@ -165,7 +172,9 @@ export async function loadGltf(device: GpuDevice, gltfPath: string): Promise<Sce
     const getMaterial = (materialIndex: number | undefined): Material => {
         const key = materialIndex ?? -1;
         let material = materialCache.get(key);
-        if (material) return material;
+        if (material) {
+            return material;
+        }
 
         const pbr = (materialIndex !== undefined ? doc.materials?.[materialIndex]?.pbrMetallicRoughness : undefined) ?? {};
         if ("baseColorTexture" in pbr || "metallicRoughnessTexture" in pbr) {
@@ -199,10 +208,14 @@ export async function loadGltf(device: GpuDevice, gltfPath: string): Promise<Sce
             instances.push(instance);
         }
 
-        for (const child of node.children ?? []) visit(child, world);
+        for (const child of node.children ?? []) {
+            visit(child, world);
+        }
     };
 
-    for (const rootIndex of sceneNodes) visit(rootIndex, mat4.identity());
+    for (const rootIndex of sceneNodes) {
+        visit(rootIndex, mat4.identity());
+    }
 
     return instances;
 }

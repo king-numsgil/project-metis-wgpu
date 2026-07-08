@@ -1,10 +1,10 @@
 import {
-    type GPUTextureFormat,
     type GpuDevice,
     type GpuSampler,
     type GpuTexture,
-    type GpuTextureView,
+    type GPUTextureFormat,
     GPUTextureUsage,
+    type GpuTextureView,
     ImageColorSpace,
     sdlImageLoadTexture,
 } from "bun-webgpu-rs";
@@ -26,24 +26,27 @@ export interface LoadedTexture {
  * `srgb` should be `true` for colour data (albedo, emissive) and `false` for
  * data maps (normal, metallic, roughness) — see math/PBR shading formulas.md.
  */
-export async function loadTexture(device: GpuDevice, path: string, options?: { srgb?: boolean; label?: string }): Promise<LoadedTexture> {
+export async function loadTexture(device: GpuDevice, path: string, options?: {
+    srgb?: boolean;
+    label?: string
+}): Promise<LoadedTexture> {
     const texture = await sdlImageLoadTexture(device, path, {
         label: options?.label ?? path,
         colorSpace: options?.srgb ? ImageColorSpace.Srgb : ImageColorSpace.Linear,
         usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
     });
-    return { texture, view: texture.createView() };
+    return {texture, view: texture.createView()};
 }
 
 function createSolidTexture(device: GpuDevice, rgba: [number, number, number, number], srgb: boolean, label: string): GpuTextureView {
     const format: GPUTextureFormat = srgb ? "rgba8unorm-srgb" : "rgba8unorm";
     const texture = device.createTexture({
         label,
-        size: { width: 1, height: 1 },
+        size: {width: 1, height: 1},
         format,
         usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
     });
-    device.queue.writeTexture({ texture }, new Uint8Array(rgba), { bytesPerRow: 4 }, { width: 1, height: 1 });
+    device.queue.writeTexture({texture}, new Uint8Array(rgba), {bytesPerRow: 4}, {width: 1, height: 1});
     return texture.createView();
 }
 
@@ -71,7 +74,9 @@ const defaultsCache = new WeakMap<GpuDevice, MaterialDefaults>();
  */
 export function getMaterialDefaults(device: GpuDevice): MaterialDefaults {
     let defaults = defaultsCache.get(device);
-    if (defaults) return defaults;
+    if (defaults) {
+        return defaults;
+    }
 
     defaults = {
         sampler: device.createSampler({
