@@ -28,11 +28,16 @@ describe("requestAdapter", () => {
         expect(a === null || typeof a === "object").toBe(true);
     });
 
-    it("adapter has features array", () => {
+    it("adapter has a spec-compliant setlike features collection", () => {
         if (!adapter) {
             return;
         }
-        expect(Array.isArray(adapter.features)).toBe(true);
+        // GPUSupportedFeatures is setlike (has/size/keys), not an Array — mirror the WebGPU spec.
+        const features = adapter.features;
+        expect(typeof features.size).toBe("number");
+        expect(typeof features.has).toBe("function");
+        expect(Array.isArray(features.keys())).toBe(true);
+        expect(features.has("__definitely_not_a_real_feature__")).toBe(false);
     });
 
     it("adapter has limits object", () => {

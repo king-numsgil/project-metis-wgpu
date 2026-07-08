@@ -9,8 +9,6 @@ export type { Transform } from "./math/transform";
 export { cube, plane, roomBox, uvSphere } from "./assets/primitives";
 export type { MeshData, WindowCutout } from "./assets/primitives";
 export { loadGltf } from "./assets/gltf";
-export { decodePng } from "./assets/png";
-export type { DecodedImage } from "./assets/png";
 export { getMaterialDefaults, loadTexture } from "./assets/texture";
 export type { LoadedTexture, MaterialDefaults } from "./assets/texture";
 

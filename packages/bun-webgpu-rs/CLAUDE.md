@@ -38,11 +38,13 @@ CMake is installed globally — no PATH manipulation needed.
 - **Platform**: Windows 11 / PowerShell (primary shell)
 - **Rust toolchain**: stable
 - **napi-rs**: 3.x — uses `#[napi]`, `#[napi(object)]`, `Reference<T>`, async napi fns
-- **SDL3**: built from source via `sdl3-sys = { version = "0.6", features = ["build-from-source-static"] }`
+- **SDL3**: built from source via `sdl3-sys = { version = "0.6.7", features = ["build-from-source-static"] }` (bundles SDL 3.4.12)
+- **SDL3_image**: built from source via `sdl3-image-sys = { version = "0.6.4", features = ["build-from-source-static"] }` (bundles SDL_image 3.4.4); links against the same `sdl3-sys`, no version conflict
 - **wgpu**: 24.0.5 with WGSL feature
 
 Cargo cache / sdl3-sys source:
-`C:\Users\DarkF\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sdl3-sys-0.6.6+SDL-3.4.10\src\generated\`
+`C:\Users\DarkF\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sdl3-sys-0.6.7+SDL-3.4.12\src\generated\`
+`…\sdl3-image-sys-0.6.4+SDL-image-3.4.4\src\generated\image.rs`
 
 ---
 
@@ -67,6 +69,11 @@ src/
     joystick.rs   — SdlJoyHat enum, SdlJoystick class, sdlGetJoysticks
     gamepad.rs    — SdlGamepadAxis/Button enums, SdlGamepad class, sdlGetGamepads
     debug.rs      — sdlLog, sdlGetPerformanceCounter, sdlGetPerformanceFrequency
+  image/
+    mod.rs        — SDL3_image file loaders that decode straight into wgpu
+                    textures (sdlImageLoadTexture, sdlImageLoadAnimation,
+                    ImageColorSpace enum). No pixel bytes cross the napi
+                    boundary; file readers only (no *_IO / SDL_IOStream variants)
 ```
 
 ---
@@ -183,6 +190,52 @@ cursor.destroy()
 ```
 
 ---
+
+## Image loading (SDL3_image → wgpu)
+
+`src/image/mod.rs` decodes an image **file** and uploads it straight into a
+`GpuTexture` — the decoded pixels never cross the napi boundary as a byte array.
+Both loaders are **async** (decode + upload on the libuv threadpool).
+
+```ts
+import { sdlImageLoadTexture, sdlImageLoadAnimation, ImageColorSpace, GPUTextureUsage } from "bun-webgpu-rs";
+
+// Colour map (albedo/emissive) — sRGB is the default:
+const albedo = await sdlImageLoadTexture(device, "hull_albedo.png");     // rgba8unorm-srgb
+// Data map (normal/roughness) — must be linear:
+const normal = await sdlImageLoadTexture(device, "hull_normal.png", {
+  colorSpace: ImageColorSpace.Linear,                                   // rgba8unorm
+  usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,    // default
+});
+// Several loads decode in parallel on the threadpool:
+const [a, b] = await Promise.all([sdlImageLoadTexture(device, "a.png"), sdlImageLoadTexture(device, "b.jpg")]);
+
+// Animated (GIF/WEBP/APNG): every frame is uploaded up front.
+const anim = await sdlImageLoadAnimation(device, "explosion.gif");
+for (let i = 0; i < anim.frameCount; i++) {
+  const frame = anim.frame(i);       // GpuTexture handle (shares the uploaded texture)
+  const ms = anim.delayMs(i);        // frame duration
+}
+```
+
+Design rules for this module:
+- **File readers only.** `IMG_Load` / `IMG_LoadAnimation` are wrapped; the
+  `*_IO` (`SDL_IOStream`) and `SDL_Renderer`-based `IMG_LoadTexture*` entry
+  points are intentionally omitted.
+- **Async / off-thread, and it's safe to be.** Decode + upload run on a libuv
+  worker via `AsyncTask` (same pattern as `create_render_pipeline_async`).
+  SDL3_image has no `IMG_Init` (no init-thread coupling), `IMG_Load` has no
+  main-thread requirement (only SDL's own 2D renderer does — which we don't
+  use), SDL3 pixel formats are const (the old cross-thread format-list race is
+  gone), and each call owns its surface. `SDL_GetError` is thread-local, so the
+  error string is captured inside the worker task.
+- **RGBA8, endianness-safe.** The surface is `SDL_ConvertSurface`'d to
+  `SDL_PIXELFORMAT_RGBA32` (R,G,B,A byte order regardless of endianness), which
+  maps 1:1 to wgpu `rgba8unorm(-srgb)`. Verified byte-for-byte in
+  `tests/sdl-image.test.ts` (encode PNG → load → GPU readback → compare).
+- **Strong enum, not a bool.** sRGB/linear is `ImageColorSpace`, mirroring the
+  crate's `#[napi] enum` convention rather than a magic flag.
+- Loading needs no `SDL_Init` — decode + `SDL_ConvertSurface` are self-contained.
 
 ## GPU debug primitives
 

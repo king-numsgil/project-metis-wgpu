@@ -394,6 +394,27 @@ export declare class SdlGamepad {
   close(): void
 }
 
+/**
+ * An animated image (GIF/WEBP/APNG/…) loaded from a file: every frame is
+ * uploaded to its own GPU texture up front, and `frame(i)` hands them out
+ * ready to bind. Frame delays are exposed in milliseconds.
+ */
+export declare class SdlImageAnimation {
+  /** Number of frames. */
+  get frameCount(): number
+  /** Frame width in pixels (shared by every frame). */
+  get width(): number
+  /** Frame height in pixels (shared by every frame). */
+  get height(): number
+  /** This frame's display duration, in milliseconds. */
+  delayMs(index: number): number
+  /**
+   * A `GpuTexture` handle for frame `index`, ready to bind. Cheap: shares the
+   * already-uploaded GPU texture (no re-upload, no copy).
+   */
+  frame(index: number): GpuTexture
+}
+
 /** An open joystick handle. Call `.close()` when done. */
 export declare class SdlJoystick {
   instanceId(): number
@@ -438,7 +459,9 @@ export declare class SdlJoystick {
 export declare class SdlKeyboardState {
   /**
    * Returns `true` if the key identified by `scancode` is currently pressed.
-   * Pass a `SdlScancode` value (or any raw integer index). Out-of-range returns `false`.
+   * A real `SdlScancode` past the tracked array (e.g. `SdlScancode.Count`)
+   * returns `false`; a number that isn't a `SdlScancode` variant is rejected
+   * at the napi boundary.
    */
   get(scancode: SdlScancode): boolean
   /** Total number of scancodes tracked (SdlScancode.Count, typically 512). */
@@ -1087,6 +1110,24 @@ export interface GpuVertexState {
   buffers?: Array<GpuVertexBufferLayout | undefined | null>
 }
 
+/**
+ * How the decoded pixels are interpreted when the GPU samples them — the
+ * sRGB/linear split every PBR pipeline needs (colour maps are sRGB, data maps
+ * like normal/roughness are linear; see metis-engine's `texture.ts`).
+ */
+export declare enum ImageColorSpace {
+  /**
+   * sRGB-encoded colour (albedo, emissive) — creates an `rgba8unorm-srgb`
+   * texture, so the hardware linearises on sample.
+   */
+  Srgb = 0,
+  /**
+   * Raw linear data (normal, metallic, roughness, masks) — creates an
+   * `rgba8unorm` texture with no sRGB decode.
+   */
+  Linear = 1
+}
+
 export interface MouseRect {
   x: number
   y: number
@@ -1444,6 +1485,32 @@ export declare function sdlHasJoystick(): boolean
 
 /** Hide the mouse cursor. */
 export declare function sdlHideCursor(): void
+
+/**
+ * Decode an animated image file into per-frame `GpuTexture`s, off the JS
+ * thread. Resolves to an `SdlImageAnimation` whose `frame(i)`/`delayMs(i)`
+ * expose ready-to-bind handles + timing. File reader only (no `_IO` variant).
+ */
+export declare function sdlImageLoadAnimation(device: GpuDevice, path: string, options?: SdlImageLoadOptions | undefined | null): Promise<SdlImageAnimation>
+
+export interface SdlImageLoadOptions {
+  /** Debug label applied to the created GPU texture(s). */
+  label?: string
+  /** Colour space of the source pixels. Defaults to `Srgb`. */
+  colorSpace?: ImageColorSpace
+  /** `GpuTextureUsage` bitmask. Defaults to `TEXTURE_BINDING | COPY_DST`. */
+  usage?: number
+}
+
+/**
+ * Decode an image file (PNG, JPG, WebP, … — whatever SDL_image was built with)
+ * straight into a `GpuTexture` ready to bind, off the JS thread. The pixels
+ * never cross into JS.
+ *
+ * `path` is a filesystem path; the `_IO`/stream variants are intentionally not
+ * exposed. The returned promise rejects with the SDL error string on failure.
+ */
+export declare function sdlImageLoadTexture(device: GpuDevice, path: string, options?: SdlImageLoadOptions | undefined | null): Promise<GpuTexture>
 
 /** Initialize SDL subsystems. `flags` is a bitmask of `SdlInitFlag` values. */
 export declare function sdlInit(flags: number): void

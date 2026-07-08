@@ -80,13 +80,11 @@ src/
                                  network-independent path every demo/fixture scene defaults to)
                 gltf.ts       — a deliberately narrow glTF 2.0 reader (see its doc comment for the
                                  exact supported subset), not a general-purpose importer
-                png.ts        — a from-scratch PNG decoder (color types 0/2/4/6, 8- or 16-bit, no
-                                 interlacing) — the inverse of the encoder already hand-rolled in
-                                 bun-webgpu-rs/tests/helpers/screenshot.ts; no image-decoding
-                                 dependency was pulled in since this has zero WebGPU-compat surface
-                texture.ts    — loadTexture() (PNG -> GpuTexture) + getMaterialDefaults() (the
-                                 shared 1x1 neutral placeholders every unset material texture
-                                 slot falls back to)
+                texture.ts    — loadTexture() (image file -> GpuTexture via bun-webgpu-rs's
+                                 `sdlImageLoadTexture` SDL3_image binding — decode + upload happen
+                                 in Rust, supports PNG/JPG/WebP/…; replaced the former from-scratch
+                                 PNG decoder) + getMaterialDefaults() (the shared 1x1 neutral
+                                 placeholders every unset material texture slot falls back to)
   index.ts      — public API barrel export
 examples/       exterior-demo.ts, interior-demo.ts — windowed, interactive, SDL-loop-driven
 test/           fixture.ts — headless validation harness (also downloads+caches a Khronos sample

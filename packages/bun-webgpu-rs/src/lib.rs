@@ -2,6 +2,7 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod gpu;
+mod image;
 #[allow(unused_imports)]
 mod sdl;
 mod vector;
@@ -72,3 +73,7 @@ pub use gpu::{GpuBufferUsage, GpuTextureUsage, GpuShaderStage, GpuMapMode, GpuCo
 // ── Vector ─────────────────────────────────────────────────────────────────────
 
 pub use vector::{VectorContext, FontMetrics, DrawCall};
+
+// ── SDL_image (file -> wgpu texture) ────────────────────────────────────────────
+
+pub use image::{ImageColorSpace, SdlImageAnimation, SdlImageLoadOptions, sdl_image_load_texture, sdl_image_load_animation};

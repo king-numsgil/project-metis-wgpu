@@ -238,10 +238,14 @@ describe("keyboard state handle", () => {
         expect(KB.get(SdlScancode.Space)).toBe(false);
     });
 
-    it("out-of-range scancode returns false", () => {
+    it("valid-but-untracked scancode returns false; a non-enum value is rejected", () => {
         const KB = sdlGetKeyboardState();
+        // SdlScancode.Count (512) is a real enum value that sits just past the
+        // tracked-key array, so the Rust bounds check returns false.
         expect(KB.get(SdlScancode.Count)).toBe(false);
-        expect(KB.get(9999)).toBe(false);
+        // A number outside the enum is rejected at the napi boundary — strong
+        // typing means `get` only accepts real SdlScancode values, not any int.
+        expect(() => KB.get(9999 as unknown as SdlScancode)).toThrow();
     });
 
     it("SdlScancode enum has expected values", () => {

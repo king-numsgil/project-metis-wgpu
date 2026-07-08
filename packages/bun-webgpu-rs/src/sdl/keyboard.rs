@@ -325,7 +325,9 @@ pub struct SdlKeyboardState(RawKbState);
 #[napi]
 impl SdlKeyboardState {
     /// Returns `true` if the key identified by `scancode` is currently pressed.
-    /// Pass a `SdlScancode` value (or any raw integer index). Out-of-range returns `false`.
+    /// A real `SdlScancode` past the tracked array (e.g. `SdlScancode.Count`)
+    /// returns `false`; a number that isn't a `SdlScancode` variant is rejected
+    /// at the napi boundary.
     #[napi]
     pub fn get(&self, scancode: SdlScancode) -> bool {
         let i = scancode as usize;

@@ -5,8 +5,9 @@ import {
     type GpuTexture,
     type GpuTextureView,
     GPUTextureUsage,
+    ImageColorSpace,
+    sdlImageLoadTexture,
 } from "bun-webgpu-rs";
-import { decodePng } from "./png";
 
 export interface LoadedTexture {
     texture: GpuTexture;
@@ -14,28 +15,23 @@ export interface LoadedTexture {
 }
 
 /**
- * Loads a PNG from disk into a GPU texture. `srgb` should be `true` for
- * color data (albedo, emissive) and `false` for data maps (normal,
- * metallic, roughness) — see math/PBR shading formulas.md.
+ * Loads an image file into a GPU texture via bun-webgpu-rs's SDL3_image binding
+ * (`sdlImageLoadTexture`), which decodes *and* uploads entirely in Rust — the
+ * pixel bytes never cross the FFI boundary. Handles PNG/JPG/WebP/… (whatever
+ * SDL_image was built with), replacing the engine's former hand-rolled PNG
+ * decoder. Async: the decode + upload run on a native worker thread, so a big
+ * texture doesn't stall the frame loop, and `Promise.all` of several loads
+ * decodes them in parallel.
+ *
+ * `srgb` should be `true` for colour data (albedo, emissive) and `false` for
+ * data maps (normal, metallic, roughness) — see math/PBR shading formulas.md.
  */
 export async function loadTexture(device: GpuDevice, path: string, options?: { srgb?: boolean; label?: string }): Promise<LoadedTexture> {
-    const bytes = new Uint8Array(await Bun.file(path).arrayBuffer());
-    const image = decodePng(bytes);
-    const format: GPUTextureFormat = options?.srgb ? "rgba8unorm-srgb" : "rgba8unorm";
-
-    const texture = device.createTexture({
+    const texture = await sdlImageLoadTexture(device, path, {
         label: options?.label ?? path,
-        size: { width: image.width, height: image.height },
-        format,
+        colorSpace: options?.srgb ? ImageColorSpace.Srgb : ImageColorSpace.Linear,
         usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
     });
-    device.queue.writeTexture(
-        { texture },
-        image.pixels,
-        { bytesPerRow: image.width * 4, rowsPerImage: image.height },
-        { width: image.width, height: image.height },
-    );
-
     return { texture, view: texture.createView() };
 }
 
