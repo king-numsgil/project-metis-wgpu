@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-`metis-engine` is a WebGPU clustered-forward PBR renderer for the space-sim game — built directly on `bun-webgpu-rs`'s raw WebGPU/SDL3 bindings (no other rendering-facing dependency; `wgpu-matrix` is the only non-`bun-webgpu-rs` dependency, for matrix/vector math). It's a standalone package with no dependency on `metis-tui`; `metis-game` is its eventual consumer, though that wiring hasn't happened yet.
+`metis-engine` is a WebGPU clustered-forward PBR renderer for the space-sim game — built directly on `bun-webgpu-rs`'s raw WebGPU/SDL3 bindings (no other rendering-facing dependency; `wgpu-matrix` is the only non-`bun-webgpu-rs` dependency, for matrix/vector math). It's a standalone package with no dependency on `metis-tui`. `metis-game` consumes it (a 100-point-light demo), and does so via the caller-owned-device path — it never touches `RenderContext`. See "The engine does not own the window" below.
 
 It's the first package in this monorepo to build a *real* render pipeline — depth buffer, vertex buffers, multiple bind groups, compute passes, multisample-capable targets. Every prior pipeline in `bun-webgpu-rs/tests/render*.test.ts` and `metis-game/src/index.ts` is a hardcoded no-vertex-buffer triangle, so the patterns here (vertex layouts, bind group group-index conventions, WGSL module concatenation) are this repo's first precedent, not a continuation of one.
 
@@ -114,6 +114,28 @@ test/           fixture.ts — headless validation harness (also downloads+cache
 math/           formula references cited by the shading code, following the same "honest physics +
                 explicitly labeled handwave" convention as packages/metis-tui/math/
 ```
+
+### The engine does not own the window — `RenderContext` is a convenience
+
+`RenderContext` bundles four separable jobs (SDL/window lifetime, adapter+device
+creation, the surface/swapchain, and `RenderTargets` allocation), which makes it
+*look* like the engine's entry point. It isn't. `ClusteredForwardRenderer.render()`
+takes only a `GpuCommandEncoder`, a `RenderTargets`, and a `Scene`; the post chain
+takes an output view + format. Nothing in the render path references a window, a
+surface, or SDL.
+
+So a host that already bootstraps its own window/adapter/device/surface — which
+is exactly what `metis-game` does — constructs `new RenderTargets(device, w, h)`,
+`new ClusteredForwardRenderer(device)`, and `createDefaultPostProcessPipeline(device)`
+directly, and never touches `RenderContext`. This was verified end-to-end (a real
+window + caller-owned device driving a full frame, clean under a `validation`
+error scope). `DOC.md` §1.3 documents that path.
+
+A `SceneRenderer` facade bundling targets+forward+post behind one `render(encoder,
+scene, output, dt)` call was proposed and **deliberately declined** — the explicit
+wiring keeps the data flow (and the resolved-vs-multisampled view choice) visible
+at the call site. Don't add one without a fresh reason; do keep `RenderContext`
+strictly optional, and don't let engine types acquire a window/surface dependency.
 
 ### Why "clustered forward," concretely
 

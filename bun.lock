@@ -41,6 +41,7 @@
       "name": "metis-game",
       "dependencies": {
         "bun-webgpu-rs": "workspace:*",
+        "metis-engine": "workspace:*",
         "wgpu-matrix": "^3.4.2",
       },
       "devDependencies": {

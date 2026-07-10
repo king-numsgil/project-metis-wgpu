@@ -17,7 +17,18 @@ consumer would import from `"metis-engine"`.
 
 ## 1. Quick start
 
-### Windowed (interactive)
+There are three ways to drive the engine. They differ only in **who owns the
+device and the output surface** — the render path is identical in all three.
+
+`RenderContext` is a *convenience bootstrapper*, *not* a dependency. It bundles
+four separable jobs (SDL/window lifetime, adapter+device creation, the
+surface/swapchain, and `RenderTargets` allocation). The renderer itself knows
+nothing about windows: `ClusteredForwardRenderer.render()` needs only a
+`GpuDevice`, a `RenderTargets`, and a `Scene`; the post chain needs an output
+view + format. If you already own a device and a surface, skip `RenderContext`
+entirely — see §1.3.
+
+### 1.1 Windowed (interactive)
 
 ```ts
 import { scheduler } from "node:timers/promises";
@@ -64,7 +75,7 @@ while (running) {
 ctx.destroy();
 ```
 
-### Headless (fixtures, benchmarks, screenshot tests)
+### 1.2 Headless (fixtures, benchmarks, screenshot tests)
 
 Identical, except `RenderContext.createOffscreen({...})`. `beginFrame()` returns
 the same offscreen view every frame and `present()` is a no-op, so there is no
@@ -72,6 +83,65 @@ vsync. Read the result back from `ctx.captureTexture` (pinned to `rgba8unorm`).
 
 **Auto-exposure adapts over frames** — render ~30 warmup frames before capturing
 or the image reflects the first frame's transient.
+
+### 1.3 Caller-owned device and surface (no `RenderContext`)
+
+For an app that already bootstraps its own SDL window, adapter, device, and
+surface, construct the engine pieces directly from your `GpuDevice`. **No engine
+type needs to own or even see the window.**
+
+`packages/metis-game/src/index.ts` is the working reference for this path —
+a 100-light demo that never touches `RenderContext`.
+
+```ts
+// ── your bootstrap; the engine touches none of it ────────────────────────
+sdlInit(SdlInitFlag.Video);
+const wnd = sdlCreateWindow("game", 1440, 768);
+const adapter = await requestAdapterForWindow(wnd, { powerPreference: "high-performance" });
+const device = await adapter!.requestDevice();
+const surface = createSurface(adapter!, wnd);
+const fmt = surface.getPreferredFormat();
+surface.configure(device, { width: wnd.width, height: wnd.height });
+
+// ── engine: derived from `device` alone ──────────────────────────────────
+const targets = new RenderTargets(device, wnd.width, wnd.height);
+const forward = new ClusteredForwardRenderer(device);
+const post = createDefaultPostProcessPipeline(device);
+// const hud = new VectorText(device, fmt);   // optional; wants the OUTPUT format
+
+// ── per frame ────────────────────────────────────────────────────────────
+const frame = surface.getCurrentTexture();
+if (frame.suboptimal) surface.configure(device, { width: wnd.width, height: wnd.height });
+
+const encoder = device.createCommandEncoder();
+forward.render(encoder, targets, scene);
+post.pipeline.run(encoder, {
+    device,
+    hdrColorView: targets.hdrColorResolvedView, // resolved, NOT hdrColorMultisampledView
+    depthView: targets.depthView,
+    outputView: frame.createView(),
+    outputFormat: fmt,                          // surface.getPreferredFormat()
+    width: wnd.width,
+    height: wnd.height,
+    deltaTime: dt,
+});
+device.queue.submit([encoder.finish()]);
+frame.present();                                // after submit
+```
+
+Two responsibilities `RenderContext` would otherwise have handled for you:
+
+- **Resize.** On window resize, call `surface.configure(...)` **and**
+  `targets.resize(device, w, h)`, and `scene.camera.setAspectFromSize(w, h)`.
+  Forget the middle one and the forward pass keeps drawing at the old size.
+- **Teardown.** Destroy in dependency order: `forward.destroy()`,
+  `post.pipeline.destroy()`, `hud?.destroy()`, `targets.destroy()`, then your
+  own `device.destroy()` / `wnd.destroy()` / `sdlQuit()`.
+
+Both consumers of the **output** format want your swapchain's format, never
+`HDR_COLOR_FORMAT` — they write the final target, after the tonemap.
+`VectorText` takes it in its constructor; the post-process passes receive it
+per-frame as `outputFormat` on the frame context.
 
 ---
 
@@ -92,7 +162,12 @@ Getting any of these wrong produces a plausible-looking but wrong image.
 
 ## 3. `rhi/` — device, surface, targets
 
-### `RenderContext`
+### `RenderContext` — optional
+
+A bootstrapper for the common cases (§1.1, §1.2), bundling SDL/window lifetime,
+adapter + device creation, the surface, and a `RenderTargets`. Nothing in the
+render path requires it — if you own a device and a surface already, construct
+`RenderTargets` yourself and skip this class (§1.3).
 
 ```ts
 interface RenderContextOptions {
@@ -128,7 +203,9 @@ work-done wait, polluting every measurement. See `bench/lights.ts`.
 
 ### `RenderTargets`
 
-Owned by `RenderContext`; you rarely construct one.
+The HDR color + depth attachments the forward pass draws into. `RenderContext`
+creates one for you as `ctx.targets`; construct it directly
+(`new RenderTargets(device, width, height)`) when you own the device (§1.3).
 
 ```ts
 width, height: number;
