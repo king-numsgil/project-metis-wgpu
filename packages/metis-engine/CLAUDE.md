@@ -8,6 +8,27 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 It's the first package in this monorepo to build a *real* render pipeline — depth buffer, vertex buffers, multiple bind groups, compute passes, multisample-capable targets. Every prior pipeline in `bun-webgpu-rs/tests/render*.test.ts` and `metis-game/src/index.ts` is a hardcoded no-vertex-buffer triangle, so the patterns here (vertex layouts, bind group group-index conventions, WGSL module concatenation) are this repo's first precedent, not a continuation of one.
 
+## Read [`DOC.md`](DOC.md) first
+
+[`DOC.md`](DOC.md) is this package's **API reference**: every public export with
+its signature, the canonical render-loop recipe (windowed and headless), the
+config constants, and the invariants that fail silently (winding/cull direction,
+resolved-vs-multisampled views, `sunDirection` semantics, swallowed WebGPU
+validation errors).
+
+**Consult it before opening source files.** It exists so a task doesn't start
+with a dozen `Read` calls. Drop to source only when it doesn't cover what you
+need — then consider whether the gap belongs in the doc.
+
+**Keep it current.** Changing a public API — an exported symbol's signature, a
+constant in `clusterConfig.ts`, the pass order inside `render()`, or any
+documented invariant — means updating `DOC.md` **in the same change**. A stale
+doc is worse than none, because it will be trusted.
+
+This `CLAUDE.md` explains *why* (architecture, rationale, the debugging history
+below). `DOC.md` explains *what to call*. Keep that split — don't duplicate
+war stories into `DOC.md`, don't grow an API listing here.
+
 ## Commands
 
 Run from `packages/metis-engine/` unless noted.
