@@ -3,23 +3,22 @@
 // before src/text/vectorText.ts, so this renders one string to an offscreen
 // target and screenshots it before the HUD overlay leans on it.
 import { GPUTextureUsage } from "bun-webgpu-rs";
-import { takeScreenshot } from "../../bun-webgpu-rs/tests/helpers/screenshot";
-import { VectorText } from "../src/text/vectorText";
-import { RenderContext } from "../src/rhi/context";
+import { takeScreenshot } from "bun-webgpu-rs/tests/helpers/screenshot.ts";
+import { RenderContext, VectorText } from "metis-engine";
 
 const W = 480;
 const H = 160;
 const FONT_PATH = new URL("../../../assets/JetBrainsMono-Regular.ttf", import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1");
 
 async function main() {
-    const ctx = await RenderContext.createOffscreen({ width: W, height: H, label: "vector-text-smoke" });
+    const ctx = await RenderContext.createOffscreen({width: W, height: H, label: "vector-text-smoke"});
     const text = new VectorText(ctx.device, "rgba8unorm");
     text.loadFont("mono", FONT_PATH);
     text.drawText("metis-engine HUD", "mono", 28, 16, 64);
 
     const target = ctx.device.createTexture({
         label: "vector-text-smoke-target",
-        size: { width: W, height: H },
+        size: {width: W, height: H},
         format: "rgba8unorm",
         usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
     });
@@ -42,7 +41,9 @@ async function main() {
 function countNonBackground(pixels: Uint8Array): number {
     let count = 0;
     for (let i = 0; i < pixels.length; i += 4) {
-        if (pixels[i]! > 5 || pixels[i + 1]! > 5 || pixels[i + 2]! > 5) count++;
+        if (pixels[i]! > 5 || pixels[i + 1]! > 5 || pixels[i + 2]! > 5) {
+            count++;
+        }
     }
     return count;
 }

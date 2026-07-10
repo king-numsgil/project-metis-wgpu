@@ -2,6 +2,7 @@ import {
     createSurface,
     type GpuAdapter,
     type GpuDevice,
+    type GPUPresentMode,
     type GpuSurface,
     type GpuTexture,
     type GPUTextureFormat,
@@ -26,6 +27,13 @@ export interface RenderContextOptions {
     powerPreference?: PowerPreference;
     backend?: Backend;
     label?: string;
+    /**
+     * Swapchain present mode (windowed only). Defaults to `"fifo"` (vsync). Use
+     * `"immediate"` to disable vsync — required to measure raw CPU/GPU frame
+     * cost, since on D3D/Vulkan the vsync wait otherwise lands in
+     * `getCurrentTexture()`/work-done and pollutes any per-frame timing.
+     */
+    presentMode?: GPUPresentMode;
 }
 
 export interface FrameTarget {
@@ -50,6 +58,7 @@ export class RenderContext {
 
     private readonly window: SdlWindow | null;
     private readonly surface: GpuSurface | null;
+    private readonly presentMode: GPUPresentMode;
     // takeScreenshot (bun-webgpu-rs/tests/helpers/screenshot.ts) can only read
     // back tight rgba8unorm, so the offscreen path is pinned to that format.
     private readonly offscreenFormat: GPUTextureFormat = "rgba8unorm";
@@ -63,6 +72,7 @@ export class RenderContext {
         height: number,
         window: SdlWindow | null,
         surface: GpuSurface | null,
+        presentMode: GPUPresentMode = "fifo",
     ) {
         this.device = device;
         this.adapter = adapter;
@@ -70,6 +80,7 @@ export class RenderContext {
         this.height = height;
         this.window = window;
         this.surface = surface;
+        this.presentMode = presentMode;
         this.targets = new RenderTargets(device, width, height);
         if (!surface) {
             this.createOffscreenTarget();
@@ -124,8 +135,9 @@ export class RenderContext {
         }
         const device = await adapter.requestDevice({label: options.label ?? "metis-engine-windowed"});
         const surface = createSurface(adapter, window);
-        surface.configure(device, {width: window.width, height: window.height});
-        return new RenderContext(device, adapter, window.width, window.height, window, surface);
+        const presentMode = options.presentMode ?? "fifo";
+        surface.configure(device, {width: window.width, height: window.height, presentMode});
+        return new RenderContext(device, adapter, window.width, window.height, window, surface, presentMode);
     }
 
     /**
@@ -137,7 +149,7 @@ export class RenderContext {
         if (this.surface) {
             const frame = this.surface.getCurrentTexture();
             if (frame.suboptimal) {
-                this.surface.configure(this.device, {width: this.width, height: this.height});
+                this.surface.configure(this.device, {width: this.width, height: this.height, presentMode: this.presentMode});
             }
             return {
                 view: frame.createView(),
@@ -163,7 +175,7 @@ export class RenderContext {
         this.height = height;
         this.targets.resize(this.device, width, height);
         if (this.surface) {
-            this.surface.configure(this.device, {width, height});
+            this.surface.configure(this.device, {width, height, presentMode: this.presentMode});
         } else {
             this.offscreenTarget?.destroy();
             this.createOffscreenTarget();

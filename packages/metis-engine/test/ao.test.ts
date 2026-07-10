@@ -8,22 +8,29 @@
 //      forward/AO passes wrapped in a validation error scope, so a broken WGSL
 //      shader fails loudly instead of silently rendering garbage (see
 //      packages/metis-engine/CLAUDE.md's note on swallowed wgpu errors).
-import { describe, expect, it } from "bun:test";
 import { requestAdapter } from "bun-webgpu-rs";
+import { takeScreenshot } from "bun-webgpu-rs/tests/helpers/screenshot.ts";
+import { describe, expect, it } from "bun:test";
+import {
+    AO_NOISE_DIM,
+    AoTechnique,
+    ClusteredForwardRenderer,
+    createInteriorEnvironment,
+    cube,
+    ExposureState,
+    generateAoNoise,
+    generateSsaoKernel,
+    Material,
+    Mesh,
+    mulberry32,
+    plane,
+    PostProcessPipeline,
+    RenderContext,
+    Scene,
+    SSAO_KERNEL_SIZE,
+    TonemapPass,
+} from "metis-engine";
 import { vec3 } from "wgpu-matrix";
-import { takeScreenshot } from "../../bun-webgpu-rs/tests/helpers/screenshot";
-import { AO_NOISE_DIM, AoTechnique, SSAO_KERNEL_SIZE } from "../src/ao/aoConfig";
-import { generateAoNoise, generateSsaoKernel, mulberry32 } from "../src/ao/aoKernel";
-import { PostProcessPipeline } from "../src/postprocess/pipeline";
-import { ExposureState } from "../src/postprocess/exposureState";
-import { TonemapPass } from "../src/postprocess/tonemap";
-import { cube, plane } from "../src/assets/primitives";
-import { RenderContext } from "../src/rhi/context";
-import { createInteriorEnvironment } from "../src/scene/environment";
-import { Material } from "../src/scene/material";
-import { Mesh } from "../src/scene/mesh";
-import { Scene } from "../src/scene/scene";
-import { ClusteredForwardRenderer } from "../src/shading/clusteredForwardRenderer";
 
 // ── Pure-math: SSAO kernel ──────────────────────────────────────────────────
 
@@ -50,7 +57,9 @@ describe("generateSsaoKernel", () => {
     it("weights later samples farther from the origin (accelerating scale)", () => {
         const avgLen = (from: number, to: number) => {
             let sum = 0;
-            for (let i = from; i < to; i++) sum += Math.hypot(kernel[i * 4]!, kernel[i * 4 + 1]!, kernel[i * 4 + 2]!);
+            for (let i = from; i < to; i++) {
+                sum += Math.hypot(kernel[i * 4]!, kernel[i * 4 + 1]!, kernel[i * 4 + 2]!);
+            }
             return sum / (to - from);
         };
         const q = SSAO_KERNEL_SIZE / 4;
@@ -102,7 +111,7 @@ const AO_H = 256;
 
 /** Renders a box-on-a-floor scene lit only by ambient, returns the mean screen luma [0,1] and any captured validation error. */
 async function renderAoScene(technique: AoTechnique): Promise<{ mean: number; error: string | null }> {
-    const ctx = await RenderContext.createOffscreen({ width: AO_W, height: AO_H, label: `ao-${technique}` });
+    const ctx = await RenderContext.createOffscreen({width: AO_W, height: AO_H, label: `ao-${technique}`});
     const forward = new ClusteredForwardRenderer(ctx.device);
     forward.ao.technique = technique;
 
@@ -113,15 +122,15 @@ async function renderAoScene(technique: AoTechnique): Promise<{ mean: number; er
 
     const scene = new Scene();
     // Ambient-only: sun off, flat white fill. Then final colour ≈ albedo * AO.
-    scene.environment = createInteriorEnvironment({ sunIntensity: 0, ambientColor: [1, 1, 1], ambientIntensity: 1.0 });
+    scene.environment = createInteriorEnvironment({sunIntensity: 0, ambientColor: [1, 1, 1], ambientIntensity: 1.0});
     scene.camera.position = vec3.create(2.2, 2.2, 2.2);
     scene.camera.target = vec3.create(0, 0.25, 0);
     scene.camera.setAspectFromSize(AO_W, AO_H);
 
-    const grey = new Material({ baseColor: [0.5, 0.5, 0.5, 1], metallic: 0, roughness: 1 });
+    const grey = new Material({baseColor: [0.5, 0.5, 0.5, 1], metallic: 0, roughness: 1});
     scene.add(new Mesh(ctx.device, plane(6, 6), "floor"), grey);
     // Box resting on the floor (bottom face at y=0) → contact crease all around its base.
-    scene.add(new Mesh(ctx.device, cube(1, 1, 1), "box"), grey, { position: vec3.create(0, 0.5, 0) });
+    scene.add(new Mesh(ctx.device, cube(1, 1, 1), "box"), grey, {position: vec3.create(0, 0.5, 0)});
 
     ctx.device.pushErrorScope("validation");
     const frame = ctx.beginFrame();
@@ -144,13 +153,15 @@ async function renderAoScene(technique: AoTechnique): Promise<{ mean: number; er
 
     const pixels = await takeScreenshot(ctx.device, ctx.captureTexture!, AO_W, AO_H, `tests/output/ao-${technique}.png`);
     let sum = 0;
-    for (let i = 0; i < pixels.length; i += 4) sum += 0.2126 * pixels[i]! + 0.7152 * pixels[i + 1]! + 0.0722 * pixels[i + 2]!;
+    for (let i = 0; i < pixels.length; i += 4) {
+        sum += 0.2126 * pixels[i]! + 0.7152 * pixels[i + 1]! + 0.0722 * pixels[i + 2]!;
+    }
     const mean = sum / (pixels.length / 4) / 255;
 
     forward.destroy();
     post.destroy();
     ctx.destroy();
-    return { mean, error: err ? `${err.type}: ${err.message}` : null };
+    return {mean, error: err ? `${err.type}: ${err.message}` : null};
 }
 
 const adapter = await requestAdapter({}).catch(() => null);

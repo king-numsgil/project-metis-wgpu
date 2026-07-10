@@ -2,27 +2,35 @@
 // bun-webgpu-rs's own `takeScreenshot` test helper — see
 // bun-webgpu-rs/tests/render.test.ts for the offscreen-rgba8unorm pattern
 // this mirrors (the swapchain's bgra8unorm-srgb can't be read back directly).
-import { mkdirSync } from "node:fs";
 import {
-    GPUShaderStage,
     type GpuBindGroupLayout,
     type GpuCommandEncoder,
     type GpuDevice,
     type GpuRenderPipeline,
+    GPUShaderStage,
 } from "bun-webgpu-rs";
+import { takeScreenshot } from "bun-webgpu-rs/tests/helpers/screenshot.ts";
+import {
+    ClusteredForwardRenderer,
+    createDefaultPostProcessPipeline,
+    createExteriorEnvironment,
+    createInteriorEnvironment,
+    cube,
+    loadGltf,
+    Material,
+    Mesh,
+    plane,
+    type PostProcessFrameContext,
+    type PostProcessPass,
+    RenderContext,
+    roomBox,
+    Scene,
+    uvSphere,
+    VectorText,
+} from "metis-engine";
+import { mkdirSync } from "node:fs";
 import { vec3 } from "wgpu-matrix";
-import { takeScreenshot } from "../../bun-webgpu-rs/tests/helpers/screenshot";
 import { loadMetalPlateTextures, makeEmissivePanelTexture } from "../examples/demoAssets";
-import { cube, plane, roomBox, uvSphere } from "../src/assets/primitives";
-import { loadGltf } from "../src/assets/gltf";
-import { createDefaultPostProcessPipeline, type PostProcessFrameContext, type PostProcessPass } from "../src/postprocess/pipeline";
-import { RenderContext } from "../src/rhi/context";
-import { createExteriorEnvironment, createInteriorEnvironment } from "../src/scene/environment";
-import { Material } from "../src/scene/material";
-import { Mesh } from "../src/scene/mesh";
-import { Scene } from "../src/scene/scene";
-import { ClusteredForwardRenderer } from "../src/shading/clusteredForwardRenderer";
-import { VectorText } from "../src/text/vectorText";
 
 const W = 800;
 const H = 450;
@@ -34,7 +42,7 @@ const FONT_PATH = new URL("../../../assets/JetBrainsMono-Regular.ttf", import.me
 
 /** Shared render-and-screenshot harness: builds a scene, lets auto-exposure settle over a few frames, captures the final frame with a HUD label. */
 async function renderToFile(name: string, hudLabel: string, buildScene: (device: GpuDevice) => Scene) {
-    const ctx = await RenderContext.createOffscreen({ width: W, height: H, label: `fixture-${name}` });
+    const ctx = await RenderContext.createOffscreen({width: W, height: H, label: `fixture-${name}`});
     const forward = new ClusteredForwardRenderer(ctx.device);
     const post = createDefaultPostProcessPipeline(ctx.device);
     const hud = new VectorText(ctx.device, ctx.outputFormat);
@@ -85,16 +93,16 @@ async function renderExterior() {
         scene.camera.target = vec3.create(0, 0.3, 0);
 
         const hullMesh = new Mesh(device, uvSphere(1, 32, 48), "hull");
-        const hullMaterial = new Material({ baseColor: [0.62, 0.64, 0.67, 1], metallic: 0.85, roughness: 0.35 });
+        const hullMaterial = new Material({baseColor: [0.62, 0.64, 0.67, 1], metallic: 0.85, roughness: 0.35});
         scene.add(hullMesh, hullMaterial);
 
         const padMesh = new Mesh(device, cube(6, 0.1, 6), "deck");
-        const padMaterial = new Material({ baseColor: [0.15, 0.15, 0.17, 1], metallic: 0.1, roughness: 0.8 });
-        scene.add(padMesh, padMaterial, { position: vec3.create(0, -1.05, 0) });
+        const padMaterial = new Material({baseColor: [0.15, 0.15, 0.17, 1], metallic: 0.1, roughness: 0.8});
+        scene.add(padMesh, padMaterial, {position: vec3.create(0, -1.05, 0)});
 
         scene.pointLights.push(
-            { position: vec3.create(-1.6, 0.3, 0.8), color: [1, 0.15, 0.1], intensity: 6, range: 4 },
-            { position: vec3.create(1.6, 0.3, 0.8), color: [0.1, 1, 0.2], intensity: 6, range: 4 },
+            {position: vec3.create(-1.6, 0.3, 0.8), color: [1, 0.15, 0.1], intensity: 6, range: 4},
+            {position: vec3.create(1.6, 0.3, 0.8), color: [0.1, 1, 0.2], intensity: 6, range: 4},
         );
 
         return scene;
@@ -115,16 +123,16 @@ async function renderInterior() {
 
         const roomMesh = new Mesh(
             device,
-            roomBox(8, 4, 10, { s0: 0.3, s1: 0.7, t0: 0.4, t1: 0.85 }),
+            roomBox(8, 4, 10, {s0: 0.3, s1: 0.7, t0: 0.4, t1: 0.85}),
             "room",
         );
-        const roomMaterial = new Material({ baseColor: [0.55, 0.54, 0.52, 1], metallic: 0.0, roughness: 0.85 });
+        const roomMaterial = new Material({baseColor: [0.55, 0.54, 0.52, 1], metallic: 0.0, roughness: 0.85});
         scene.add(roomMesh, roomMaterial);
 
         // Ceiling fixtures.
         scene.pointLights.push(
-            { position: vec3.create(-2, 3.6, 1), color: [1, 0.92, 0.75], intensity: 5, range: 6 },
-            { position: vec3.create(2, 3.6, 1), color: [1, 0.92, 0.75], intensity: 5, range: 6 },
+            {position: vec3.create(-2, 3.6, 1), color: [1, 0.92, 0.75], intensity: 5, range: 6},
+            {position: vec3.create(2, 3.6, 1), color: [1, 0.92, 0.75], intensity: 5, range: 6},
         );
 
         return scene;
@@ -138,6 +146,26 @@ async function renderInterior() {
  */
 class NaiveClampPass implements PostProcessPass {
     readonly name = "naive-clamp";
+
+    execute(encoder: GpuCommandEncoder, ctx: PostProcessFrameContext): void {
+        const bindGroup = this.device.createBindGroup({
+            layout: this.bindGroupLayout,
+            entries: [{binding: 0, textureView: ctx.hdrColorView}],
+        });
+        const pass = encoder.beginRenderPass({
+            colorAttachments: [{
+                view: ctx.outputView,
+                loadOp: "clear",
+                storeOp: "store",
+                clearValue: {r: 0, g: 0, b: 0, a: 1},
+            }],
+        });
+        pass.setPipeline(this.pipeline);
+        pass.setBindGroup(0, bindGroup);
+        pass.draw(3);
+        pass.end();
+    }
+
     private readonly pipeline: GpuRenderPipeline;
     private readonly bindGroupLayout: GpuBindGroupLayout;
 
@@ -161,43 +189,29 @@ class NaiveClampPass implements PostProcessPass {
             `,
         });
         this.bindGroupLayout = device.createBindGroupLayout({
-            entries: [{ binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } }],
+            entries: [{binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: {sampleType: "float"}}],
         });
         this.pipeline = device.createRenderPipeline({
-            layout: device.createPipelineLayout({ bindGroupLayouts: [this.bindGroupLayout] }),
-            vertex: { module, entryPoint: "vs" },
-            fragment: { module, entryPoint: "fs", targets: [{ format: "rgba8unorm" }] },
-            primitive: { topology: "triangle-list" },
+            layout: device.createPipelineLayout({bindGroupLayouts: [this.bindGroupLayout]}),
+            vertex: {module, entryPoint: "vs"},
+            fragment: {module, entryPoint: "fs", targets: [{format: "rgba8unorm"}]},
+            primitive: {topology: "triangle-list"},
         });
-    }
-
-    execute(encoder: GpuCommandEncoder, ctx: PostProcessFrameContext): void {
-        const bindGroup = this.device.createBindGroup({
-            layout: this.bindGroupLayout,
-            entries: [{ binding: 0, textureView: ctx.hdrColorView }],
-        });
-        const pass = encoder.beginRenderPass({
-            colorAttachments: [{ view: ctx.outputView, loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 1 } }],
-        });
-        pass.setPipeline(this.pipeline);
-        pass.setBindGroup(0, bindGroup);
-        pass.draw(3);
-        pass.end();
     }
 }
 
 function buildHdrClipScene(device: GpuDevice): Scene {
     const scene = new Scene();
-    scene.environment = createExteriorEnvironment({ ambientIntensity: 0.01, sunIntensity: 1.5 });
+    scene.environment = createExteriorEnvironment({ambientIntensity: 0.01, sunIntensity: 1.5});
     scene.camera.position = vec3.create(0, 1.5, 3);
     scene.camera.target = vec3.create(0, 0, 0);
 
     const floorMesh = new Mesh(device, plane(6, 6), "floor");
-    const floorMaterial = new Material({ baseColor: [0.5, 0.5, 0.52, 1], metallic: 0.0, roughness: 0.9 });
+    const floorMaterial = new Material({baseColor: [0.5, 0.5, 0.52, 1], metallic: 0.0, roughness: 0.9});
     scene.add(floorMesh, floorMaterial);
 
     // Intentionally overbright — a naive clamp will flatten this to a hard white disc.
-    scene.pointLights.push({ position: vec3.create(0, 0.4, 0), color: [1, 0.95, 0.85], intensity: 80, range: 5 });
+    scene.pointLights.push({position: vec3.create(0, 0.4, 0), color: [1, 0.95, 0.85], intensity: 80, range: 5});
 
     return scene;
 }
@@ -205,7 +219,7 @@ function buildHdrClipScene(device: GpuDevice): Scene {
 /** Compares the default (auto-exposure + ACES) pipeline against a naive exposure*clamp baseline on an intentionally overbright light. */
 async function renderHdrClipComparison() {
     for (const variant of ["tonemapped", "naive-clamp"] as const) {
-        const ctx = await RenderContext.createOffscreen({ width: W, height: H, label: `fixture-hdr-clip-${variant}` });
+        const ctx = await RenderContext.createOffscreen({width: W, height: H, label: `fixture-hdr-clip-${variant}`});
         const forward = new ClusteredForwardRenderer(ctx.device);
         const naive = variant === "naive-clamp" ? new NaiveClampPass(ctx.device) : null;
         const post = variant === "tonemapped" ? createDefaultPostProcessPipeline(ctx.device) : null;
@@ -229,8 +243,11 @@ async function renderHdrClipComparison() {
                 height: H,
                 deltaTime: 1 / 30,
             };
-            if (post) post.pipeline.run(encoder, frameCtx);
-            else naive!.execute(encoder, frameCtx);
+            if (post) {
+                post.pipeline.run(encoder, frameCtx);
+            } else {
+                naive!.execute(encoder, frameCtx);
+            }
             if (i === 29) {
                 hud.drawText(`METIS-ENGINE // HDR-CLIP (${variant})`, "mono", 18, 16, 28);
                 hud.render(encoder, frame.view, W, H, [0.85, 0.95, 1.0, 1.0]);
@@ -256,27 +273,31 @@ const GLTF_SOURCE = "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-
 
 /** Downloads the Khronos "Box" sample glTF into a local cache directory (once) and returns the cached .gltf path. Stretch goal — see CLAUDE.md's known limitations for why only this one plain, texture-free sample is supported. */
 async function ensureGltfSampleCached(): Promise<string> {
-    mkdirSync(GLTF_CACHE_DIR, { recursive: true });
+    mkdirSync(GLTF_CACHE_DIR, {recursive: true});
     const gltfPath = `${GLTF_CACHE_DIR}Box.gltf`;
     for (const file of ["Box.gltf", "Box0.bin"]) {
         const dest = `${GLTF_CACHE_DIR}${file}`;
-        if (await Bun.file(dest).exists()) continue;
+        if (await Bun.file(dest).exists()) {
+            continue;
+        }
         const response = await fetch(`${GLTF_SOURCE}${file}`);
-        if (!response.ok) throw new Error(`failed to download ${file}: ${response.status}`);
+        if (!response.ok) {
+            throw new Error(`failed to download ${file}: ${response.status}`);
+        }
         await Bun.write(dest, await response.arrayBuffer());
     }
     return gltfPath;
 }
 
 async function renderGltfDemo() {
-    const ctx = await RenderContext.createOffscreen({ width: W, height: H, label: "fixture-gltf" });
+    const ctx = await RenderContext.createOffscreen({width: W, height: H, label: "fixture-gltf"});
     const forward = new ClusteredForwardRenderer(ctx.device);
     const post = createDefaultPostProcessPipeline(ctx.device);
     const hud = new VectorText(ctx.device, ctx.outputFormat);
     hud.loadFont("mono", FONT_PATH);
 
     const scene = new Scene();
-    scene.environment = createExteriorEnvironment({ ambientIntensity: 0.05 });
+    scene.environment = createExteriorEnvironment({ambientIntensity: 0.05});
     scene.camera.position = vec3.create(2.5, 2, 3);
     scene.camera.target = vec3.create(0, 0, 0);
     scene.camera.setAspectFromSize(W, H);
@@ -319,14 +340,14 @@ async function renderGltfDemo() {
 }
 
 async function renderTexturedDemo() {
-    const ctx = await RenderContext.createOffscreen({ width: W, height: H, label: "fixture-textured" });
+    const ctx = await RenderContext.createOffscreen({width: W, height: H, label: "fixture-textured"});
     const forward = new ClusteredForwardRenderer(ctx.device);
     const post = createDefaultPostProcessPipeline(ctx.device);
     const hud = new VectorText(ctx.device, ctx.outputFormat);
     hud.loadFont("mono", FONT_PATH);
 
     const scene = new Scene();
-    scene.environment = createExteriorEnvironment({ ambientIntensity: 0.03 });
+    scene.environment = createExteriorEnvironment({ambientIntensity: 0.03});
     scene.camera.position = vec3.create(0, 1.0, 4.2);
     scene.camera.target = vec3.create(0.1, 0.15, 0);
     scene.camera.setAspectFromSize(W, H);
@@ -344,7 +365,7 @@ async function renderTexturedDemo() {
         metallicTexture: metalPlate.metallic,
         roughnessTexture: metalPlate.roughness,
     });
-    scene.add(panelMesh, panelMaterial, { position: vec3.create(-1.2, 0, 0), rotationEuler: vec3.create(0.25, 0.5, 0) });
+    scene.add(panelMesh, panelMaterial, {position: vec3.create(-1.2, 0, 0), rotationEuler: vec3.create(0.25, 0.5, 0)});
 
     const emissiveMesh = new Mesh(ctx.device, plane(1.2, 0.8), "emissive-panel");
     const emissiveMaterial = new Material({
@@ -359,7 +380,7 @@ async function renderTexturedDemo() {
         rotationEuler: vec3.create(Math.PI / 2, 0, 0),
     });
 
-    scene.pointLights.push({ position: vec3.create(1.5, 2, 3), color: [1, 0.95, 0.85], intensity: 8, range: 8 });
+    scene.pointLights.push({position: vec3.create(1.5, 2, 3), color: [1, 0.95, 0.85], intensity: 8, range: 8});
 
     for (let i = 0; i < 30; i++) {
         const frame = ctx.beginFrame();

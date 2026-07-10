@@ -9,7 +9,7 @@ export const CLUSTER_COUNT_Z = 24;
 export const NUM_CLUSTERS = CLUSTER_COUNT_X * CLUSTER_COUNT_Y * CLUSTER_COUNT_Z;
 
 /** Per-cluster light-index-list capacity. */
-export const MAX_LIGHTS_PER_CLUSTER = 32;
+export const MAX_LIGHTS_PER_CLUSTER = 64;
 
 /** Total point lights the renderer will upload in a single frame. */
 export const MAX_POINT_LIGHTS = 256;
