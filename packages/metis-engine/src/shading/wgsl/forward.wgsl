@@ -3,10 +3,12 @@
 
 @group(0) @binding(0) var<uniform> camera: Camera;
 @group(0) @binding(1) var<uniform> environment: Environment;
-@group(0) @binding(2) var shadowMap: texture_2d<f32>; // moments: E[z], E[z^2], E[z^3], E[z^4]
-@group(0) @binding(3) var shadowSampler: sampler; // non-filtering — rgba32float has no linear-filter support
-@group(0) @binding(4) var<uniform> shadowUniforms: ShadowUniforms;
+@group(0) @binding(2) var cascade0Moments: texture_2d<f32>; // cascade 0 MSM: E[z]..E[z^4]
+@group(0) @binding(3) var momentsSampler: sampler; // non-filtering — rgba32float has no linear-filter support
+@group(0) @binding(4) var<uniform> cascades: CascadeUniforms;
 @group(0) @binding(5) var aoTex: texture_2d<f32>; // screen-space ambient occlusion (r8, 1 = fully open)
+@group(0) @binding(6) var cascadeDepth: texture_depth_2d_array; // cascades 1..N (PCF), one layer each
+@group(0) @binding(7) var cascadeCompareSampler: sampler_comparison; // hardware PCF (compare less-equal)
 
 @group(1) @binding(0) var<uniform> material: Material;
 @group(1) @binding(1) var matSampler: sampler;
@@ -39,8 +41,6 @@ struct VertexOutput {
     @location(4) worldTangent: vec4<f32>,
 };
 
-// Shadow map is SHADOW_MAP_SIZE x SHADOW_MAP_SIZE (clusteredForwardRenderer.ts) — keep in sync.
-const SHADOW_TEXEL_SIZE: f32 = 1.0 / 2048.0;
 
 // Hausdorff 4-moment shadow mapping (Peters & Klein 2015, Algorithm 4 /
 // supplementary Listing 4): reconstructs an occlusion estimate from the first
@@ -139,39 +139,96 @@ fn computeMsmOcclusion(rawMoments: vec4<f32>, queryDepth: f32) -> f32 {
     return clamp(shadowIntensity, 0.0, 1.0);
 }
 
-// Fragments outside the shadow frustum default to fully lit — the frustum is
-// fit to the scene's bounding sphere each frame (see
-// clusteredForwardRenderer.ts), so this only matters for stray geometry well
-// outside it.
-fn sampleSunShadow(worldPosition: vec3<f32>, N: vec3<f32>) -> f32 {
-    // Normal offset: insurance against self-shadowing on sloped/curved
-    // receivers. Sized in *shadow texels*, not absolute units: the 3x3 PCF
-    // taps sample texels up to sqrt(2) texels away but compare against this
-    // fragment's own query depth, so on a sloped receiver the neighbors'
-    // stored depths differ by up to ~1.4 texel-footprints of surface slope —
-    // the offset must clear that. 0.04 ≈ 2.5 texels at 2048 over this
-    // scene's ~17.5-unit shadow frustum (the old 0.02 was tuned at 4096 and
-    // measurably failed at 2048: a sunlit 60°-lit floor read 0.81 visibility
-    // because the diagonal taps' slope delta exceeded the offset's depth
-    // margin). If SHADOW_MAP_SIZE or the scene scale changes, rescale this.
-    let offsetPosition = worldPosition + N * 0.04;
-    let lightClip = shadowUniforms.lightViewProj * vec4<f32>(offsetPosition, 1.0);
-    let shadowUV = lightClip.xy * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5, 0.5);
-    let depth = lightClip.z;
+// The normal offset (per cascade, texel-scaled) clears self-shadowing on
+// sloped receivers: the 3x3 taps reach ~1.4 texels away but compare against
+// this fragment's own depth, so on a slope the neighbours' stored depths differ
+// by up to ~1.4 texel-footprints of slope — the offset must exceed that. It is
+// sized per cascade because each cascade's texel is a different world size.
+fn shadowClipUV(cascade: i32, worldPosition: vec3<f32>, N: vec3<f32>) -> vec3<f32> {
+    let offsetPosition = worldPosition + N * cascades.normalOffsets[cascade];
+    let lightClip = cascades.lightViewProj[cascade] * vec4<f32>(offsetPosition, 1.0);
+    // Ortho projection (w = 1), so lightClip.z is already the [0,1] shadow depth.
+    let uv = lightClip.xy * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5, 0.5);
+    return vec3<f32>(uv, lightClip.z);
+}
 
-    if (shadowUV.x < 0.0 || shadowUV.x > 1.0 || shadowUV.y < 0.0 || shadowUV.y > 1.0 || depth < 0.0 || depth > 1.0) {
+// Cascade 0: Hausdorff 4-moment shadow mapping (no bias -> no peter-panning,
+// corner-leak-proof). 3x3 PCF over the reconstructed occlusion.
+fn sampleCascade0(worldPosition: vec3<f32>, N: vec3<f32>) -> f32 {
+    let cu = shadowClipUV(0, worldPosition, N);
+    if (cu.x < 0.0 || cu.x > 1.0 || cu.y < 0.0 || cu.y > 1.0 || cu.z < 0.0 || cu.z > 1.0) {
         return 1.0;
     }
-
+    let texel = 1.0 / cascades.params.y;
     var sum = 0.0;
     for (var dy = -1; dy <= 1; dy++) {
         for (var dx = -1; dx <= 1; dx++) {
-            let offset = vec2<f32>(f32(dx), f32(dy)) * SHADOW_TEXEL_SIZE;
-            let moments = textureSampleLevel(shadowMap, shadowSampler, shadowUV + offset, 0.0);
-            sum += 1.0 - computeMsmOcclusion(moments, depth);
+            let m = textureSampleLevel(cascade0Moments, momentsSampler, cu.xy + vec2<f32>(f32(dx), f32(dy)) * texel, 0.0);
+            sum += 1.0 - computeMsmOcclusion(m, cu.z);
         }
     }
     return sum / 9.0;
+}
+
+// Cascades 1..N: plain depth + hardware comparison PCF (3x3 taps, each a 2x2
+// bilinear compare via the linear comparison sampler -> effectively 4x4). The
+// shadow depth is standard-Z (near=0 = closest to light), and the sampler's
+// "less-equal" compare returns the fraction of texels the receiver is in front
+// of — i.e. the lit fraction.
+fn samplePcfCascade(cascade: i32, worldPosition: vec3<f32>, N: vec3<f32>) -> f32 {
+    let layer = cascade - 1;
+    let cu = shadowClipUV(cascade, worldPosition, N);
+    if (cu.x < 0.0 || cu.x > 1.0 || cu.y < 0.0 || cu.y > 1.0 || cu.z < 0.0 || cu.z > 1.0) {
+        return 1.0;
+    }
+    let texel = 1.0 / cascades.params.y;
+    var sum = 0.0;
+    for (var dy = -1; dy <= 1; dy++) {
+        for (var dx = -1; dx <= 1; dx++) {
+            let o = vec2<f32>(f32(dx), f32(dy)) * texel;
+            sum += textureSampleCompareLevel(cascadeDepth, cascadeCompareSampler, cu.xy + o, layer, cu.z);
+        }
+    }
+    return sum / 9.0;
+}
+
+fn sampleCascadeVis(cascade: i32, worldPosition: vec3<f32>, N: vec3<f32>) -> f32 {
+    if (cascade == 0) {
+        return sampleCascade0(worldPosition, N);
+    }
+    return samplePcfCascade(cascade, worldPosition, N);
+}
+
+// Cascaded directional shadow: pick the cascade whose slice contains this
+// fragment's view-space depth, then cross-fade into the next across a small
+// band at the far edge so the resolution step is invisible. Past the last
+// cascade's far boundary, everything is fully lit.
+fn sampleSunShadow(worldPosition: vec3<f32>, N: vec3<f32>, linearDepth: f32) -> f32 {
+    let count = i32(cascades.params.x);
+    if (linearDepth >= cascades.splitFar[count - 1]) {
+        return 1.0;
+    }
+
+    var c = 0;
+    for (var i = 0; i < count; i = i + 1) {
+        if (linearDepth < cascades.splitFar[i]) {
+            c = i;
+            break;
+        }
+    }
+
+    var vis = sampleCascadeVis(c, worldPosition, N);
+
+    if (c < count - 1) {
+        let nearEdge = select(0.0, cascades.splitFar[max(c - 1, 0)], c > 0);
+        let farEdge = cascades.splitFar[c];
+        let band = (farEdge - nearEdge) * cascades.params.z;
+        if (band > 0.0 && linearDepth > farEdge - band) {
+            let t = clamp((linearDepth - (farEdge - band)) / band, 0.0, 1.0);
+            vis = mix(vis, sampleCascadeVis(c + 1, worldPosition, N), t);
+        }
+    }
+    return vis;
 }
 
 @vertex
@@ -214,7 +271,8 @@ fn fs(input: VertexOutput) -> @location(0) vec4<f32> {
     // lets the sun reach the fragment.
     let sunL = normalize(-environment.sunDirection);
     let sunRadiance = environment.sunColorIntensity.rgb * environment.sunColorIntensity.a;
-    let sunVisibility = sampleSunShadow(input.worldPosition, geometricNormal);
+    // -viewZ is the positive view-space depth, used to select the shadow cascade.
+    let sunVisibility = sampleSunShadow(input.worldPosition, geometricNormal, -input.viewZ);
     color += shadeLight(N, V, sunL, sunRadiance, albedo, metallic, roughness) * sunVisibility;
 
     // Flat ambient fill (the documented handwave for bounce light indoors),

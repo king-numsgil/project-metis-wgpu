@@ -26,8 +26,24 @@ struct Model {
     normalMat: mat3x3<f32>,
 };
 
+// One light-space matrix for the shadow *render* passes — bound one cascade at
+// a time via an offset bind group (shadow.wgsl).
 struct ShadowUniforms {
     lightViewProj: mat4x4<f32>,
+};
+
+// The full cascade set consumed by the forward *sampling* pass. Keep in sync
+// with clusteredForwardRenderer.ts's CASCADE_FORWARD_SIZE and cascade writes.
+const CASCADE_COUNT: u32 = 4u;
+struct CascadeUniforms {
+    lightViewProj: array<mat4x4<f32>, 4>, // one ortho light-view-proj per cascade
+    splitFar: vec4<f32>,                  // far view-depth boundary of cascades 0..3
+    // Per-cascade world-space normal offset (texel-scaled). Not a constant: the
+    // offset must clear the depth spread of the PCF footprint, which scales with
+    // each cascade's texel size, so a fixed value silently under-biases the
+    // coarse far cascades (acne) or over-biases the fine near one (peter-panning).
+    normalOffsets: vec4<f32>,
+    params: vec4<f32>,                    // x = cascade count, y = shadow map size, z = blend fraction
 };
 
 const PI: f32 = 3.14159265359;

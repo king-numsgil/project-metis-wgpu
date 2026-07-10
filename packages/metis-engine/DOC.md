@@ -344,17 +344,40 @@ normalMatrixFromModel(model, dst?): Mat3Arg // inverse-transpose upper 3x3
 class ClusteredForwardRenderer {
     constructor(device: GpuDevice)
     readonly ao: AmbientOcclusion;
+    shadowDistance: number;       // far reach of the cascaded shadows (default 400)
+    cascadeSplitLambda: number;   // practical-split blend, 1=log 0=uniform (default 0.85)
     readonly frameBindGroupLayout, materialBindGroupLayout, modelBindGroupLayout: GpuBindGroupLayout;
     render(encoder: GpuCommandEncoder, targets: RenderTargets, scene: Scene): void;
     destroy(): void;
 }
 ```
 
+**Directional shadows are a 4-cascade CSM** (hybrid: cascade 0 = Moment Shadow
+Mapping, cascades 1–3 = depth + hardware PCF). You get correct shadows across a
+wide depth range without tuning — crisp near, coarser-but-attached far, no bleed.
+Two knobs:
+
+- **`shadowDistance`** (default 400) — how far shadows reach, in world units. The
+  4 cascades subdivide `[camera.near, shadowDistance]`, so set it to the distance
+  shadows stay legible, not to the horizon: a needlessly large value coarsens
+  *every* cascade. Geometry beyond it renders fully sunlit. For a planetary scene
+  this is what keeps the cascades on the near surface instead of trying (and
+  failing) to span to the Moon.
+- **`cascadeSplitLambda`** (default 0.85) — biases resolution toward the camera.
+  `1` = fully logarithmic (tightest near cascade), `0` = uniform. Raise it if near
+  shadows aren't crisp enough; lower it if the far cascade is starved.
+
+Fixed internals: `SHADOW_MAP_SIZE = 2048` per cascade; VRAM ≈ 184 MB (cascade 0's
+MSM moments + MSAA depth dominate). The per-cascade bias is texel-scaled
+automatically. Cascade boundaries cross-fade, so there's no visible seam.
+`shadowDistance` is the replacement for the old `shadowRadius` (CSM supersedes the
+single camera-clamped map). See CLAUDE.md "Cascaded shadow maps" for the design.
+
 `render()` records, in order, every frame:
 
 1. Write camera + environment uniforms.
 2. Write cluster params + pack the point-light array.
-3. **Shadow depth pass** (4x MSAA, depth-only, `cullMode: "none"`) → **moment resolve** (→ `rgba32float` E[z]..E[z⁴]).
+3. **Cascaded shadow passes** (`cullMode: "none"`): cascade 0 = 4x-MSAA depth → moment resolve (→ `rgba32float` E[z]..E[z⁴]); cascades 1–3 = single-sample depth into a `depth_2d_array` layer each.
 4. **Cluster build** (compute) — per-cluster view-space AABBs.
 5. **Light cull** (compute) — sphere-vs-AABB, writes per-cluster light index lists.
 6. **AO** — `clearToWhite` if `technique === None`, else prepass + SSAO/HBAO + blur.
