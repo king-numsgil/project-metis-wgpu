@@ -153,6 +153,9 @@ Getting any of these wrong produces a plausible-looking but wrong image.
 |---|---|
 | Triangles wind **CCW seen from the outside**; the forward pipeline culls back faces. | Lights appear on the wrong side, specular vanishes (the `uvSphere` bug — CLAUDE.md). |
 | Post-process reads `targets.hdrColorResolvedView`, never `hdrColorMultisampledView`. | Validation error or garbage. |
+| **Depth is reverse-Z.** Any pipeline writing the main depth buffer uses `depthCompare: "greater"` + `depthClearValue: 0.0`. | Depth sorts backwards — far geometry paints over near. |
+| Anything *reading* the main depth buffer tests background as `depth <= 0.0` (not `>= 1.0`). | Background/foreground inverted (e.g. auto-exposure meters the empty sky and blows out). |
+| The **shadow** pass is orthographic and stays standard-Z (`"less"`, clear `1.0`). Do not "fix" it for consistency. | Shadows invert; the MSM reconstruction assumes `[0,1]` support. |
 | `Environment.sunDirection` is the direction light **travels** (sun → scene), normalized. | Sun lights the wrong side. |
 | Point lights contribute nothing past `range`; the shader's falloff window matches the cull sphere. | Lights pop at cluster edges. |
 | **`bun-webgpu-rs` never throws on WebGPU validation errors** — they print to stderr as `[wgpu] uncaptured error:` and execution continues with garbage. | A script "succeeds" having rendered nothing. Grep output for `wgpu`, or wrap a frame in `pushErrorScope("validation")` / `await popErrorScope()`. |
@@ -302,11 +305,31 @@ Exterior vs. interior is **only** `ambientIntensity` (+ geometry). There is no
 ```ts
 class Camera {
     position, target, up: Vec3Arg;
-    fovYRadians = Math.PI / 4; aspect = 16 / 9; near = 0.1; far = 1000;
+    fovYRadians = Math.PI / 4; aspect = 16 / 9;
+    near = 0.01;        // cheap to make small: reverse-Z precision is ~z * 2^-24, independent of near
+    clusterFar = 1000;  // light-culling range only — NOT a clip plane. There is no `far`.
     setAspectFromSize(width, height): void;
     viewMatrix(dst?), projectionMatrix(dst?), viewProjectionMatrix(dst?): Mat4Arg;
 }
 
+**`projectionMatrix()` is reverse-Z with an infinite far plane** (`near → ndc.z 1`,
+`∞ → 0`, so `ndc.z == near / viewDepth`). There is deliberately **no `far`
+field** — the far plane cancels out of `near/z`, so it's infinite for free, and
+distant precision doesn't depend on `near` either. Combined with the engine's
+`depth32float` buffer this gives ~constant *relative* depth precision
+(`gap/z ≈ 2⁻²⁴ ≈ 6e-8`) from centimetres to thousands of kilometres — a
+logarithmic depth buffer without `frag_depth` writes. Rationale, measurements,
+and what it did *not* break: CLAUDE.md, "Reverse-Z with an infinite far plane".
+
+`clusterFar` exists because the **clustered light grid** still needs a finite
+depth range to slice exponentially. It is not a clip plane: geometry past it
+renders normally (lit by sun + ambient); only *point lights* past it stop being
+culled into clusters, and so contribute nothing. Widening `[near, clusterFar]`
+coarsens Z-slice density —
+`slices-per-doubling = CLUSTER_COUNT_Z / log2(clusterFar / near)` — so prefer a
+tight `clusterFar` for indoor scenes.
+
+```ts
 interface Transform { position: Vec3Arg; rotationEuler: Vec3Arg; scale: Vec3Arg }
 createTransform(overrides?: Partial<Transform>): Transform
 transformToMat4(t, dst?): Mat4Arg          // T * Rx * Ry * Rz * S
@@ -349,6 +372,11 @@ MAX_LIGHTS_PER_CLUSTER = 64;      // per-cluster capacity cap
 MAX_POINT_LIGHTS = 256;           // per-scene cap (excess is dropped with a console.warn)
 COMPUTE_WORKGROUP_SIZE = 64;
 ```
+
+The grid's depth range is `[camera.near, camera.clusterFar]`, **not** a projection
+far plane (there isn't one — see §4). The cluster math works entirely in
+*view space* (`clusterZIndex` takes linear `-viewZ`), which is why it is
+completely independent of the reverse-Z depth convention.
 
 **`MAX_LIGHTS_PER_CLUSTER` is a hard cap, enforced by dropping lights.** When
 more than that many lights overlap one cluster, the cull loop `break`s and the

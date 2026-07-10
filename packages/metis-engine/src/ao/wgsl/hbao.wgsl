@@ -54,8 +54,8 @@ fn fs(in: VOut) -> @location(0) f32 {
     let screen = ao.params0.xy;
     let coord = vec2<i32>(in.pos.xy);
     let depth = textureLoad(depthTex, coord, 0);
-    if (depth >= 1.0) {
-        return 1.0; // background
+    if (depth <= 0.0) {
+        return 1.0; // background (reverse-Z: 0 = infinitely far)
     }
 
     let uv = in.pos.xy / screen;
@@ -98,8 +98,8 @@ fn fs(in: VOut) -> @location(0) f32 {
                 continue;
             }
             let sampleDepth = textureLoad(depthTex, sampleCoord, 0);
-            if (sampleDepth >= 1.0) {
-                continue;
+            if (sampleDepth <= 0.0) {
+                continue; // reverse-Z background
             }
 
             let S = reconstructViewPos(sampleUV, sampleDepth);

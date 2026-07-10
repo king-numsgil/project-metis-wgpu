@@ -50,8 +50,8 @@ fn fs(in: VOut) -> @location(0) f32 {
     let screen = ao.params0.xy;
     let coord = vec2<i32>(in.pos.xy);
     let depth = textureLoad(depthTex, coord, 0);
-    if (depth >= 1.0) {
-        return 1.0; // background — nothing to occlude
+    if (depth <= 0.0) {
+        return 1.0; // background — nothing to occlude (reverse-Z: 0 = infinitely far)
     }
 
     let uv = in.pos.xy / screen;
@@ -84,8 +84,8 @@ fn fs(in: VOut) -> @location(0) f32 {
 
         let sampleCoord = vec2<i32>(sampleUV * screen);
         let sampleDepth = textureLoad(depthTex, sampleCoord, 0);
-        if (sampleDepth >= 1.0) {
-            continue; // no occluder at this screen location
+        if (sampleDepth <= 0.0) {
+            continue; // no occluder at this screen location (reverse-Z background)
         }
         let storedPos = reconstructViewPos(sampleUV, sampleDepth);
 

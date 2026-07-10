@@ -186,7 +186,10 @@ export class ClusteredForwardRenderer {
             vertex: {module, entryPoint: "vs", buffers: [MESH_VERTEX_LAYOUT]},
             fragment: {module, entryPoint: "fs", targets: [{format: HDR_COLOR_FORMAT}]},
             primitive: {topology: "triangle-list", cullMode: "back"},
-            depthStencil: {format: DEPTH_FORMAT, depthWriteEnabled: true, depthCompare: "less"},
+            // "greater", not "less": Camera uses a reverse-Z projection (near -> 1,
+            // infinity -> 0), which is what makes depth32float's precision land
+            // where the perspective divide needs it. Paired with depthClearValue 0.
+            depthStencil: {format: DEPTH_FORMAT, depthWriteEnabled: true, depthCompare: "greater"},
             multisample: {count: MSAA_SAMPLE_COUNT},
         });
 
@@ -438,7 +441,7 @@ export class ClusteredForwardRenderer {
                 view: targets.depthView,
                 depthLoadOp: "clear",
                 depthStoreOp: "store",
-                depthClearValue: 1.0,
+                depthClearValue: 0.0, // reverse-Z: 0 = infinitely far = "nothing drawn"
             },
         });
 
@@ -490,7 +493,10 @@ export class ClusteredForwardRenderer {
         const invProj = mat4.invert(scene.camera.projectionMatrix());
         const params = new Std140Writer();
         params.mat4(invProj);
-        params.vec4(targets.width, targets.height, scene.camera.near, scene.camera.far);
+        // clusterFar, not a projection far plane — the reverse-Z projection is
+        // infinite. The cluster grid needs a finite range to slice
+        // exponentially; lights past it simply aren't culled into any cluster.
+        params.vec4(targets.width, targets.height, scene.camera.near, scene.camera.clusterFar);
         params.vec4u(CLUSTER_COUNT_X, CLUSTER_COUNT_Y, CLUSTER_COUNT_Z, MAX_LIGHTS_PER_CLUSTER);
         const lightCount = Math.min(scene.pointLights.length, MAX_POINT_LIGHTS);
         params.vec4u(lightCount, 0, 0, 0);

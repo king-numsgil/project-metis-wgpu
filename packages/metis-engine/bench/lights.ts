@@ -184,7 +184,7 @@ const scene = new Scene();
 scene.environment = createExteriorEnvironment({ambientIntensity: 0.02});
 scene.camera.position = vec3.create(0, 11, 30);
 scene.camera.target = vec3.create(0, 1, 0);
-scene.camera.far = 200;
+scene.camera.clusterFar = 200; // light-culling range; the projection itself is infinite
 scene.camera.setAspectFromSize(ctx.width, ctx.height);
 
 const floorMesh = new Mesh(ctx.device, plane(PLANE_SIZE, PLANE_SIZE), "bench-floor");

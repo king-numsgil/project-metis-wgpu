@@ -5,11 +5,14 @@
 // partial sum (+ valid-pixel count) per workgroup; pass 2 reduces all of
 // those to one value.
 //
-// Background pixels (depth == far, nothing drawn there) are excluded from
-// the average — a space sim's frame is mostly empty black sky, and naively
-// including it drags the "average" luminance so low that auto-exposure
-// blows the actual geometry out to white trying to compensate. See
-// math/Tonemapping and exposure formulas.md's "the one labeled handwave".
+// Background pixels (nothing drawn there) are excluded from the average — a
+// space sim's frame is mostly empty black sky, and naively including it drags
+// the "average" luminance so low that auto-exposure blows the actual geometry
+// out to white trying to compensate. See math/Tonemapping and exposure
+// formulas.md's "the one labeled handwave".
+//
+// The camera uses a reverse-Z projection (math/camera.ts), so the depth buffer
+// clears to 0 and "background" is `depth <= 0`, not `depth >= 1`.
 
 struct LuminanceParams {
     width: u32,
@@ -44,7 +47,7 @@ fn reduceTile(
     var valid = 0u;
     if (gid.x < lumParams.width && gid.y < lumParams.height) {
         let depth = textureLoad(depthTex, vec2<i32>(i32(gid.x), i32(gid.y)), 0);
-        if (depth < 1.0) {
+        if (depth > 0.0) { // reverse-Z: >0 means geometry was drawn here
             let color = textureLoad(hdrTex, vec2<i32>(i32(gid.x), i32(gid.y)), 0).rgb;
             let luma = dot(color, vec3<f32>(0.2126, 0.7152, 0.0722));
             logLum = log(max(luma, 1e-5));

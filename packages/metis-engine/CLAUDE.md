@@ -137,6 +137,76 @@ wiring keeps the data flow (and the resolved-vs-multisampled view choice) visibl
 at the call site. Don't add one without a fresh reason; do keep `RenderContext`
 strictly optional, and don't let engine types acquire a window/surface dependency.
 
+### Reverse-Z with an infinite far plane — and why the near plane is now free
+
+`Camera.projectionMatrix()` is `mat4.perspectiveReverseZ(fov, aspect, near)` with
+`zFar` **omitted** (infinite). Near maps to `ndc.z = 1`, infinity to `0`, so
+`ndc.z == near / viewDepth` exactly. The forward and AO-prepass pipelines
+therefore use `depthCompare: "greater"` and `depthClearValue: 0.0`, and anything
+sampling the main depth buffer tests background as `depth <= 0`, not `>= 1`.
+
+This is *the* depth setup for a space sim, and it only works because the depth
+buffer is `depth32float`. Standard Z wastes float precision twice over: the float
+is densest near 0, and the perspective divide *also* concentrates precision near
+the near plane, so the two compound and distant geometry gets almost nothing.
+Reverse-Z maps near to 1, putting the float's dense-near-zero region exactly
+where `1/z` is coarsest. The two cancel.
+
+Measured (float32 ULPs, `near = 0.01`), the smallest resolvable world-space gap:
+
+| view z | standard Z | reverse Z |
+|---|---|---|
+| 0.1 m | ~0 nm | 5.96 nm |
+| 1 m | 596 nm | 74.5 nm |
+| 100 m | 5.96 mm | 11.6 µm |
+| 1 km | 596 mm | 72.8 µm |
+| 10 km | 59.3 m | 909 µm |
+
+Reverse-Z is worse *only* within ~30 cm of the near plane, where both are
+nanometre-scale — i.e. it costs nothing usable. `gap/z` stays ~`2^-24` at every
+distance, so this **is** a logarithmic depth buffer, obtained free from the
+float's exponent bits rather than by writing `@builtin(frag_depth)` (which would
+disable early-Z — the reason log depth was rejected). Two corollaries:
+
+- **The far plane cancels out of `near/z`**, so it's infinite at zero precision cost.
+- **`dz ≈ z · 2^-24` is independent of `near`**, so `near = 0.01` costs distant
+  precision nothing. Under standard Z the near plane tyrannises everything; here
+  it doesn't.
+
+With a `depth24unorm` buffer, reversing would buy almost nothing — uniform
+quantization is symmetric under flipping. `depth32float` is the precondition.
+
+**The shadow pass deliberately stays standard-Z** (`"less"`, clear `1.0`). It's
+*orthographic*: depth is already linear, so reverse-Z gains it nothing, and the
+Moment Shadow Mapping reconstruction is tuned around support on `[0,1]` with a
+hand-verified bias constant (Formula 6). It has its own `SHADOW_DEPTH_FORMAT` and
+pipeline, so the two conventions coexist cleanly. Don't "fix" it for consistency.
+
+**Clustering was unaffected**, which is the non-obvious part: the cluster grid
+never touches NDC depth. `clusterZIndex` consumes *linear view-space* depth
+(`-viewZ`, from the view matrix), and `cluster_build.wgsl` slices on `zNear`/
+`zFar` in view space; its `invProj` unprojection auto-follows whatever projection
+the camera produced. `cluster_build.wgsl`, `light_cull.wgsl`, and `common.wgsl`
+needed **zero** changes. (`screenToViewRay` unprojects at `ndc.z = 1.0`, which
+used to be the far plane and is now the near plane — still a valid point along the
+same ray, and `intersectZPlane` rescales it, so relative precision is preserved.)
+
+The one real cost: the grid needs a *finite* range, so `Camera.clusterFar`
+(default 1000 m) replaces the projection's far plane for light culling only.
+Widening `[near, clusterFar]` coarsens Z-slice density —
+`slices-per-doubling = CLUSTER_COUNT_Z / log2(clusterFar / near)`, so dropping
+`near` 0.1 → 0.01 took the bench's 200-light scene from 2.19 to 1.68 slices per
+doubling and GPU frame time from 2.51 ms → 2.69 ms (more lights land in the same
+cluster). If that ever matters, raise `near` or lower `clusterFar` rather than
+adding slices. Lights beyond `clusterFar` are simply never culled into a cluster
+and contribute nothing; geometry beyond it still renders.
+
+Verified after the change: `test/ao.test.ts` (GPU readback, creases darken), the
+full `bun run fixture` set (exterior/interior/hdr-clip/gltf/textured, no `wgpu`
+errors, correct occlusion + shadows + auto-exposure), the 200-light bench, and
+`metis-game`. A CPU port of `cluster_build`'s ray/AABB math confirmed all 24 Z
+slices round-trip through `clusterZIndex` and every AABB is finite.
+
 ### Why "clustered forward," concretely
 
 `ClusteredForwardRenderer.render()` does, every frame: (1) write the camera/environment uniforms, (2) fit an orthographic shadow frustum to the scene's bounding sphere and render a depth-only pass from the sun's viewpoint (`shadow.wgsl`), (3) run two compute passes — `cluster_build.wgsl` divides the view frustum into a fixed 16×9×24 grid with exponential depth slicing, `light_cull.wgsl` sphere-tests every point light against every cluster's AABB and writes a per-cluster light-index list — then (4) the actual forward pass, where `forward.wgsl`'s fragment shader looks up its own cluster and only shades the lights assigned to it, plus the sun (shadow-tested) and a flat ambient term. See `math/Clustered forward formulas.md` for the exact formulas, including the two real bugs hit building this (a room mesh's shadow frustum computed from instance *position* instead of mesh *extent*, and shadow-pass backface culling dropping a room's inward-facing geometry when viewed from outside by the light) and how they were diagnosed.

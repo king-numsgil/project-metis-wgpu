@@ -122,7 +122,11 @@ export class AmbientOcclusion {
             vertex: {module: prepassModule, entryPoint: "vs", buffers: [MESH_VERTEX_LAYOUT]},
             fragment: {module: prepassModule, entryPoint: "fs", targets: [{format: NORMAL_FORMAT}]},
             primitive: {topology: "triangle-list", cullMode: "back"},
-            depthStencil: {format: DEPTH_FORMAT, depthWriteEnabled: true, depthCompare: "less"},
+            // "greater" + clear 0: matches the forward pass's reverse-Z projection
+            // (see math/camera.ts). ssao/hbao read this buffer, test background as
+            // `depth <= 0`, and reconstruct view position through `invProj`/`proj`,
+            // which follow whatever projection the camera produced.
+            depthStencil: {format: DEPTH_FORMAT, depthWriteEnabled: true, depthCompare: "greater"},
         });
 
         // ── AO sampling pipelines (SSAO / HBAO) ─────────────────────────────
@@ -274,7 +278,7 @@ export class AmbientOcclusion {
                 view: this.depthView,
                 depthLoadOp: "clear",
                 depthStoreOp: "store",
-                depthClearValue: 1.0,
+                depthClearValue: 0.0, // reverse-Z: 0 = infinitely far = "nothing drawn"
             },
         });
         prepass.setPipeline(this.prepassPipeline);
@@ -325,7 +329,10 @@ export class AmbientOcclusion {
         w.mat4(scene.camera.viewProjectionMatrix());
         w.mat4(proj);
         w.mat4(mat4.invert(proj));
-        w.vec4(this.width, this.height, scene.camera.near, scene.camera.far);
+        // z/w are informational only (the AO shaders reconstruct through invProj
+        // and read just params0.xy). `clusterFar` stands in for the projection's
+        // far plane, which is infinite under reverse-Z and would poison the f32.
+        w.vec4(this.width, this.height, scene.camera.near, scene.camera.clusterFar);
         w.vec4(this.radius, this.bias, this.intensity, this.power);
         this.device.queue.writeBuffer(this.uniforms, 0, w.toBytes());
     }
