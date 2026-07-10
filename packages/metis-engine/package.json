@@ -3,10 +3,14 @@
     "module": "src/index.ts",
     "type": "module",
     "private": true,
+    "exports": {
+        ".": "./src/index.ts"
+    },
     "scripts": {
         "fixture": "bun run test/fixture.ts",
         "demo:exterior": "bun run examples/exterior-demo.ts",
-        "demo:interior": "bun run examples/interior-demo.ts"
+        "demo:interior": "bun run examples/interior-demo.ts",
+        "bench:lights": "bun run bench/lights.ts"
     },
     "devDependencies": {
         "@types/bun": "latest"
