@@ -29,7 +29,7 @@ import {
     Scene,
     SSAO_KERNEL_SIZE,
     TonemapPass,
-} from "metis-engine";
+} from "metis-engine/renderer";
 import { vec3 } from "wgpu-matrix";
 
 // ── Pure-math: SSAO kernel ──────────────────────────────────────────────────
@@ -151,7 +151,7 @@ async function renderAoScene(technique: AoTechnique): Promise<{ mean: number; er
     const err = await ctx.device.popErrorScope();
     frame.present();
 
-    const pixels = await takeScreenshot(ctx.device, ctx.captureTexture!, AO_W, AO_H, `tests/output/ao-${technique}.png`);
+    const pixels = await takeScreenshot(ctx.device, ctx.captureTexture!, AO_W, AO_H, `test/output/ao-${technique}.png`);
     let sum = 0;
     for (let i = 0; i < pixels.length; i += 4) {
         sum += 0.2126 * pixels[i]! + 0.7152 * pixels[i + 1]! + 0.0722 * pixels[i + 2]!;

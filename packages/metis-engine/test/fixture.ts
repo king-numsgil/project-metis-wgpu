@@ -27,7 +27,7 @@ import {
     Scene,
     uvSphere,
     VectorText,
-} from "metis-engine";
+} from "metis-engine/renderer";
 import { mkdirSync } from "node:fs";
 import { vec3 } from "wgpu-matrix";
 import { loadMetalPlateTextures, makeEmissivePanelTexture } from "../examples/demoAssets";
@@ -76,7 +76,7 @@ async function renderToFile(name: string, hudLabel: string, buildScene: (device:
         frame.present();
     }
 
-    const pixels = await takeScreenshot(ctx.device, ctx.captureTexture!, W, H, `tests/output/${name}.png`);
+    const pixels = await takeScreenshot(ctx.device, ctx.captureTexture!, W, H, `test/output/${name}.png`);
     console.log(`${name}.png written, ${pixels.length} bytes of pixel data`);
 
     forward.destroy();
@@ -258,7 +258,7 @@ async function renderHdrClipComparison() {
         }
 
         const name = `hdr-clip-${variant}`;
-        await takeScreenshot(ctx.device, ctx.captureTexture!, W, H, `tests/output/${name}.png`);
+        await takeScreenshot(ctx.device, ctx.captureTexture!, W, H, `test/output/${name}.png`);
         console.log(`${name}.png written`);
 
         forward.destroy();
@@ -330,7 +330,7 @@ async function renderGltfDemo() {
         frame.present();
     }
 
-    await takeScreenshot(ctx.device, ctx.captureTexture!, W, H, "tests/output/gltf-box.png");
+    await takeScreenshot(ctx.device, ctx.captureTexture!, W, H, "test/output/gltf-box.png");
     console.log("gltf-box.png written");
 
     forward.destroy();
@@ -405,7 +405,7 @@ async function renderTexturedDemo() {
         frame.present();
     }
 
-    await takeScreenshot(ctx.device, ctx.captureTexture!, W, H, "tests/output/textured.png");
+    await takeScreenshot(ctx.device, ctx.captureTexture!, W, H, "test/output/textured.png");
     console.log("textured.png written");
 
     forward.destroy();

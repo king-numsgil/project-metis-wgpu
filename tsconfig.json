@@ -34,6 +34,9 @@
             ],
             "metis-engine": [
                 "./packages/metis-engine"
+            ],
+            "metis-data": [
+                "./packages/metis-data"
             ]
         }
     }

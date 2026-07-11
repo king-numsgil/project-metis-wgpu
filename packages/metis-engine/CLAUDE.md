@@ -6,6 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `metis-engine` is a WebGPU clustered-forward PBR renderer for the space-sim game — built directly on `bun-webgpu-rs`'s raw WebGPU/SDL3 bindings (no other rendering-facing dependency; `wgpu-matrix` is the only non-`bun-webgpu-rs` dependency, for matrix/vector math). It's a standalone package with no dependency on `metis-tui`. `metis-game` consumes it (a 100-point-light demo), and does so via the caller-owned-device path — it never touches `RenderContext`. See "The engine does not own the window" below.
 
+**`src/` is split into two independent subtrees.** `src/renderer/` is the entire renderer described in this doc; `src/ecs/` is a young archetype ECS (backed by the `metis-data` struct/buffer library) that will eventually feed the renderer. They do not depend on each other yet — the renderer still takes a hand-built `Scene`, not ECS data. The root `src/index.ts` re-exports them as namespaces (`export * as Renderer`, `export * as ECS`), but consumers import through the package's **subpath exports** — `metis-engine/renderer` and `metis-engine/ecs` — which is what `examples/`, `test/`, `bench/`, and `metis-game` now do (`import { ClusteredForwardRenderer, … } from "metis-engine/renderer"`). The ECS's current shape and limits are in "The ECS" below.
+
 It's the first package in this monorepo to build a *real* render pipeline — depth buffer, vertex buffers, multiple bind groups, compute passes, multisample-capable targets. Every prior pipeline in `bun-webgpu-rs/tests/render*.test.ts` and `metis-game/src/index.ts` is a hardcoded no-vertex-buffer triangle, so the patterns here (vertex layouts, bind group group-index conventions, WGSL module concatenation) are this repo's first precedent, not a continuation of one.
 
 ## Read [`DOC.md`](DOC.md) first
@@ -37,7 +39,7 @@ Run from `packages/metis-engine/` unless noted.
 # Install deps (from repo root)
 bun install
 
-# Headless render + screenshot validation — writes PNGs to tests/output/,
+# Headless render + screenshot validation — writes PNGs to test/output/,
 # reuses bun-webgpu-rs's takeScreenshot test helper
 bun run fixture
 
@@ -58,8 +60,14 @@ There is no `bun test` suite — `test/fixture.ts` (screenshots + a hard failure
 
 ### Module layout
 
+`src/` has three entries: the root barrel `index.ts` (`export * as Renderer` +
+`export * as ECS`), the `renderer/` subtree (below), and the `ecs/` subtree
+("The ECS", further down). The renderer breakdown below is rooted at
+`src/renderer/`; `examples/`, `test/`, `bench/`, and `math/` sit at the package
+root, unchanged by the split.
+
 ```
-src/
+src/renderer/   — the entire renderer; import via "metis-engine/renderer"
   rhi/          context.ts    — device/adapter/surface lifecycle; RenderContext.createOffscreen()
                                  (headless, for the fixture) vs. createWindowed() (SDL, for demos)
                                  both funnel through the same beginFrame()/FrameTarget shape
@@ -114,7 +122,8 @@ src/
                                  in Rust, supports PNG/JPG/WebP/…; replaced the former from-scratch
                                  PNG decoder) + getMaterialDefaults() (the shared 1x1 neutral
                                  placeholders every unset material texture slot falls back to)
-  index.ts      — public API barrel export
+  index.ts      — renderer barrel (re-exports RenderContext, Scene, ClusteredForwardRenderer, …);
+                  reached from outside as "metis-engine/renderer"
 examples/       exterior-demo.ts, interior-demo.ts — windowed, interactive, SDL-loop-driven
 test/           fixture.ts — headless validation harness (also downloads+caches a Khronos sample
                               glTF into test/assets-cache/, gitignored); vectorText.smoke.ts —
@@ -122,6 +131,38 @@ test/           fixture.ts — headless validation harness (also downloads+cache
 math/           formula references cited by the shading code, following the same "honest physics +
                 explicitly labeled handwave" convention as packages/metis-tui/math/
 ```
+
+### The ECS (`src/ecs/`) — early archetype storage, not yet wired to rendering
+
+`src/ecs/` is a from-scratch **archetype ECS** and is deliberately young — it is
+storage only, with no systems, scheduling, or renderer integration yet. It exists
+so the sim can be modelled as entities/components; the renderer still consumes a
+hand-built `Scene`, and nothing extracts one from the other yet.
+
+Storage model: entities with the *same set of component names* share an
+`Archetype`. Each archetype holds its entities as **packed array-of-structs rows**
+in a single growable `ArrayBuffer` (one contiguous row per entity, all its
+components interleaved), typed and laid out by the **`metis-data`** descriptor
+library (`StructOf`, `wrap`, `F32`/`U32`, …). `getComponent` returns a live
+typed *view* into that buffer (`.set(...)`/`.get(...)`), not a copy. Removal is
+swap-with-last (`removeEntity`), so dense indices are not stable across despawns.
+The buffer doubles on overflow (`INITIAL_CAPACITY = 32`).
+
+Public surface (via `metis-engine/ecs`): `defineComponent(name, descriptor)`,
+`World<CS>` (`spawnEntity(...names)` → `EntityId`, `despawnEntity`,
+`getComponent`, `queryEntities(names)`), and debug helpers in `debug.ts`
+(`inspectWorld`/`printWorldInfo`/`printEntityBytes` — archetype layout + raw
+byte/f32/u32 dumps, matching this repo's verify-the-bytes habit). `src/ecs/test.ts`
+is a manual smoke script (`bun run src/ecs/test.ts`), not a test-runner test.
+
+**What it deliberately does *not* have yet** (all discussed as next steps, none
+built): entity **generation tags** (`EntityId` is a bare incrementing `number`,
+so recycled ids would alias — ids are never reused today because there is no free
+list, but that's not a safety guarantee); **exclusion queries** (`queryEntities`
+matches archetypes that are a *superset* of the requested names — there is no
+`Without`); a **hierarchy** (`ChildOf`/`Children` components) or transform
+propagation; and any **system/scheduler** layer. Don't document these as if they
+exist.
 
 ### The engine does not own the window — `RenderContext` is a convenience
 
@@ -301,11 +342,11 @@ There's no `if (interior)` branch anywhere in the shading code. `Environment.amb
 
 ### Ambient occlusion is a swappable enum, and only touches the ambient term
 
-`ClusteredForwardRenderer` owns an `AmbientOcclusion` (`src/ao/`); set `renderer.ao.technique` to `AoTechnique.None`, `.SSAO`, or `.HBAO` (a runtime quality dial — the interior demo cycles it with the `O` key). When active it runs three passes *before* the forward pass — a geometry prepass (view-space normals + depth), the chosen occlusion technique (`ssao.wgsl`/`hbao.wgsl`, fullscreen), and a box blur — and `forward.wgsl` multiplies the result into **only** the flat ambient term. That last part is the load-bearing correctness point: AO approximates occlusion of *indirect/bounce* light, so it must never darken the sun or point lights (their occlusion is the shadow map's job). Multiplying the whole lit image by AO — which some engines do — double-darkens shadowed creases and is wrong. `None` is branchless: the renderer clears the AO buffer to white so the forward multiply is a no-op, mirroring the always-bound-placeholder pattern the material textures already use. Both techniques' math (and the deliberate normal-oriented HBAO tangent simplification) is in `math/Ambient occlusion formulas.md`; `test/ao.test.ts` validates the kernel generators on the CPU and, via GPU readback + a `pushErrorScope`, that each technique darkens a box's contact creases without any swallowed WGSL validation error. The prepass is a *second* geometry pass (a production engine would share a depth prepass); at this engine's scale the duplicate draw is cheap and keeps AO decoupled from the forward path.
+`ClusteredForwardRenderer` owns an `AmbientOcclusion` (`src/renderer/ao/`); set `renderer.ao.technique` to `AoTechnique.None`, `.SSAO`, or `.HBAO` (a runtime quality dial — the interior demo cycles it with the `O` key). When active it runs three passes *before* the forward pass — a geometry prepass (view-space normals + depth), the chosen occlusion technique (`ssao.wgsl`/`hbao.wgsl`, fullscreen), and a box blur — and `forward.wgsl` multiplies the result into **only** the flat ambient term. That last part is the load-bearing correctness point: AO approximates occlusion of *indirect/bounce* light, so it must never darken the sun or point lights (their occlusion is the shadow map's job). Multiplying the whole lit image by AO — which some engines do — double-darkens shadowed creases and is wrong. `None` is branchless: the renderer clears the AO buffer to white so the forward multiply is a no-op, mirroring the always-bound-placeholder pattern the material textures already use. Both techniques' math (and the deliberate normal-oriented HBAO tangent simplification) is in `math/Ambient occlusion formulas.md`; `test/ao.test.ts` validates the kernel generators on the CPU and, via GPU readback + a `pushErrorScope`, that each technique darkens a box's contact creases without any swallowed WGSL validation error. The prepass is a *second* geometry pass (a production engine would share a depth prepass); at this engine's scale the duplicate draw is cheap and keeps AO decoupled from the forward path.
 
 ### Why MSAA — and a misdiagnosis worth knowing about
 
-The forward pipeline renders 4x multisampled (`RenderTargets.hdrColorMultisampled`/`depth` in `src/rhi/targets.ts`; the color target auto-resolves via `resolveTarget` into a single-sampled texture everything downstream reads — depth doesn't resolve, since WebGPU has no depth `resolveTarget`, so `LuminanceAveragePass` reads it directly as `texture_depth_multisampled_2d` at sample index 0, which is enough to know whether *something* was drawn there). This exists because the interior demo showed a "dashed line" artifact along the room's floor/wall and wall/wall seams that **was originally (wrongly) diagnosed as shadow-map acne** — several rounds of shadow bias/normal-offset/PCF tuning had zero visible effect on it, which in hindsight was the tell. It was ordinary geometric-edge aliasing (no MSAA existed at all before this): two adjacent, differently-lit flat-shaded quads meeting at a hard edge, rendered with exactly one sample per pixel, alias into what looks exactly like a dashed shadow-map artifact when the edge is nearly axis-aligned in screen space. Enabling MSAA fixed it outright; the shadow-side tuning (Formula 6 in `math/Clustered forward formulas.md`) turned out to be solving a real but much smaller problem that was never the visible complaint. Lesson: when a targeted fix produces *zero* visible change, that's a stronger signal to question the diagnosis than to push the fix further.
+The forward pipeline renders 4x multisampled (`RenderTargets.hdrColorMultisampled`/`depth` in `src/renderer/rhi/targets.ts`; the color target auto-resolves via `resolveTarget` into a single-sampled texture everything downstream reads — depth doesn't resolve, since WebGPU has no depth `resolveTarget`, so `LuminanceAveragePass` reads it directly as `texture_depth_multisampled_2d` at sample index 0, which is enough to know whether *something* was drawn there). This exists because the interior demo showed a "dashed line" artifact along the room's floor/wall and wall/wall seams that **was originally (wrongly) diagnosed as shadow-map acne** — several rounds of shadow bias/normal-offset/PCF tuning had zero visible effect on it, which in hindsight was the tell. It was ordinary geometric-edge aliasing (no MSAA existed at all before this): two adjacent, differently-lit flat-shaded quads meeting at a hard edge, rendered with exactly one sample per pixel, alias into what looks exactly like a dashed shadow-map artifact when the edge is nearly axis-aligned in screen space. Enabling MSAA fixed it outright; the shadow-side tuning (Formula 6 in `math/Clustered forward formulas.md`) turned out to be solving a real but much smaller problem that was never the visible complaint. Lesson: when a targeted fix produces *zero* visible change, that's a stronger signal to question the diagnosis than to push the fix further.
 
 ### A second, genuinely separate shadow leak — fixed via Moment Shadow Mapping, not the BRDF
 
@@ -331,7 +372,7 @@ Every material's bind group has exactly 6 texture-related bindings (1 sampler + 
 
 ### WGSL module concatenation
 
-`bun-webgpu-rs`'s `createShaderModule` takes one `code: string`; WGSL has no `#include`. Every shader that needs the shared structs/BRDF/cluster-math in `common.wgsl` gets it via plain string concatenation (`` `${commonWgsl}\n${forwardWgsl}` ``) at pipeline creation — in `clusteredForwardRenderer.ts` (forward), `lightCuller.ts` (cluster_build/light_cull), and `shadowCascades.ts` (shadow; shadow_resolve is standalone, no common). `.wgsl` files are imported as raw text via Bun's `with { type: "text" }` import attribute (ambient-declared in `src/shading/wgsl.d.ts`).
+`bun-webgpu-rs`'s `createShaderModule` takes one `code: string`; WGSL has no `#include`. Every shader that needs the shared structs/BRDF/cluster-math in `common.wgsl` gets it via plain string concatenation (`` `${commonWgsl}\n${forwardWgsl}` ``) at pipeline creation — in `clusteredForwardRenderer.ts` (forward), `lightCuller.ts` (cluster_build/light_cull), and `shadowCascades.ts` (shadow; shadow_resolve is standalone, no common). `.wgsl` files are imported as raw text via Bun's `with { type: "text" }` import attribute (ambient-declared in `src/renderer/shading/wgsl.d.ts`).
 
 ### Known limitations (not yet done)
 

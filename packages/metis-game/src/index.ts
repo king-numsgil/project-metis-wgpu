@@ -43,7 +43,7 @@ import {
     Scene,
     uvSphere,
     VectorText,
-} from "metis-engine";
+} from "metis-engine/renderer";
 import { scheduler } from "node:timers/promises";
 import { vec3 } from "wgpu-matrix";
 

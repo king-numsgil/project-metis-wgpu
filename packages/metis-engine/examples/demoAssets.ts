@@ -1,6 +1,6 @@
 // Shared demo/fixture asset helpers — downloads + caches a real CC0 PBR
 import { type GpuDevice, GPUTextureUsage, type GpuTextureView } from "bun-webgpu-rs";
-import { loadTexture } from "metis-engine";
+import { loadTexture } from "metis-engine/renderer";
 // texture set once (Poly Haven's "metal_plate_02", via its public file API)
 // and generates a synthetic emissive "instrument panel" texture, so both the
 // headless fixture (test/fixture.ts) and the interactive windowed demos

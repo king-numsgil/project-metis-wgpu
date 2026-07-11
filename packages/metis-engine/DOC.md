@@ -5,9 +5,13 @@ Practical API reference for `metis-engine`, written so a task can be started
 are the way they are — architecture, debugging war stories, known limitations.
 This file explains *what to call*.
 
-Everything below is exported from the barrel `src/index.ts`. Examples import
-from `../src/...` (that's what `examples/`, `test/`, and `bench/` do); an outside
-consumer would import from `"metis-engine"`.
+Everything below (§1–§10) is the **renderer**, exported from `src/renderer/` and
+reached as **`metis-engine/renderer`** — the package's subpath export, which is
+what `examples/`, `test/`, `bench/`, and `metis-game` import from
+(`import { ClusteredForwardRenderer, … } from "metis-engine/renderer"`). The root
+`metis-engine` barrel re-exports the renderer as the `Renderer` namespace and the
+ECS as `ECS`. The archetype **ECS** (`src/ecs/`, imported as `metis-engine/ecs`)
+is separate and covered in §11; it is not yet wired to the renderer.
 
 > **Scope / trust.** Signatures here are transcribed from source. If a task
 > depends on an exact signature, spot-check that one symbol. If you change a
@@ -528,7 +532,7 @@ no-ops if nothing was staged.
 ## 10. Commands
 
 ```powershell
-bun run fixture          # headless render + screenshot validation -> tests/output/*.png
+bun run fixture          # headless render + screenshot validation -> test/output/*.png
 bun run demo:exterior    # interactive; WASD+QE fly, arrows look, Esc quit
 bun run demo:interior    # + O cycles AO technique
 bun run bench:lights     # windowed light benchmark (see bench/lights.ts header for flags)
@@ -541,3 +545,70 @@ assertion. Run them manually.
 
 `bench/lights.ts` flags: `--lights N` (≤256), `--duration S`, `--warmup S`,
 `--width`, `--height`, `--vsync`. Defaults to no-vsync so timings are real.
+
+---
+
+## 11. `ecs/` — archetype ECS
+
+Imported from **`metis-engine/ecs`** (or the `ECS` namespace off the root barrel).
+This is **storage only** — no systems, no scheduler, and **no renderer
+integration**: the renderer still takes a hand-built `Scene` (§4), and nothing
+extracts one from ECS data yet. Depends on the `metis-data` descriptor library
+(`StructOf`, `wrap`, `F32`, `U32`, …) for component layout.
+
+**Model.** Entities sharing the same *set of component names* live in one
+`Archetype`, which stores them as packed array-of-structs rows (one contiguous,
+interleaved row per entity) in a growable `ArrayBuffer`. `getComponent` returns a
+live typed **view** into that buffer, not a copy.
+
+```ts
+import { F32, StructOf, U32 } from "metis-data";
+import { defineComponent, World } from "metis-engine/ecs";
+
+const world = new World({
+    Position: defineComponent("Position", StructOf({ x: F32, y: F32 })),
+    Velocity: defineComponent("Velocity", StructOf({ x: F32, y: F32 })),
+    Tags:     defineComponent("Tags", U32),
+} as const);
+
+const e = world.spawnEntity("Position", "Velocity", "Tags");  // -> EntityId (number)
+world.getComponent(e, "Position").set({ x: 1.5, y: 2.5 });    // live view: .set(...) / .get(...)
+world.getComponent(e, "Tags").set(0b0011);
+
+for (const id of world.queryEntities(["Position", "Velocity"])) { /* ... */ }
+world.despawnEntity(e);
+```
+
+### `defineComponent` / `World`
+
+```ts
+defineComponent<D>(name: string, descriptor: D): ComponentDef<D>   // a component = a named metis-data descriptor
+
+class World<CS extends ComponentSet> {
+    constructor(components: CS)                                     // CS = Record<name, ComponentDef>
+    get entityCount(): number;  get archetypeCount(): number;
+    spawnEntity(...componentNames: (keyof CS & string)[]): EntityId;
+    despawnEntity(id: EntityId): void;
+    getComponent(id: EntityId, name: K): <live typed view of that component>;
+    queryEntities(componentNames: (keyof CS & string)[]): IterableIterator<EntityId>;
+    iterArchetypes(): IterableIterator<Archetype>;
+    dumpEntityBytes(id): EntityBytesDump;  dumpEntityLayout(id): Record<string, {offset,byteSize}>;
+}
+```
+
+### Debug helpers (`debug.ts`)
+
+`inspectWorld(world)` / `printWorldInfo(world)` (per-archetype entity counts,
+capacity, row size, byte-offset layout) and `printEntityBytes(world, id)` (hex +
+f32/u32 dumps of one entity's row) — the raw-byte introspection this repo leans
+on. `src/ecs/test.ts` is a manual smoke script (`bun run src/ecs/test.ts`), not a
+test-runner test.
+
+### Sharp edges (current, deliberate)
+
+| Thing | State |
+|---|---|
+| `EntityId` | a bare incrementing `number` — **no generation tag**; not reused today (no free list), but that's not a safety guarantee. |
+| `queryEntities` | matches archetypes that are a **superset** of the requested names. **No `Without`/exclusion** filter yet. |
+| `removeEntity` | swap-with-last, so an entity's dense row index is **not stable** across despawns. |
+| Hierarchy / systems | none — no `ChildOf`/`Children`, no transform propagation, no scheduler. |

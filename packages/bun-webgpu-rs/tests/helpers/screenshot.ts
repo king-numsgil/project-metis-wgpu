@@ -20,7 +20,7 @@ const CRC_TABLE = (() => {
 function crc32(buf: Uint8Array): number {
     let c = 0xffffffff;
     for (const b of buf) {
-        c = CRC_TABLE[(c ^ b) & 0xff] ^ (c >>> 8);
+        c = CRC_TABLE[(c ^ b) & 0xff]! ^ (c >>> 8);
     }
     return (c ^ 0xffffffff) >>> 0;
 }

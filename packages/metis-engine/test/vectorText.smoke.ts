@@ -4,7 +4,7 @@
 // target and screenshots it before the HUD overlay leans on it.
 import { GPUTextureUsage } from "bun-webgpu-rs";
 import { takeScreenshot } from "bun-webgpu-rs/tests/helpers/screenshot.ts";
-import { RenderContext, VectorText } from "metis-engine";
+import { RenderContext, VectorText } from "metis-engine/renderer";
 
 const W = 480;
 const H = 160;
@@ -27,7 +27,7 @@ async function main() {
     text.render(encoder, target.createView(), W, H, [0.1, 1.0, 0.6, 1.0], "clear");
     ctx.device.queue.submit([encoder.finish()]);
 
-    const pixels = await takeScreenshot(ctx.device, target, W, H, "tests/output/vector-text-smoke.png");
+    const pixels = await takeScreenshot(ctx.device, target, W, H, "test/output/vector-text-smoke.png");
     const litPixels = countNonBackground(pixels);
     console.log(`vector-text-smoke.png written; ${litPixels} non-background pixels`);
     if (litPixels === 0) {

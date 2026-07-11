@@ -4,7 +4,9 @@
     "type": "module",
     "private": true,
     "exports": {
-        ".": "./src/index.ts"
+        ".": "./src/index.ts",
+        "./renderer": "./src/renderer/index.ts",
+        "./ecs": "./src/ecs/index.ts"
     },
     "scripts": {
         "fixture": "bun run test/fixture.ts",
@@ -16,10 +18,11 @@
         "@types/bun": "latest"
     },
     "peerDependencies": {
-        "typescript": "^6"
+        "typescript": "^7"
     },
     "dependencies": {
         "bun-webgpu-rs": "workspace:*",
+        "metis-data": "workspace:*",
         "wgpu-matrix": "^3.4.2"
     }
 }

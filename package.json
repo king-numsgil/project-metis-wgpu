@@ -1,14 +1,14 @@
 {
-  "name": "metis-wgpu",
-  "type": "module",
-  "private": true,
-  "devDependencies": {
-    "@types/bun": "latest"
-  },
-  "peerDependencies": {
-    "typescript": "^6"
-  },
-  "workspaces": [
-    "packages/*"
-  ]
+    "name": "metis-wgpu",
+    "type": "module",
+    "private": true,
+    "devDependencies": {
+        "@types/bun": "latest"
+    },
+    "peerDependencies": {
+        "typescript": "^7"
+    },
+    "workspaces": [
+        "packages/*"
+    ]
 }
