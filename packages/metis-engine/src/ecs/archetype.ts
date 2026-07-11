@@ -1,176 +1,249 @@
-import {
-    type Descriptor,
-    type DescriptorToMemoryBuffer,
-    type DescriptorTypedArray,
-    type StructDescriptor,
-    StructOf,
-    wrap,
-} from "metis-data";
-
-import type { ComponentSet } from "./component.ts";
+import type { ComponentDef } from "./component.ts";
+import { AXES, type EcsTypedArray, type FieldType } from "./field.ts";
 
 export type EntityId = number;
 export type SignatureKey = string;
 
+/** Canonical key for a set of component names (order-independent). */
 export function makeSignatureKey(names: string[]): SignatureKey {
     return [...names].sort().join(",");
 }
 
 const INITIAL_CAPACITY = 32;
 
-type ArchetypeStructMembers<CS extends ComponentSet> = {
-    [K in keyof CS]: CS[K]["descriptor"];
-};
-
-type ArchetypeRowDescriptor<CS extends ComponentSet> = StructDescriptor<ArchetypeStructMembers<CS>>;
-
-export interface EntityBytesDump {
-    readonly archetypeKey: SignatureKey;
-    readonly entityId: EntityId;
-    readonly denseIndex: number;
-    readonly rowByteSize: number;
-    readonly hex: string;
-    readonly f32View: Float32Array;
-    readonly u32View: Uint32Array;
+/** One field's storage: `arrays[0]` for a scalar, `arrays[0..n-1]` (x/y/z/w) for a vec. */
+interface FieldColumn {
+    readonly field: FieldType;
+    arrays: EcsTypedArray[];
 }
 
-export class Archetype<CS extends ComponentSet> {
+/** A per-field or per-vec view handed to systems: a typed array, or `{x,y,z}`. */
+type FieldView = EcsTypedArray | Record<string, EcsTypedArray>;
+/** A component's columns, keyed by field name. */
+type ComponentView = Record<string, FieldView>;
+/** All components' columns in an archetype, keyed by component name. */
+export type ColumnsView = Record<string, ComponentView>;
+
+/**
+ * Stores every entity that has exactly one set of components, in Structure-of-
+ * Arrays form: one typed array per scalar field (per axis for a vec), indexed by
+ * a dense row. Iteration is a bare `column[row]` — no wrappers, no allocation.
+ * Rows are kept dense with swap-with-last on removal, so a row is NOT a stable
+ * handle across despawns; the `EntityId -> row` map is the stable lookup.
+ */
+export class Archetype {
     readonly signatureKey: SignatureKey;
+    readonly componentNames: readonly string[];
 
-    private readonly rowDescriptor: ArchetypeRowDescriptor<CS>;
-    private buffer: ArrayBuffer;
-    private readonly entities: EntityId[];
-    private readonly entityIndex: Map<EntityId, number>;
+    private _capacity = INITIAL_CAPACITY;
+    private _count = 0;
+    private readonly entities: EntityId[] = [];
+    private readonly rowOfEntity = new Map<EntityId, number>();
+    // component name -> field name -> column
+    private readonly store = new Map<string, Map<string, FieldColumn>>();
+    private columnsView: ColumnsView = {};
 
-    constructor(signatureKey: SignatureKey, components: CS) {
+    constructor(signatureKey: SignatureKey, defs: readonly ComponentDef[]) {
         this.signatureKey = signatureKey;
-        this.entities = [];
-        this.entityIndex = new Map();
-        this._capacity = INITIAL_CAPACITY;
+        this.componentNames = defs.map((d) => d.name);
 
-        const members = {} as ArchetypeStructMembers<CS>;
-        for (const key of Object.keys(components) as Array<keyof CS>) {
-            members[key] = components[key]!.descriptor as CS[typeof key]["descriptor"];
+        for (const def of defs) {
+            const fields = new Map<string, FieldColumn>();
+            for (const [fieldName, fieldType] of Object.entries(def.schema)) {
+                fields.set(fieldName, this.allocField(fieldType, this._capacity));
+            }
+            this.store.set(def.name, fields);
         }
-        this.rowDescriptor = StructOf(members) as ArchetypeRowDescriptor<CS>;
-        this.buffer = new ArrayBuffer(INITIAL_CAPACITY * this.rowDescriptor.byteSize);
+        this.rebuildColumnsView();
     }
-
-    private _capacity: number;
 
     get capacity(): number {
         return this._capacity;
     }
 
-    get entityCount(): number {
-        return this.entities.length;
+    get count(): number {
+        return this._count;
     }
 
-    get rowByteSize(): number {
-        return this.rowDescriptor.byteSize;
+    /** Dense entity ids: `entityIds[row]` is the entity at that row. */
+    get entityIds(): readonly EntityId[] {
+        return this.entities;
     }
 
-    addEntity(entityId: EntityId): void {
-        if (this.entityIndex.has(entityId)) {
-            throw new Error(`Entity ${entityId} already exists in archetype "${this.signatureKey}"`);
+    /** Live column arrays for systems: `columns[Component][field]` (or `[field].x`). */
+    get columns(): ColumnsView {
+        return this.columnsView;
+    }
+
+    has(entityId: EntityId): boolean {
+        return this.rowOfEntity.has(entityId);
+    }
+
+    rowOf(entityId: EntityId): number | undefined {
+        return this.rowOfEntity.get(entityId);
+    }
+
+    addEntity(entityId: EntityId): number {
+        if (this.rowOfEntity.has(entityId)) {
+            throw new Error(`Entity ${entityId} already in archetype "${this.signatureKey}"`);
         }
-        if (this.entities.length >= this._capacity) {
+        if (this._count >= this._capacity) {
             this.grow();
         }
-        const denseIndex = this.entities.length;
-        this.entities.push(entityId);
-        this.entityIndex.set(entityId, denseIndex);
+        const row = this._count;
+        // Zero the row: a dense slot can be reused after a swap-with-last despawn,
+        // so it may hold a previous entity's data. Guarantees fresh entities read
+        // as zero regardless of reuse.
+        for (const fields of this.store.values()) {
+            for (const col of fields.values()) {
+                for (const arr of col.arrays) {
+                    arr[row] = 0;
+                }
+            }
+        }
+        this.entities[row] = entityId;
+        this.rowOfEntity.set(entityId, row);
+        this._count++;
+        return row;
     }
 
     removeEntity(entityId: EntityId): void {
-        const denseIndex = this.entityIndex.get(entityId);
-        if (denseIndex === undefined) {
-            throw new Error(`Entity ${entityId} not found in archetype "${this.signatureKey}"`);
+        const row = this.rowOfEntity.get(entityId);
+        if (row === undefined) {
+            throw new Error(`Entity ${entityId} not in archetype "${this.signatureKey}"`);
         }
+        const last = this._count - 1;
 
-        const lastIndex = this.entities.length - 1;
-        const lastEntityId = this.entities[lastIndex];
-        if (lastEntityId === undefined) {
-            throw new Error(`Archetype "${this.signatureKey}" is unexpectedly empty`);
-        }
-
-        if (denseIndex !== lastIndex) {
-            const rowSize = this.rowDescriptor.byteSize;
-            const dst = new Uint8Array(this.buffer, denseIndex * rowSize, rowSize);
-            const src = new Uint8Array(this.buffer, lastIndex * rowSize, rowSize);
-            dst.set(src);
-            this.entities[denseIndex] = lastEntityId;
-            this.entityIndex.set(lastEntityId, denseIndex);
+        if (row !== last) {
+            // Swap-with-last: copy the last row's values into the vacated row.
+            for (const fields of this.store.values()) {
+                for (const col of fields.values()) {
+                    for (const arr of col.arrays) {
+                        arr[row] = arr[last]!;
+                    }
+                }
+            }
+            const movedEntity = this.entities[last]!;
+            this.entities[row] = movedEntity;
+            this.rowOfEntity.set(movedEntity, row);
         }
 
         this.entities.pop();
-        this.entityIndex.delete(entityId);
+        this.rowOfEntity.delete(entityId);
+        this._count--;
     }
 
-    getComponent<K extends keyof CS & string>(
-        entityId: EntityId,
-        componentName: K,
-    ): DescriptorToMemoryBuffer<CS[K]["descriptor"]> {
-        const denseIndex = this.entityIndex.get(entityId);
-        if (denseIndex === undefined) {
-            throw new Error(`Entity ${entityId} not found in archetype "${this.signatureKey}"`);
+    /**
+     * A random-access accessor for one entity's component: settable `number`
+     * fields (scalars) and `{ x, y, z }` sub-objects (vecs). Row and array are
+     * resolved live on each access, so it stays valid across growth and swaps.
+     */
+    accessor(entityId: EntityId, componentName: string): Record<string, unknown> {
+        const fields = this.store.get(componentName);
+        if (fields === undefined) {
+            throw new Error(`Component "${componentName}" not in archetype "${this.signatureKey}"`);
         }
+        const rowOfEntity = this.rowOfEntity;
+        const target: Record<string, unknown> = {};
 
-        const rowOffset = denseIndex * this.rowDescriptor.byteSize;
-        const memberOffset = rowOffset + this.rowDescriptor.offsetOf(componentName);
-        const memberDescriptor = this.rowDescriptor.members[componentName] as CS[K]["descriptor"];
-
-        return wrap(
-            memberDescriptor as Descriptor<DescriptorTypedArray>,
-            this.buffer,
-            memberOffset,
-        ) as DescriptorToMemoryBuffer<CS[K]["descriptor"]>;
-    }
-
-    dumpEntityBytes(entityId: EntityId): EntityBytesDump {
-        const denseIndex = this.entityIndex.get(entityId);
-        if (denseIndex === undefined) {
-            throw new Error(`Entity ${entityId} not found in archetype "${this.signatureKey}"`);
+        for (const [fieldName, col] of fields) {
+            if (col.field.kind === "scalar") {
+                Object.defineProperty(target, fieldName, {
+                    enumerable: true,
+                    get: () => col.arrays[0]![rowOfEntity.get(entityId)!],
+                    set: (v: number) => { col.arrays[0]![rowOfEntity.get(entityId)!] = v; },
+                });
+            } else {
+                const sub: Record<string, unknown> = {};
+                for (let axis = 0; axis < col.field.n; axis++) {
+                    const a = axis;
+                    Object.defineProperty(sub, AXES[axis]!, {
+                        enumerable: true,
+                        get: () => col.arrays[a]![rowOfEntity.get(entityId)!],
+                        set: (v: number) => { col.arrays[a]![rowOfEntity.get(entityId)!] = v; },
+                    });
+                }
+                target[fieldName] = sub;
+            }
         }
-
-        const rowSize = this.rowDescriptor.byteSize;
-        const rowOffset = denseIndex * rowSize;
-        const rowBuffer = this.buffer.slice(rowOffset, rowOffset + rowSize);
-
-        const hex = Array.from(new Uint8Array(rowBuffer))
-            .map((b) => b.toString(16).padStart(2, "0"))
-            .join(" ");
-
-        return {
-            archetypeKey: this.signatureKey,
-            entityId,
-            denseIndex,
-            rowByteSize: rowSize,
-            hex,
-            f32View: new Float32Array(rowBuffer),
-            u32View: new Uint32Array(rowBuffer),
-        };
+        return target;
     }
 
-    dumpLayout(): Record<string, { offset: number; byteSize: number }> {
-        const result: Record<string, { offset: number; byteSize: number }> = {};
-        for (const key of Object.keys(this.rowDescriptor.members)) {
-            result[key] = {
-                offset: this.rowDescriptor.offsetOf(key),
-                byteSize: this.rowDescriptor.members[key]!.byteSize,
-            };
+    /** Per-component field layout, for debug/inspection. */
+    describe(): Record<string, Array<{ field: string; kind: string; axes: number; bytes: number }>> {
+        const out: Record<string, Array<{ field: string; kind: string; axes: number; bytes: number }>> = {};
+        for (const [comp, fields] of this.store) {
+            out[comp] = [];
+            for (const [fieldName, col] of fields) {
+                const scalarBytes = col.field.kind === "scalar" ? col.field.bytes : col.field.scalar.bytes;
+                out[comp]!.push({
+                    field: fieldName,
+                    kind: col.field.kind === "scalar" ? "scalar" : `vec${col.field.n}`,
+                    axes: col.arrays.length,
+                    bytes: scalarBytes * col.arrays.length,
+                });
+            }
         }
-        return result;
+        return out;
     }
 
-    *iterEntities(): IterableIterator<EntityId> {
-        yield *this.entities;
+    /** Total bytes currently allocated across all columns. */
+    get allocatedBytes(): number {
+        let total = 0;
+        for (const fields of this.store.values()) {
+            for (const col of fields.values()) {
+                for (const arr of col.arrays) {
+                    total += arr.byteLength;
+                }
+            }
+        }
+        return total;
+    }
+
+    private allocField(fieldType: FieldType, capacity: number): FieldColumn {
+        if (fieldType.kind === "scalar") {
+            return { field: fieldType, arrays: [new fieldType.ctor(capacity)] };
+        }
+        const arrays: EcsTypedArray[] = [];
+        for (let axis = 0; axis < fieldType.n; axis++) {
+            arrays.push(new fieldType.scalar.ctor(capacity));
+        }
+        return { field: fieldType, arrays };
     }
 
     private grow(): void {
-        this._capacity *= 2;
-        const newBuffer = new ArrayBuffer(this._capacity * this.rowDescriptor.byteSize);
-        new Uint8Array(newBuffer).set(new Uint8Array(this.buffer));
-        this.buffer = newBuffer;
+        const newCapacity = this._capacity * 2;
+        for (const fields of this.store.values()) {
+            for (const col of fields.values()) {
+                col.arrays = col.arrays.map((old) => {
+                    const Ctor = old.constructor as { new (length: number): EcsTypedArray };
+                    const grown = new Ctor(newCapacity);
+                    grown.set(old);
+                    return grown;
+                });
+            }
+        }
+        this._capacity = newCapacity;
+        this.rebuildColumnsView();
+    }
+
+    private rebuildColumnsView(): void {
+        const view: ColumnsView = {};
+        for (const [comp, fields] of this.store) {
+            const compView: ComponentView = {};
+            for (const [fieldName, col] of fields) {
+                if (col.field.kind === "scalar") {
+                    compView[fieldName] = col.arrays[0]!;
+                } else {
+                    const axes: Record<string, EcsTypedArray> = {};
+                    for (let axis = 0; axis < col.field.n; axis++) {
+                        axes[AXES[axis]!] = col.arrays[axis]!;
+                    }
+                    compView[fieldName] = axes;
+                }
+            }
+            view[comp] = compView;
+        }
+        this.columnsView = view;
     }
 }

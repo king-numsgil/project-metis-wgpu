@@ -548,67 +548,88 @@ assertion. Run them manually.
 
 ---
 
-## 11. `ecs/` — archetype ECS
+## 11. `ecs/` — archetype ECS (Structure-of-Arrays)
 
 Imported from **`metis-engine/ecs`** (or the `ECS` namespace off the root barrel).
 This is **storage only** — no systems, no scheduler, and **no renderer
 integration**: the renderer still takes a hand-built `Scene` (§4), and nothing
-extracts one from ECS data yet. Depends on the `metis-data` descriptor library
-(`StructOf`, `wrap`, `F32`, `U32`, …) for component layout.
+extracts one from ECS data yet. It has **no `metis-data` dependency** — component
+fields are a small ECS-local type vocabulary, and storage is SoA (see below).
 
 **Model.** Entities sharing the same *set of component names* live in one
-`Archetype`, which stores them as packed array-of-structs rows (one contiguous,
-interleaved row per entity) in a growable `ArrayBuffer`. `getComponent` returns a
-live typed **view** into that buffer, not a copy.
+`Archetype`. Within it, every component field is its own **typed-array column**
+indexed by a dense row — a scalar is one column, a vec is one column per axis. So
+a system touches data as a bare `column[row]` index (fast, cache-friendly, typed).
+`getComponent` is a random-access accessor for a single entity; `query` is the
+per-archetype fast path for systems.
 
 ```ts
-import { F32, StructOf, U32 } from "metis-data";
-import { defineComponent, World } from "metis-engine/ecs";
+import { defineComponent, f32, u32, vec3, World } from "metis-engine/ecs";
 
 const world = new World({
-    Position: defineComponent("Position", StructOf({ x: F32, y: F32 })),
-    Velocity: defineComponent("Velocity", StructOf({ x: F32, y: F32 })),
-    Tags:     defineComponent("Tags", U32),
-} as const);
+    Position: defineComponent("Position", { pos: vec3(f32) }),
+    Velocity: defineComponent("Velocity", { vel: vec3(f32) }),
+    Tags:     defineComponent("Tags", { bits: u32 }),
+});
 
 const e = world.spawnEntity("Position", "Velocity", "Tags");  // -> EntityId (number)
-world.getComponent(e, "Position").set({ x: 1.5, y: 2.5 });    // live view: .set(...) / .get(...)
-world.getComponent(e, "Tags").set(0b0011);
+world.getComponent(e, "Position").pos.x = 1.5;                // settable scalars / {x,y,z}
+world.getComponent(e, "Tags").bits = 0b0011;
+
+// Fast path: once per matching archetype, with typed SoA columns + dense count.
+const dt = 1 / 60;
+world.query(["Position", "Velocity"], (cols, count) => {
+    const px = cols.Position.pos.x, vx = cols.Velocity.vel.x;
+    for (let i = 0; i < count; i++) px[i] += vx[i] * dt;
+});
 
 for (const id of world.queryEntities(["Position", "Velocity"])) { /* ... */ }
 world.despawnEntity(e);
 ```
 
+### Field types
+
+Scalars `f32 f64 i32 u32 i16 u16 i8 u8` (each → its TypedArray) and vectors
+`vec2(scalar) vec3(scalar) vec4(scalar)`. A component schema is a record of them:
+`{ pos: vec3(f32), hp: f32, flags: u32 }`.
+
 ### `defineComponent` / `World`
 
 ```ts
-defineComponent<D>(name: string, descriptor: D): ComponentDef<D>   // a component = a named metis-data descriptor
+defineComponent<S>(name: string, schema: S): ComponentDef<S>   // schema = Record<field, f32 | vec3(f32) | …>
 
-class World<CS extends ComponentSet> {
-    constructor(components: CS)                                     // CS = Record<name, ComponentDef>
+class World<R extends Registry> {                              // R = Record<name, ComponentDef>
+    constructor(registry: R)
     get entityCount(): number;  get archetypeCount(): number;
-    spawnEntity(...componentNames: (keyof CS & string)[]): EntityId;
+    spawnEntity(...componentNames: (keyof R & string)[]): EntityId;   // fields zero-initialised
     despawnEntity(id: EntityId): void;
-    getComponent(id: EntityId, name: K): <live typed view of that component>;
-    queryEntities(componentNames: (keyof CS & string)[]): IterableIterator<EntityId>;
+    getComponent(id, name): ComponentAccessor;                  // random access: `.field = n`, `.vec.x = n`
+    query(names, (cols, count, entityIds) => void): void;       // per-archetype SoA columns — the fast path
+    queryEntities(names): IterableIterator<EntityId>;
     iterArchetypes(): IterableIterator<Archetype>;
-    dumpEntityBytes(id): EntityBytesDump;  dumpEntityLayout(id): Record<string, {offset,byteSize}>;
 }
 ```
 
+`query` runs `run` once per archetype that has **all** the named components. `cols`
+is keyed by component then field: a scalar field is a `TypedArray` (`cols.Tags.bits[i]`),
+a vec field is `{ x, y, z }` typed arrays (`cols.Position.pos.x[i]`). **Do not
+spawn/despawn while a `query` is running** — structural changes reallocate/reorder
+the current archetype's columns and rows.
+
 ### Debug helpers (`debug.ts`)
 
-`inspectWorld(world)` / `printWorldInfo(world)` (per-archetype entity counts,
-capacity, row size, byte-offset layout) and `printEntityBytes(world, id)` (hex +
-f32/u32 dumps of one entity's row) — the raw-byte introspection this repo leans
-on. `src/ecs/test.ts` is a manual smoke script (`bun run src/ecs/test.ts`), not a
-test-runner test.
+`inspectWorld(world)` / `printWorldInfo(world)` — per-archetype entity counts,
+capacity, and the per-component column layout (field, kind, axis count,
+bytes/entity). `src/ecs/test.ts` is a manual smoke script (`bun run src/ecs/test.ts`);
+`src/ecs/test/ecs.test.ts` is the automated `bun test` suite.
 
 ### Sharp edges (current, deliberate)
 
 | Thing | State |
 |---|---|
 | `EntityId` | a bare incrementing `number` — **no generation tag**; not reused today (no free list), but that's not a safety guarantee. |
-| `queryEntities` | matches archetypes that are a **superset** of the requested names. **No `Without`/exclusion** filter yet. |
-| `removeEntity` | swap-with-last, so an entity's dense row index is **not stable** across despawns. |
+| `query` / `queryEntities` | match archetypes that are a **superset** of the requested names. **No `Without`/exclusion** filter yet. |
+| `despawnEntity` | swap-with-last, so an entity's dense row index is **not stable** across despawns (columns get reordered). |
+| Buffers | each column doubles on overflow (`INITIAL_CAPACITY = 32`); no shrink. |
 | Hierarchy / systems | none — no `ChildOf`/`Children`, no transform propagation, no scheduler. |
+| GPU extract | not built — SoA→AoS interleaving for upload (where `metis-data` re-enters) is future work. |

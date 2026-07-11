@@ -1,28 +1,26 @@
-import type { Archetype, EntityId } from "./archetype.ts";
-import type { ComponentSet } from "./component.ts";
+import type { Archetype } from "./archetype.ts";
+import type { Registry } from "./component.ts";
 import type { World } from "./world.ts";
 
 export interface ArchetypeInfo {
     readonly signatureKey: string;
     readonly entityCount: number;
     readonly capacity: number;
-    readonly rowByteSize: number;
-    readonly totalBytes: number;
+    readonly allocatedBytes: number;
     readonly usedBytes: number;
-    readonly layout: Record<string, { offset: number; byteSize: number }>;
+    readonly components: Record<string, Array<{ field: string; kind: string; axes: number; bytes: number }>>;
 }
 
-export function inspectArchetype<CS extends ComponentSet>(
-    archetype: Archetype<CS>,
-): ArchetypeInfo {
+export function inspectArchetype(archetype: Archetype): ArchetypeInfo {
+    // Used bytes = the per-entity byte footprint (sum over columns) times count.
+    const perEntity = archetype.count > 0 ? archetype.allocatedBytes / archetype.capacity : 0;
     return {
         signatureKey: archetype.signatureKey,
-        entityCount: archetype.entityCount,
+        entityCount: archetype.count,
         capacity: archetype.capacity,
-        rowByteSize: archetype.rowByteSize,
-        totalBytes: archetype.capacity * archetype.rowByteSize,
-        usedBytes: archetype.entityCount * archetype.rowByteSize,
-        layout: archetype.dumpLayout(),
+        allocatedBytes: archetype.allocatedBytes,
+        usedBytes: Math.round(perEntity * archetype.count),
+        components: archetype.describe(),
     };
 }
 
@@ -32,7 +30,7 @@ export interface WorldInfo {
     readonly archetypes: ArchetypeInfo[];
 }
 
-export function inspectWorld<CS extends ComponentSet>(world: World<CS>): WorldInfo {
+export function inspectWorld<R extends Registry>(world: World<R>): WorldInfo {
     return {
         entityCount: world.entityCount,
         archetypeCount: world.archetypeCount,
@@ -40,51 +38,25 @@ export function inspectWorld<CS extends ComponentSet>(world: World<CS>): WorldIn
     };
 }
 
-export function printWorldInfo<CS extends ComponentSet>(world: World<CS>): void {
+export function printWorldInfo<R extends Registry>(world: World<R>): void {
     const info = inspectWorld(world);
-    console.log(`\n${"=".repeat(50)}`);
-    console.log(`  World — ${info.entityCount} entities, ${info.archetypeCount} archetypes`);
-    console.log(`${"=".repeat(50)}`);
+    console.log(`\n${"=".repeat(56)}`);
+    console.log(`  World — ${info.entityCount} entities, ${info.archetypeCount} archetypes (SoA)`);
+    console.log(`${"=".repeat(56)}`);
 
     for (const arch of info.archetypes) {
-        const pct = arch.totalBytes > 0
-            ? ((arch.usedBytes / arch.totalBytes) * 100).toFixed(1)
+        const pct = arch.allocatedBytes > 0
+            ? ((arch.usedBytes / arch.allocatedBytes) * 100).toFixed(1)
             : "0.0";
-
         console.log(`\n  Archetype [${arch.signatureKey}]`);
-        console.log(`    Entities : ${arch.entityCount} / ${arch.capacity} (${pct}% full)`);
-        console.log(`    Row size : ${arch.rowByteSize} bytes`);
-        console.log(`    Buffer   : ${arch.usedBytes} / ${arch.totalBytes} bytes`);
-        console.log(`    Layout:`);
-
-        const entries = Object.entries(arch.layout);
-        for (const [name, {offset, byteSize}] of entries) {
-            const bar = "█".repeat(byteSize);
-            console.log(`      +${String(offset).padStart(3, "0")}  ${name.padEnd(16)} ${byteSize}b  ${bar}`);
+        console.log(`    Entities : ${arch.entityCount} / ${arch.capacity} (${pct}% of buffers used)`);
+        console.log(`    Columns  : ${arch.usedBytes} / ${arch.allocatedBytes} bytes`);
+        for (const [comp, fields] of Object.entries(arch.components)) {
+            console.log(`    ${comp}:`);
+            for (const f of fields) {
+                console.log(`      ${f.field.padEnd(14)} ${f.kind.padEnd(6)} ${f.axes} col  ${f.bytes}b/entity`);
+            }
         }
     }
     console.log();
-}
-
-export function printEntityBytes<CS extends ComponentSet>(
-    world: World<CS>,
-    entityId: EntityId,
-): void {
-    const dump = world.dumpEntityBytes(entityId);
-    const layout = world.dumpEntityLayout(entityId);
-
-    console.log(`\n  Entity ${entityId} [${dump.archetypeKey}] @ dense[${dump.denseIndex}]`);
-    console.log(`  Row size : ${dump.rowByteSize} bytes`);
-    console.log(`  Hex      : ${dump.hex}`);
-
-    console.log(`  Breakdown:`);
-    for (const [name, {offset, byteSize}] of Object.entries(layout)) {
-        const bytes = Array.from(new Uint8Array(dump.f32View.buffer, offset, byteSize))
-            .map((b) => b.toString(16).padStart(2, "0"))
-            .join(" ");
-        console.log(`    ${name.padEnd(16)} @+${String(offset).padStart(3, "0")} [${bytes}]`);
-    }
-
-    console.log(`  As f32   : [${Array.from(dump.f32View).join(", ")}]`);
-    console.log(`  As u32   : [${Array.from(dump.u32View).join(", ")}]`);
 }

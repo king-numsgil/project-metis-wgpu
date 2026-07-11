@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `metis-engine` is a WebGPU clustered-forward PBR renderer for the space-sim game — built directly on `bun-webgpu-rs`'s raw WebGPU/SDL3 bindings (no other rendering-facing dependency; `wgpu-matrix` is the only non-`bun-webgpu-rs` dependency, for matrix/vector math). It's a standalone package with no dependency on `metis-tui`. `metis-game` consumes it (a 100-point-light demo), and does so via the caller-owned-device path — it never touches `RenderContext`. See "The engine does not own the window" below.
 
-**`src/` is split into two independent subtrees.** `src/renderer/` is the entire renderer described in this doc; `src/ecs/` is a young archetype ECS (backed by the `metis-data` struct/buffer library) that will eventually feed the renderer. They do not depend on each other yet — the renderer still takes a hand-built `Scene`, not ECS data. The root `src/index.ts` re-exports them as namespaces (`export * as Renderer`, `export * as ECS`), but consumers import through the package's **subpath exports** — `metis-engine/renderer` and `metis-engine/ecs` — which is what `examples/`, `test/`, `bench/`, and `metis-game` now do (`import { ClusteredForwardRenderer, … } from "metis-engine/renderer"`). The ECS's current shape and limits are in "The ECS" below.
+**`src/` is split into two independent subtrees.** `src/renderer/` is the entire renderer described in this doc; `src/ecs/` is a young archetype ECS (Structure-of-Arrays storage, no `metis-data` dependency) that will eventually feed the renderer. They do not depend on each other yet — the renderer still takes a hand-built `Scene`, not ECS data. The root `src/index.ts` re-exports them as namespaces (`export * as Renderer`, `export * as ECS`), but consumers import through the package's **subpath exports** — `metis-engine/renderer` and `metis-engine/ecs` — which is what `examples/`, `test/`, `bench/`, and `metis-game` now do (`import { ClusteredForwardRenderer, … } from "metis-engine/renderer"`). The ECS's current shape and limits are in "The ECS" below.
 
 It's the first package in this monorepo to build a *real* render pipeline — depth buffer, vertex buffers, multiple bind groups, compute passes, multisample-capable targets. Every prior pipeline in `bun-webgpu-rs/tests/render*.test.ts` and `metis-game/src/index.ts` is a hardcoded no-vertex-buffer triangle, so the patterns here (vertex layouts, bind group group-index conventions, WGSL module concatenation) are this repo's first precedent, not a continuation of one.
 
@@ -139,21 +139,38 @@ storage only, with no systems, scheduling, or renderer integration yet. It exist
 so the sim can be modelled as entities/components; the renderer still consumes a
 hand-built `Scene`, and nothing extracts one from the other yet.
 
-Storage model: entities with the *same set of component names* share an
-`Archetype`. Each archetype holds its entities as **packed array-of-structs rows**
-in a single growable `ArrayBuffer` (one contiguous row per entity, all its
-components interleaved), typed and laid out by the **`metis-data`** descriptor
-library (`StructOf`, `wrap`, `F32`/`U32`, …). `getComponent` returns a live
-typed *view* into that buffer (`.set(...)`/`.get(...)`), not a copy. Removal is
-swap-with-last (`removeEntity`), so dense indices are not stable across despawns.
-The buffer doubles on overflow (`INITIAL_CAPACITY = 32`).
+**Storage model: archetype + Structure-of-Arrays (SoA).** Entities with the *same
+set of component names* share an `Archetype`. Within one, each component field is
+stored as its **own typed-array column** indexed by a dense row — a scalar field
+is one column, a vec field is one column *per axis* (`x`/`y`/`z`/`w`). So a system
+touches data as a bare `column[row]` index: cache-friendly, fully typed, no
+wrapper, no allocation. Removal is swap-with-last (copy the last row into the
+vacated one, every column), so a row is **not** a stable handle across despawns —
+the `EntityId → row` map is. Columns double on overflow (`INITIAL_CAPACITY = 32`;
+each column is reallocated 2× and copied).
 
-Public surface (via `metis-engine/ecs`): `defineComponent(name, descriptor)`,
-`World<CS>` (`spawnEntity(...names)` → `EntityId`, `despawnEntity`,
-`getComponent`, `queryEntities(names)`), and debug helpers in `debug.ts`
-(`inspectWorld`/`printWorldInfo`/`printEntityBytes` — archetype layout + raw
-byte/f32/u32 dumps, matching this repo's verify-the-bytes habit). `src/ecs/test.ts`
-is a manual smoke script (`bun run src/ecs/test.ts`), not a test-runner test.
+**Why SoA and not `metis-data`.** This subtree used to store AoS rows via
+`metis-data` (`StructOf`/`wrap`). That was wrong: `metis-data` describes
+*interleaved (AoS) GPU layout*, which is the slow shape to iterate per frame (the
+whole "Performance intent" saga in `metis-data`'s CLAUDE.md). The ECS now owns its
+own SoA storage with **no `metis-data` dependency**; `metis-data` will re-enter
+only at the eventual *extract* step, interleaving SoA sim data into AoS buffers for
+GPU upload. Field types are a small ECS-local vocabulary (`f32`/`u32`/`i32`/`f64`/
+`i16`/`u16`/`i8`/`u8` + `vec2`/`vec3`/`vec4`), each mapped to a TypedArray.
+
+Public surface (via `metis-engine/ecs`):
+- `defineComponent(name, schema)` where a schema is `{ field: f32 | vec3(f32) | … }`.
+- `World<Registry>`: `spawnEntity(...names) → EntityId`, `despawnEntity`,
+  `getComponent(id, name)` (a random-access accessor — `pos.mass = 5`,
+  `pos.position.x = 1` — settable scalars and `{x,y,z}` sub-objects, resolving the
+  live row/array on each access so it survives growth and swaps),
+  `queryEntities(names)`, and the fast path **`query(names, (cols, count, ids) => …)`**
+  which runs once per matching archetype with the typed SoA columns
+  (`cols.Position.pos.x[i]`), the dense count, and the dense entity ids. Don't
+  spawn/despawn during a `query` — it invalidates that archetype's columns/rows.
+- Debug helpers in `debug.ts` (`inspectWorld`/`printWorldInfo` — archetype + column
+  layout). `src/ecs/test.ts` is a manual smoke script; `src/ecs/test/ecs.test.ts`
+  is the automated `bun test` suite (spawn/despawn/query/growth/errors).
 
 **What it deliberately does *not* have yet** (all discussed as next steps, none
 built): entity **generation tags** (`EntityId` is a bare incrementing `number`,

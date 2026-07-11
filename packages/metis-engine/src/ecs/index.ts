@@ -1,3 +1,4 @@
+export * from "./field.ts";
 export * from "./component.ts";
 export * from "./archetype.ts";
 export * from "./world.ts";

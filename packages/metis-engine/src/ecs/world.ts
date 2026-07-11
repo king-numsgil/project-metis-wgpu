@@ -1,132 +1,138 @@
-import type { DescriptorToMemoryBuffer } from "metis-data";
-import { Archetype, type EntityBytesDump, type EntityId, makeSignatureKey, type SignatureKey } from "./archetype.ts";
+import { Archetype, type EntityId, makeSignatureKey, type SignatureKey } from "./archetype.ts";
+import type { ComponentDef, Registry, SchemaOf } from "./component.ts";
+import type { ComponentAccessor, ComponentColumns } from "./field.ts";
 
-import type { ComponentSet } from "./component.ts";
-
-type SubsetOf<CS extends ComponentSet, K extends keyof CS = keyof CS> = {
-    [P in K]: CS[P];
+/** The typed columns object handed to a `query` callback, keyed by the queried component names. */
+export type QueryColumns<R extends Registry, Names extends readonly (keyof R)[]> = {
+    readonly [N in Names[number]]: ComponentColumns<SchemaOf<R[N]>>;
 };
 
-interface EntityRecord {
-    readonly archetypeKey: SignatureKey;
-}
-
-export class World<CS extends ComponentSet> {
-    private readonly components: CS;
-    private readonly archetypes: Map<SignatureKey, Archetype<SubsetOf<CS>>>;
-    private readonly entityRecords: Map<EntityId, EntityRecord>;
+export class World<R extends Registry> {
+    private readonly registry: R;
+    private readonly archetypes = new Map<SignatureKey, Archetype>();
+    private readonly entityArchetype = new Map<EntityId, SignatureKey>();
     private nextEntityId: EntityId = 0;
 
-    constructor(components: CS) {
-        this.components = components;
-        this.archetypes = new Map();
-        this.entityRecords = new Map();
+    constructor(registry: R) {
+        this.registry = registry;
+    }
+
+    get entityCount(): number {
+        return this.entityArchetype.size;
     }
 
     get archetypeCount(): number {
         return this.archetypes.size;
     }
 
-    get entityCount(): number {
-        return this.entityRecords.size;
-    }
-
-    spawnEntity(...componentNames: Array<keyof CS & string>): EntityId {
+    /** Create an entity holding exactly the named components (all zero-initialised). */
+    spawnEntity(...componentNames: Array<keyof R & string>): EntityId {
         const archetype = this.getOrCreateArchetype(componentNames);
         const entityId = this.nextEntityId++;
         archetype.addEntity(entityId);
-        this.entityRecords.set(entityId, {archetypeKey: archetype.signatureKey});
+        this.entityArchetype.set(entityId, archetype.signatureKey);
         return entityId;
     }
 
     despawnEntity(entityId: EntityId): void {
-        const record = this.entityRecords.get(entityId);
-        if (record === undefined) {
-            throw new Error(`Entity ${entityId} does not exist`);
-        }
-        const archetype = this.archetypes.get(record.archetypeKey);
-        if (archetype === undefined) {
-            throw new Error(`Archetype "${record.archetypeKey}" not found`);
-        }
+        const archetype = this.archetypeOf(entityId);
         archetype.removeEntity(entityId);
-        this.entityRecords.delete(entityId);
+        this.entityArchetype.delete(entityId);
     }
 
-    getComponent<K extends keyof CS & string>(
+    /**
+     * Random-access accessor for one entity's component: `pos.mass = 5`,
+     * `pos.position.x = 1`. For per-frame work over many entities use `query`.
+     */
+    getComponent<K extends keyof R & string>(
         entityId: EntityId,
         componentName: K,
-    ): DescriptorToMemoryBuffer<CS[K]["descriptor"]> {
-        const record = this.entityRecords.get(entityId);
-        if (record === undefined) {
-            throw new Error(`Entity ${entityId} does not exist`);
-        }
-        const archetype = this.archetypes.get(record.archetypeKey);
-        if (archetype === undefined) {
-            throw new Error(`Archetype "${record.archetypeKey}" not found`);
-        }
-        return archetype.getComponent(
-            entityId,
-            componentName,
-        ) as DescriptorToMemoryBuffer<CS[K]["descriptor"]>;
+    ): ComponentAccessor<SchemaOf<R[K]>> {
+        return this.archetypeOf(entityId).accessor(entityId, componentName) as ComponentAccessor<SchemaOf<R[K]>>;
     }
 
-    *queryEntities(componentNames: Array<keyof CS & string>): IterableIterator<EntityId> {
-        const querySet = new Set<string>(componentNames);
+    /**
+     * The fast path. Invokes `run` once per archetype that has ALL the named
+     * components, handing it the typed SoA columns, the dense entity count, and
+     * the dense entity ids. Index columns by row `0..count-1`:
+     *
+     *   world.query(["Position", "Velocity"], (cols, count) => {
+     *     const px = cols.Position.position.x, vx = cols.Velocity.velocity.x;
+     *     for (let i = 0; i < count; i++) px[i] += vx[i] * dt;
+     *   });
+     *
+     * Do not spawn/despawn while iterating — structural changes invalidate the
+     * columns and rows for the current archetype.
+     */
+    query<const Names extends readonly (keyof R & string)[]>(
+        componentNames: Names,
+        run: (columns: QueryColumns<R, Names>, count: number, entityIds: readonly EntityId[]) => void,
+    ): void {
         for (const archetype of this.archetypes.values()) {
-            const archetypeNames = new Set(archetype.signatureKey.split(","));
-            if ([...querySet].every((name) => archetypeNames.has(name))) {
-                yield *archetype.iterEntities();
+            if (!this.archetypeHasAll(archetype, componentNames)) {
+                continue;
+            }
+            const all = archetype.columns;
+            const picked = {} as Record<string, unknown>;
+            for (const name of componentNames) {
+                picked[name] = all[name];
+            }
+            run(picked as QueryColumns<R, Names>, archetype.count, archetype.entityIds);
+        }
+    }
+
+    /** Yield every entity id that has ALL the named components. */
+    *queryEntities(componentNames: Array<keyof R & string>): IterableIterator<EntityId> {
+        for (const archetype of this.archetypes.values()) {
+            if (this.archetypeHasAll(archetype, componentNames)) {
+                yield* archetype.entityIds;
             }
         }
     }
 
-    *iterArchetypes(): IterableIterator<Archetype<SubsetOf<CS>>> {
-        yield *this.archetypes.values();
+    *iterArchetypes(): IterableIterator<Archetype> {
+        yield* this.archetypes.values();
     }
 
-    dumpEntityBytes(entityId: EntityId): EntityBytesDump {
-        const record = this.entityRecords.get(entityId);
-        if (record === undefined) {
+    private archetypeOf(entityId: EntityId): Archetype {
+        const key = this.entityArchetype.get(entityId);
+        if (key === undefined) {
             throw new Error(`Entity ${entityId} does not exist`);
         }
-        const archetype = this.archetypes.get(record.archetypeKey);
+        const archetype = this.archetypes.get(key);
         if (archetype === undefined) {
-            throw new Error(`Archetype "${record.archetypeKey}" not found`);
+            throw new Error(`Archetype "${key}" not found`);
         }
-        return archetype.dumpEntityBytes(entityId);
+        return archetype;
     }
 
-    dumpEntityLayout(entityId: EntityId): Record<string, { offset: number; byteSize: number }> {
-        const record = this.entityRecords.get(entityId);
-        if (record === undefined) {
-            throw new Error(`Entity ${entityId} does not exist`);
+    private archetypeHasAll(archetype: Archetype, names: readonly string[]): boolean {
+        const present = archetype.componentNames;
+        for (const name of names) {
+            if (!present.includes(name)) {
+                return false;
+            }
         }
-        const archetype = this.archetypes.get(record.archetypeKey);
-        if (archetype === undefined) {
-            throw new Error(`Archetype "${record.archetypeKey}" not found`);
-        }
-        return archetype.dumpLayout();
+        return true;
     }
 
-    private getOrCreateArchetype(
-        componentNames: Array<keyof CS & string>,
-    ): Archetype<SubsetOf<CS>> {
+    private getOrCreateArchetype(componentNames: Array<keyof R & string>): Archetype {
         const key = makeSignatureKey(componentNames);
         const existing = this.archetypes.get(key);
         if (existing !== undefined) {
             return existing;
         }
 
-        const subset = {} as SubsetOf<CS>;
+        const defs: ComponentDef[] = [];
         for (const name of componentNames) {
-            const def = this.components[name];
+            const def = this.registry[name];
             if (def === undefined) {
                 throw new Error(`Component "${name}" is not registered in this World`);
             }
-            (subset as ComponentSet)[name] = def;
+            defs.push(def);
         }
 
-        const archetype = new Archetype<SubsetOf<CS>>(key, subset);
+        const archetype = new Archetype(key, defs);
         this.archetypes.set(key, archetype);
         return archetype;
     }
