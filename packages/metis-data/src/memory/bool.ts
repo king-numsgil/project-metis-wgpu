@@ -5,22 +5,24 @@ export class BoolMemoryBufferImpl implements BoolMemoryBuffer {
     public readonly type: BoolDescriptor;
     public readonly buffer: ArrayBuffer;
     public readonly offset: number;
-
-    public view(): ReturnType<BoolDescriptor["view"]> {
-        return this.type.view(this.buffer, this.offset);
-    }
+    private readonly _view: Uint32Array;
 
     public constructor(descriptor: BoolDescriptor, buffer: ArrayBuffer, offset: number) {
+        this.type = descriptor;
         this.buffer = buffer;
         this.offset = offset;
-        this.type = descriptor;
+        this._view = descriptor.view(buffer, offset);
+    }
+
+    public view(): ReturnType<BoolDescriptor["view"]> {
+        return this._view;
     }
 
     public get(): boolean {
-        return this.view()[0]! !== 0;
+        return this._view[0]! !== 0;
     }
 
     public set(value: boolean): void {
-        this.view().set([value ? 1 : 0]);
+        this._view[0] = value ? 1 : 0;
     }
 }

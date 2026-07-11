@@ -9,14 +9,14 @@ export class StructMemoryBufferImpl<
     public readonly buffer: ArrayBuffer;
     public readonly offset: number;
 
-    public view(): ReturnType<StructDescriptor<Members>["view"]> {
-        return this.type.view(this.buffer, this.offset);
-    }
-
     public constructor(descriptor: StructDescriptor<Members>, buffer: ArrayBuffer, offset: number) {
         this.type = descriptor;
         this.buffer = buffer;
         this.offset = offset;
+    }
+
+    public view(): ReturnType<StructDescriptor<Members>["view"]> {
+        return this.type.view(this.buffer, this.offset);
     }
 
     public get members(): Members {

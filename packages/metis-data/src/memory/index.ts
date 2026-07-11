@@ -81,6 +81,12 @@ export interface VecMemoryBuffer<
     get(): TupleOf<N, number>;
 
     set(value: TupleOf<N, number>): void;
+
+    /** Read one component without allocating a tuple — for hot loops. */
+    getComponent(index: number): number;
+
+    /** Write one component without allocating a tuple — for hot loops. */
+    setComponent(index: number, value: number): void;
 }
 
 export interface MatMemoryBuffer<
@@ -191,6 +197,10 @@ export function allocate(
     }
 }
 
+/**
+ * View an existing `ArrayBuffer` region as `descriptor`. Returns a fresh,
+ * independent memory buffer.
+ */
 export function wrap<T extends Descriptor<DescriptorTypedArray>>(
     descriptor: T,
     buffer: ArrayBuffer,

@@ -151,29 +151,45 @@ region for both dense and std140; `array.test.ts` now asserts the flat view
 aliases the same bytes `at()`/`offsetAt()` address. Prefer `at()`/`offsetAt()`
 for element access regardless; `view()` is for bulk upload of the raw region.
 
-### Performance intent — and where the wrappers cost you
+### Performance intent — this is a GPU-layout library, not a hot-path iterator
 
-The storage story is ideal: a `metis-data` buffer *is* a plain `ArrayBuffer`, and
-the descriptor adds **zero** per-element storage overhead — an `ArrayOf(Struct,
-N)` is byte-for-byte the same as a hand-packed `Float32Array`. So reading/writing
-through a long-lived `.view()` and hand-indexing hits the same floor as a raw
-typed array.
+Know what job this package has before optimizing it. metis-data describes
+**GPU-compatible interleaved (AoS) memory** — std140/std430/Dense structs you
+upload as one packed buffer — and gives typed, convenient access to it. Being AoS
+*is the point*: a packed GPU buffer is interleaved. This package is exercised when
+you **pack and upload** GPU data, not when you iterate tens of thousands of
+entities per frame — so don't optimize it as if it were the per-frame hot loop.
 
-The cost is in **ergonomic access**. `array.at(i)`, `struct.get(name)`, and
-`mat.at(col)` each construct a *new* memory-buffer wrapper object (via `wrap`)
-per call, and `vec.get()` allocates a fresh tuple. In a per-frame loop over tens
-of thousands of entities that is real allocation churn and GC pressure. This is
-the known hot-path tension and the reason the benchmark exists: it measures the
-wrapper path against a raw `.view()` path, a hand-indexed `Float32Array`, and an
-array of plain JS objects, for both throughput and memory, so an optimization
-(e.g. cursor/flyweight buffers that rebind an offset instead of allocating) can
-be judged against real numbers rather than a guess. Run it with `bun run bench`
-(`bench/buffers.ts`); it takes `--count`, `--iters`, and `--json`.
+**Fast per-frame iteration is a separate, orthogonal concern, and it isn't
+metis-data's.** The ECS owns it, with a **structure-of-arrays** layout (one typed
+array per field, indexed by entity id — the bitECS pattern). There, a field access
+is a bare `field[i]` typed-array index: cache-friendly, fully typed, no wrapper, no
+closures, no eval — measured *faster* than even hand-indexed AoS. AoS interleaving
+(metis-data) and SoA iteration (ECS) are different memory models for different
+jobs; the render extract bridges them (SoA sim data → interleaved AoS where a GPU
+uniform block needs it). Speed of iteration is orthogonal to efficient GPU storage.
 
-The math layer is already built around this concern: every producing op is
-**out-first** (`Vec3.add(out, a, b)` writes into `out` and returns it), so a
-steady-state simulation loop can pre-allocate its scratch buffers and allocate
-nothing per frame.
+So the convenient API here — `allocate`/`wrap`/`at`/`get`/`for…of`, each returning
+a *fresh, independent* sub-buffer (safe to hold, compare, stash), with a
+constructor-cached region view so repeated `get`/`set` don't re-allocate, plus
+`getComponent`/`setComponent` for no-tuple vec access — is right-sized for this
+package's role. The one exception: a hot loop that *genuinely* lives on an AoS
+metis-data buffer should hand-index it (one typed array per scalar type, like the
+`flat` baseline in `bench/buffers.ts`; a *single* `Float32Array` is wrong — it
+misreads `u32`/`bool` fields). That's the exception, not the design center.
+
+**History worth not repeating.** Two abstractions were tried to make AoS iteration
+fast *and* typed: a rebindable-flyweight "cursor" (reused element buffer + `seek()`)
+and generated closure accessors. Both underdelivered (~11–14 Melem/s, no better than
+plain objects) and *only* runtime `eval`/`new Function` reached the floor. Both were
+removed. The lesson wasn't "try harder" — it's that fast typed iteration wants SoA,
+which is the ECS's layer. **Don't reintroduce a hot-path iteration abstraction
+here.** The `bench/buffers.ts` numbers (convenient vs hand-indexed `flat` vs plain
+objects, on a *mixed-type* component) exist to keep that conclusion honest.
+
+The math layer is built for allocation-free steady state: every producing op is
+**out-first** (`Vec3.add(out, a, b)` writes into `out` and returns it), so a loop
+can pre-allocate its scratch buffers and allocate nothing per frame.
 
 ### Known limitations (not yet done)
 
@@ -182,8 +198,10 @@ nothing per frame.
 - **No explicit `@align`/`@size` overrides.** Layout is derived purely from type
   + packing; you can't force a member's offset or stride the way a WGSL attribute
   can.
-- **The ergonomic-access allocation churn above is unoptimized** — measured, not
-  yet addressed. Treat `.at()`/`.get(name)` in a tight per-entity loop as a known
-  cost until the benchmark says otherwise.
+- **No fast per-frame iteration path — deliberately.** metis-data is AoS
+  GPU-layout + convenient access; per-frame hot iteration is the ECS's job via SoA
+  (see Performance intent). Don't add a hot-path iteration abstraction here — two
+  were tried (cursor, generated accessors) and removed as dominated. If a hot loop
+  truly lives on an AoS buffer, hand-index it.
 - **`src/std140_demo.ts` and `src/test.ts` are scratch scripts**, not part of the
   test suite or the public surface.

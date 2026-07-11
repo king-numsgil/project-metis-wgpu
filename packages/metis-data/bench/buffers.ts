@@ -1,32 +1,34 @@
 // metis-data memory-buffer benchmark: how do the typed views cost, in time and
-// memory, against the two things a game engine would otherwise reach for — a
-// hand-indexed flat Float32Array (the theoretical floor) and an array of plain
-// JS objects (the ergonomic default)?
+// memory, against what a game engine would otherwise reach for?
 //
-//   bun run bench/buffers.ts                 # 100k particles, default iters
+//   bun run bench/buffers.ts                 # 100k bodies, default iters
 //   bun run bench/buffers.ts --count 1000000 # a million
 //   bun run bench/buffers.ts --iters 50      # more timed reps (tighter stats)
 //   bun run bench/buffers.ts --json          # machine-readable output only
 //
-// It runs three per-frame-shaped workloads over N particles (a 48-byte AoS
-// component: position/velocity vec3, color vec4, mass/age scalars):
+// The component is a MIXED-TYPE struct (f32 vectors + u32 fields) — the realistic
+// ECS case. That matters for the baseline: a single `new Float32Array(buffer)`
+// view is UNUSABLE here (it would misread the u32 fields as float bits), so the
+// honest hand-coded floor ("flat") juggles a Float32Array AND a Uint32Array over
+// the same buffer, indexing each field into the right one. There is no cheaper
+// correct baseline for a heterogeneous struct.
+//
+// Workloads (each per-frame-shaped) over N bodies:
 //   build      — construct + initialise all N (allocation-shaped)
-//   integrate  — pos += vel*dt; age += dt   (write-heavy, the steady-state cost)
-//   reduce     — sum positions -> centroid  (read-heavy)
-// against four implementations:
-//   md-wrapper — idiomatic metis-data: arr.at(i).get("pos").set(...) — allocates
-//                a fresh view wrapper per access (the churn we want a number for)
-//   md-view    — metis-data storage, but one long-lived .view() hand-indexed
-//   flat       — a plain Float32Array, same AoS layout, hand-indexed (the floor)
-//   objects    — an array of { px, py, ... } plain objects (the baseline)
-// md-view and flat should tie: metis-data's buffer *is* a flat typed array, so
-// the descriptor adds zero storage/throughput overhead. The gap between
-// md-wrapper and md-view is the price of the ergonomic access path.
+//   integrate  — pos += vel*dt; age += dt; tick += 1   (touches f32 AND u32)
+//   reduce     — sum positions + ticks                 (read-heavy, both types)
+// Implementations:
+//   md-convenient — metis-data convenient API: arr.at(i).get("field")… (typed, packed)
+//   flat          — hand-indexed Float32Array + Uint32Array (the realistic floor)
+//   objects       — an array of { px, py, …, tick } plain objects (the ergonomic default)
+// The convenient API is fine off the hot path; for the hot path, hand-index the
+// packed buffer like `flat` (planned: generated typed accessors that match it).
 import {
     allocate,
     ArrayOf,
     F32,
     StructOf,
+    U32,
     Vec,
 } from "../src/index.ts";
 
@@ -48,32 +50,32 @@ const num = (k: string, d: number) => (args[k] !== undefined ? Number(args[k]) :
 const flag = (k: string) => args[k] === true || args[k] === "true";
 
 const COUNT = num("count", 100_000);
-const ITERS = num("iters", 25); // timed reps for integrate/reduce
-const BUILD_ITERS = Math.max(5, Math.round(ITERS / 3)); // build is heavier; fewer reps
+const ITERS = num("iters", 25);
+const BUILD_ITERS = Math.max(5, Math.round(ITERS / 3));
 const WARMUP = 3;
 const DT = 1 / 60;
 const JSON_ONLY = flag("json");
 
-// ── The component under test ──────────────────────────────────────────────────
-// Dense (particle/vertex-style) packing: tightest, no padding. 48 bytes = 12 f32.
-const Particle = StructOf({
+// ── The component under test (mixed f32 + u32, Dense) ─────────────────────────
+const Body = StructOf({
     position: Vec(F32, 3),
     velocity: Vec(F32, 3),
-    color: Vec(F32, 4),
+    tick: U32,
+    flags: U32,
     mass: F32,
     age: F32,
 });
-const STRIDE_F32 = Particle.byteSize / 4; // 12
-// Field offsets in floats, straight from the descriptor (no hardcoding).
+const STRIDE_W = Body.byteSize / 4; // 10 four-byte words
+// Field offsets in words, straight from the descriptor.
 const OFF = {
-    px: Particle.offsetOf("position") / 4,
-    vx: Particle.offsetOf("velocity") / 4,
-    r: Particle.offsetOf("color") / 4,
-    mass: Particle.offsetOf("mass") / 4,
-    age: Particle.offsetOf("age") / 4,
+    px: Body.offsetOf("position") / 4,
+    vx: Body.offsetOf("velocity") / 4,
+    tick: Body.offsetOf("tick") / 4,
+    flags: Body.offsetOf("flags") / 4,
+    mass: Body.offsetOf("mass") / 4,
+    age: Body.offsetOf("age") / 4,
 };
 
-// Deterministic pseudo-random so every implementation gets identical inputs.
 function mulberry32(seed: number) {
     let a = seed >>> 0;
     return () => {
@@ -84,23 +86,21 @@ function mulberry32(seed: number) {
     };
 }
 
-interface ParticleInit {
+interface BodyInit {
     pos: [number, number, number];
     vel: [number, number, number];
-    color: [number, number, number, number];
+    flags: number;
     mass: number;
-    age: number;
 }
-function makeInits(n: number): ParticleInit[] {
+function makeInits(n: number): BodyInit[] {
     const rand = mulberry32(0xc0ffee);
-    const out: ParticleInit[] = new Array(n);
+    const out: BodyInit[] = new Array(n);
     for (let i = 0; i < n; i++) {
         out[i] = {
             pos: [rand() * 100 - 50, rand() * 100 - 50, rand() * 100 - 50],
             vel: [rand() * 2 - 1, rand() * 2 - 1, rand() * 2 - 1],
-            color: [rand(), rand(), rand(), 1],
+            flags: (rand() * 0xffff) | 0,
             mass: 0.5 + rand() * 4,
-            age: 0,
         };
     }
     return out;
@@ -130,23 +130,18 @@ function timed(reps: number, fn: () => void): Stats {
 const inits = makeInits(COUNT);
 
 // ── Implementations ───────────────────────────────────────────────────────────
-// Each exposes: build() -> handle, integrate(handle), reduce(handle) -> checksum.
-
-// Standalone factory so the handle type can be named without the impl object
-// referencing its own type (which TS rejects as a circular initializer).
 function makeMdArray() {
-    return allocate(ArrayOf(Particle, COUNT));
+    return allocate(ArrayOf(Body, COUNT));
 }
 type MdArr = ReturnType<typeof makeMdArray>;
 
-// md-wrapper — idiomatic metis-data, wrapper object per field access.
+// md-wrapper — convenient metis-data, fresh wrapper per field access.
 const mdWrapper = {
     build(): MdArr {
         const arr = makeMdArray();
         for (let i = 0; i < COUNT; i++) {
-            const p = arr.at(i);
             const s = inits[i]!;
-            p.set({ position: s.pos, velocity: s.vel, color: s.color, mass: s.mass, age: s.age });
+            arr.at(i).set({ position: s.pos, velocity: s.vel, tick: 0, flags: s.flags, mass: s.mass, age: 0 });
         }
         return arr;
     },
@@ -160,113 +155,99 @@ const mdWrapper = {
             pos.set([px + vx * DT, py + vy * DT, pz + vz * DT]);
             const age = p.get("age");
             age.set(age.get() + DT);
+            const tick = p.get("tick");
+            tick.set(tick.get() + 1);
         }
     },
     reduce(arr: MdArr): number {
-        let cx = 0, cy = 0, cz = 0;
+        let acc = 0;
         for (let i = 0; i < COUNT; i++) {
-            const [px, py, pz] = arr.at(i).get("position").get();
-            cx += px; cy += py; cz += pz;
+            const p = arr.at(i);
+            const [px, py, pz] = p.get("position").get();
+            acc += px + py + pz + p.get("tick").get();
         }
-        return cx + cy + cz;
+        return acc;
     },
 };
 
-// md-view — metis-data storage, one long-lived flat view, hand-indexed.
-const mdView = {
-    build() {
-        const arr = allocate(ArrayOf(Particle, COUNT));
-        // ArrayOf(<struct>).view() is a Uint8Array (raw struct bytes); for
-        // hand-indexed float access take a Float32Array over the same region.
-        const v = new Float32Array(arr.buffer, arr.offset, COUNT * STRIDE_F32);
-        for (let i = 0; i < COUNT; i++) {
-            const b = i * STRIDE_F32;
-            const s = inits[i]!;
-            v[b + OFF.px] = s.pos[0]; v[b + OFF.px + 1] = s.pos[1]; v[b + OFF.px + 2] = s.pos[2];
-            v[b + OFF.vx] = s.vel[0]; v[b + OFF.vx + 1] = s.vel[1]; v[b + OFF.vx + 2] = s.vel[2];
-            v[b + OFF.r] = s.color[0]; v[b + OFF.r + 1] = s.color[1]; v[b + OFF.r + 2] = s.color[2]; v[b + OFF.r + 3] = s.color[3];
-            v[b + OFF.mass] = s.mass; v[b + OFF.age] = s.age;
-        }
-        return v;
-    },
-    integrate(v: Float32Array) {
-        for (let i = 0; i < COUNT; i++) {
-            const b = i * STRIDE_F32;
-            v[b + OFF.px] = v[b + OFF.px]! + v[b + OFF.vx]! * DT;
-            v[b + OFF.px + 1] = v[b + OFF.px + 1]! + v[b + OFF.vx + 1]! * DT;
-            v[b + OFF.px + 2] = v[b + OFF.px + 2]! + v[b + OFF.vx + 2]! * DT;
-            v[b + OFF.age] = v[b + OFF.age]! + DT;
-        }
-    },
-    reduce(v: Float32Array): number {
-        let cx = 0, cy = 0, cz = 0;
-        for (let i = 0; i < COUNT; i++) {
-            const b = i * STRIDE_F32;
-            cx += v[b + OFF.px]!; cy += v[b + OFF.px + 1]!; cz += v[b + OFF.px + 2]!;
-        }
-        return cx + cy + cz;
-    },
-};
-
-// flat — a plain Float32Array with the identical AoS layout. The floor.
+// flat — the realistic hand-coded floor: TWO typed-array views over one buffer
+// (a single Float32Array can't address the u32 fields correctly).
+interface FlatHandle { f: Float32Array; u: Uint32Array; }
 const flat = {
-    build() {
-        const v = new Float32Array(COUNT * STRIDE_F32);
+    build(): FlatHandle {
+        const buf = new ArrayBuffer(COUNT * Body.byteSize);
+        const f = new Float32Array(buf);
+        const u = new Uint32Array(buf);
         for (let i = 0; i < COUNT; i++) {
-            const b = i * STRIDE_F32;
+            const b = i * STRIDE_W;
             const s = inits[i]!;
-            v[b + OFF.px] = s.pos[0]; v[b + OFF.px + 1] = s.pos[1]; v[b + OFF.px + 2] = s.pos[2];
-            v[b + OFF.vx] = s.vel[0]; v[b + OFF.vx + 1] = s.vel[1]; v[b + OFF.vx + 2] = s.vel[2];
-            v[b + OFF.r] = s.color[0]; v[b + OFF.r + 1] = s.color[1]; v[b + OFF.r + 2] = s.color[2]; v[b + OFF.r + 3] = s.color[3];
-            v[b + OFF.mass] = s.mass; v[b + OFF.age] = s.age;
+            f[b + OFF.px] = s.pos[0]; f[b + OFF.px + 1] = s.pos[1]; f[b + OFF.px + 2] = s.pos[2];
+            f[b + OFF.vx] = s.vel[0]; f[b + OFF.vx + 1] = s.vel[1]; f[b + OFF.vx + 2] = s.vel[2];
+            u[b + OFF.tick] = 0; u[b + OFF.flags] = s.flags;
+            f[b + OFF.mass] = s.mass; f[b + OFF.age] = 0;
         }
-        return v;
+        return { f, u };
     },
-    integrate: (v: Float32Array) => mdView.integrate(v),
-    reduce: (v: Float32Array) => mdView.reduce(v),
+    integrate(h: FlatHandle) {
+        const { f, u } = h;
+        for (let i = 0; i < COUNT; i++) {
+            const b = i * STRIDE_W;
+            f[b + OFF.px] = f[b + OFF.px]! + f[b + OFF.vx]! * DT;
+            f[b + OFF.px + 1] = f[b + OFF.px + 1]! + f[b + OFF.vx + 1]! * DT;
+            f[b + OFF.px + 2] = f[b + OFF.px + 2]! + f[b + OFF.vx + 2]! * DT;
+            f[b + OFF.age] = f[b + OFF.age]! + DT;
+            u[b + OFF.tick] = u[b + OFF.tick]! + 1;
+        }
+    },
+    reduce(h: FlatHandle): number {
+        const { f, u } = h;
+        let acc = 0;
+        for (let i = 0; i < COUNT; i++) {
+            const b = i * STRIDE_W;
+            acc += f[b + OFF.px]! + f[b + OFF.px + 1]! + f[b + OFF.px + 2]! + u[b + OFF.tick]!;
+        }
+        return acc;
+    },
 };
 
-// objects — array of plain JS objects. The ergonomic baseline.
-interface ObjParticle {
+// objects — array of plain JS objects. The ergonomic default.
+interface ObjBody {
     px: number; py: number; pz: number;
     vx: number; vy: number; vz: number;
-    r: number; g: number; b: number; a: number;
-    mass: number; age: number;
+    tick: number; flags: number; mass: number; age: number;
 }
 const objects = {
-    build(): ObjParticle[] {
-        const out: ObjParticle[] = new Array(COUNT);
+    build(): ObjBody[] {
+        const out: ObjBody[] = new Array(COUNT);
         for (let i = 0; i < COUNT; i++) {
             const s = inits[i]!;
             out[i] = {
                 px: s.pos[0], py: s.pos[1], pz: s.pos[2],
                 vx: s.vel[0], vy: s.vel[1], vz: s.vel[2],
-                r: s.color[0], g: s.color[1], b: s.color[2], a: s.color[3],
-                mass: s.mass, age: s.age,
+                tick: 0, flags: s.flags, mass: s.mass, age: 0,
             };
         }
         return out;
     },
-    integrate(o: ObjParticle[]) {
+    integrate(o: ObjBody[]) {
         for (let i = 0; i < COUNT; i++) {
             const p = o[i]!;
             p.px += p.vx * DT; p.py += p.vy * DT; p.pz += p.vz * DT;
-            p.age += DT;
+            p.age += DT; p.tick += 1;
         }
     },
-    reduce(o: ObjParticle[]): number {
-        let cx = 0, cy = 0, cz = 0;
+    reduce(o: ObjBody[]): number {
+        let acc = 0;
         for (let i = 0; i < COUNT; i++) {
             const p = o[i]!;
-            cx += p.px; cy += p.py; cz += p.pz;
+            acc += p.px + p.py + p.pz + p.tick;
         }
-        return cx + cy + cz;
+        return acc;
     },
 };
 
 const IMPLS = [
-    { name: "md-wrapper", impl: mdWrapper },
-    { name: "md-view", impl: mdView },
+    { name: "md-convenient", impl: mdWrapper },
     { name: "flat", impl: flat },
     { name: "objects", impl: objects },
 ] as const;
@@ -281,19 +262,11 @@ interface Row {
     checksum: number;
 }
 
-// Storage footprint. All three buffer-backed impls ARE the packed ArrayBuffer —
-// byte-for-byte a hand-packed Float32Array — so their footprint is exact and
-// equal. md-wrapper's per-access wrapper churn is a CPU/GC cost (it shows up in
-// throughput), not a retained-memory cost, so it does not inflate this number.
-// Only the plain-object array must actually be measured, via a GC-settled heap
-// delta with the array held live across the second collection.
-const EXACT_BYTES = COUNT * Particle.byteSize;
+// Storage footprint: exact for the buffer-backed impls (they ARE the packed
+// ArrayBuffer); the plain-object array is measured via a GC-settled RSS delta,
+// because JSC's heapUsed does not account for object/ArrayBuffer bytes.
+const EXACT_BYTES = COUNT * Body.byteSize;
 let heldObjects: unknown = null;
-// JSC's `heapUsed` does NOT account for object/ArrayBuffer storage (it reads 0
-// for both), so the retained cost of the plain-object array is measured via the
-// process RSS delta across a GC-settled build — a coarse but honest signal (a
-// 100k-object array moves RSS by ~15 MiB). Averaged over a few builds to damp
-// the page-granularity noise.
 function objectMemoryBytes(): number {
     const samples: number[] = [];
     for (let s = 0; s < 4; s++) {
@@ -305,11 +278,10 @@ function objectMemoryBytes(): number {
         samples.push(process.memoryUsage().rss - before);
     }
     samples.sort((a, b) => a - b);
-    return Math.max(0, samples[Math.floor(samples.length / 2)]!); // median
+    return Math.max(0, samples[Math.floor(samples.length / 2)]!);
 }
 const bytesFor: Record<string, number> = {
-    "md-wrapper": EXACT_BYTES,
-    "md-view": EXACT_BYTES,
+    "md-convenient": EXACT_BYTES,
     "flat": EXACT_BYTES,
     "objects": objectMemoryBytes(),
 };
@@ -323,27 +295,26 @@ for (const { name, impl } of IMPLS) {
     const reduce = timed(ITERS, () => { impl.reduce(handle); });
     rows.push({ name, bytes: bytesFor[name]!, build, integrate, reduce, checksum });
 }
-void heldObjects; // keep the measured object array rooted to end-of-run
+void heldObjects;
 
 // ── Report ────────────────────────────────────────────────────────────────────
 if (JSON_ONLY) {
-    console.log(JSON.stringify({ count: COUNT, iters: ITERS, stride: Particle.byteSize, rows }, null, 2));
+    console.log(JSON.stringify({ count: COUNT, iters: ITERS, stride: Body.byteSize, rows }, null, 2));
 } else {
-    const mel = (ms: number) => (COUNT / ms / 1000).toFixed(1); // million elements / sec
+    const mel = (ms: number) => (COUNT / ms / 1000).toFixed(1);
     const bpe = (bytes: number) => (bytes / COUNT).toFixed(1);
     const pad = (s: string, n: number) => s.padEnd(n);
     const padL = (s: string, n: number) => s.padStart(n);
 
     console.log("═".repeat(78));
-    console.log("  metis-data — memory-buffer benchmark");
+    console.log("  metis-data — memory-buffer benchmark (mixed-type component)");
     console.log("═".repeat(78));
-    console.log(`    Particles ......... ${COUNT.toLocaleString()}`);
-    console.log(`    Component ......... ${Particle.byteSize} B/entity (${STRIDE_F32} f32, Dense) — ${(COUNT * Particle.byteSize / 1048576).toFixed(1)} MiB packed`);
+    console.log(`    Bodies ............ ${COUNT.toLocaleString()}`);
+    console.log(`    Component ......... ${Body.byteSize} B/entity (${STRIDE_W} words: vec3 f32 ×2, u32 ×2, f32 ×2) — ${(COUNT * Body.byteSize / 1048576).toFixed(1)} MiB packed`);
     console.log(`    Timed reps ........ integrate/reduce ${ITERS}, build ${BUILD_ITERS} (+${WARMUP} warmup)`);
     console.log(`    Runtime ........... Bun ${Bun.version}`);
     console.log("─".repeat(78));
 
-    // Checksums must all agree (identical inputs + math) — a correctness guard.
     const cs0 = rows[0]!.checksum;
     const csOk = rows.every((r) => Math.abs(r.checksum - cs0) < Math.abs(cs0) * 1e-4 + 1);
     console.log(`    checksum ${csOk ? "OK (all impls agree)" : "MISMATCH — results suspect!"}: ${rows.map((r) => r.checksum.toFixed(0)).join("  ")}`);
@@ -360,17 +331,16 @@ if (JSON_ONLY) {
     }
     console.log("");
 
-    // Relative call-outs against the flat-array floor.
     const flatRow = rows.find((r) => r.name === "flat")!;
-    const wrapRow = rows.find((r) => r.name === "md-wrapper")!;
+    const convRow = rows.find((r) => r.name === "md-convenient")!;
     const objRow = rows.find((r) => r.name === "objects")!;
     const rel = (a: number, b: number) => {
         const r = a / b;
         return r >= 1 ? `${r.toFixed(1)}x slower` : `${(b / a).toFixed(1)}x faster`;
     };
-    console.log("    vs flat Float32Array (the floor):");
-    console.log(`      md-wrapper integrate .. ${rel(wrapRow.integrate.median, flatRow.integrate.median)}  (same ${bpe(EXACT_BYTES)} B/ent footprint — the cost is CPU/GC churn, not memory)`);
-    console.log(`      objects    integrate .. ${rel(objRow.integrate.median, flatRow.integrate.median)}, ${(objRow.bytes / EXACT_BYTES).toFixed(1)}x memory (${bpe(objRow.bytes)} vs ${bpe(EXACT_BYTES)} B/ent)`);
-    console.log(`    md-view vs flat ......... ${rel(rows.find((r) => r.name === "md-view")!.integrate.median, flatRow.integrate.median)} (expected ~tie — identical bytes & access; any gap is noise)`);
+    console.log("    integrate, vs the hand-coded flat floor (2 typed-array views):");
+    console.log(`      md-convenient .. ${rel(convRow.integrate.median, flatRow.integrate.median)}  (typed named access; fine off the hot path)`);
+    console.log(`      objects       .. ${rel(objRow.integrate.median, flatRow.integrate.median)}, ${(objRow.bytes / EXACT_BYTES).toFixed(1)}x memory (${bpe(objRow.bytes)} vs ${bpe(EXACT_BYTES)} B/ent, + GC, not packed)`);
+    console.log("    (hot path -> hand-index the packed buffer as 'flat' does; codegen accessors are the planned typed equivalent.)");
     console.log("═".repeat(78));
 }

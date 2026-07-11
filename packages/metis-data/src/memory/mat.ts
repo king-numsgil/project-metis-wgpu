@@ -12,18 +12,18 @@ export class MatMemoryBufferImpl<
     public readonly buffer: ArrayBuffer;
     public readonly offset: number;
 
-    public view(): ReturnType<MatDescriptor<ScalarType, N>["view"]> {
-        return this.type.view(this.buffer, this.offset);
-    }
-
     public constructor(descriptor: MatDescriptor<ScalarType, N>, buffer: ArrayBuffer, offset: number) {
         this.type = descriptor;
         this.buffer = buffer;
         this.offset = offset;
     }
 
+    public view(): ReturnType<MatDescriptor<ScalarType, N>["view"]> {
+        return this.type.view(this.buffer, this.offset);
+    }
+
     public at(colIndex: ArrayIndices<TupleOf<N, number>>): VecMemoryBuffer<ScalarType, N> {
-        return new VecMemoryBufferImpl(this.type.column, this.buffer, this.offset + (colIndex! * this.type.columnStride));
+        return new VecMemoryBufferImpl(this.type.column, this.buffer, this.offset + colIndex! * this.type.columnStride);
     }
 
     public get(colIndex: ArrayIndices<TupleOf<N, number>>): TupleOf<N, number> {

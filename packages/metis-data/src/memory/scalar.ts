@@ -7,22 +7,26 @@ export class ScalarMemoryBufferImpl<
     public readonly type: ScalarType;
     public readonly buffer: ArrayBuffer;
     public readonly offset: number;
-
-    public view(): ReturnType<ScalarType["view"]> {
-        return this.type.view(this.buffer, this.offset) as ReturnType<ScalarType["view"]>;
-    }
+    // The region view is built once here, so get/set don't construct a fresh
+    // typed array on every call.
+    private readonly _view: ReturnType<ScalarType["view"]>;
 
     public constructor(descriptor: ScalarType, buffer: ArrayBuffer, offset: number) {
+        this.type = descriptor;
         this.buffer = buffer;
         this.offset = offset;
-        this.type = descriptor;
+        this._view = descriptor.view(buffer, offset) as ReturnType<ScalarType["view"]>;
+    }
+
+    public view(): ReturnType<ScalarType["view"]> {
+        return this._view;
     }
 
     public get(): number {
-        return this.view()[0]!;
+        return this._view[0]! as number;
     }
 
     public set(value: number): void {
-        this.view().set([value]);
+        this._view[0] = value;
     }
 }

@@ -225,6 +225,16 @@ buf.get(name): <sub-buffer>;   buf.set({ field: value, … }): void;   buf.membe
 accepts a partial object — only the keys present are written. `DescriptorValueType<T>`
 is the plain-value shape a `set()` accepts (numbers/tuples/nested objects).
 
+Vec buffers also expose `getComponent(i)` / `setComponent(i, v)` — single-component
+read/write with no tuple allocation.
+
+**Performance note.** These buffers are a *convenience* API over **GPU-layout
+(AoS) data** — for packing and uploading, and for access that isn't a per-frame
+bottleneck. metis-data is **not** a per-frame hot-iteration library; that's the
+ECS's job, with its own SoA layout (see CLAUDE.md "Performance intent"). If a hot
+loop genuinely lives on an AoS buffer here, hand-index it directly (one typed
+array per scalar type — a single `Float32Array` misreads `u32`/`bool` fields).
+
 ---
 
 ## 8. Math module
