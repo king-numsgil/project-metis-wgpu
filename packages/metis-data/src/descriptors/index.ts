@@ -40,6 +40,7 @@ export type DescriptorTypedArray =
 export enum PackingType {
     Dense,
     Std140,
+    Std430,
 }
 
 export interface Descriptor<MemoryType extends DescriptorTypedArray> {

@@ -29,18 +29,21 @@ export class StructDescriptorImpl<
         this._offsets = {} as Record<keyof Members, number>;
         this._packing = packingType;
 
-        // A Std140 struct only lays out correctly if its composite members were
-        // themselves built Std140. Packing is NOT inherited — each descriptor's
-        // packing is frozen at construction — so a member left Dense would be
-        // under-aligned and silently corrupt the layout. Catch it loudly instead.
-        if (packingType === PackingType.Std140) {
+        // A Std140/Std430 struct only lays out correctly if its composite members
+        // were themselves built with the SAME packing. Packing is NOT inherited —
+        // each descriptor's packing is frozen at construction — so a member built
+        // with a different (or Dense) packing would be mis-strided and silently
+        // corrupt the layout. Catch it loudly instead. (Scalars carry no packing
+        // and are layout-invariant, so they never trip this.)
+        if (packingType !== PackingType.Dense) {
+            const expected = PackingType[packingType];
             for (const key of Object.keys(members) as Array<keyof Members>) {
                 const memberPacking = (members[key] as { packing?: PackingType }).packing;
-                if (memberPacking !== undefined && memberPacking !== PackingType.Std140) {
+                if (memberPacking !== undefined && memberPacking !== packingType) {
                     throw new Error(
-                        `Std140 struct member "${String(key)}" was built with `
-                        + `${PackingType[memberPacking]} packing; it must be Std140 too, or its `
-                        + `offset/stride will disagree with the shader. Pass PackingType.Std140 `
+                        `${expected} struct member "${String(key)}" was built with `
+                        + `${PackingType[memberPacking]} packing; it must be ${expected} too, or its `
+                        + `offset/stride will disagree with the shader. Pass PackingType.${expected} `
                         + `when constructing it.`,
                     );
                 }

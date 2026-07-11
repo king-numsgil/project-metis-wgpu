@@ -1,345 +1,189 @@
-# metis-data — Package Guide
+# CLAUDE.md
 
-## What This Is
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-The type system and math library for GPU memory in Metis. Nothing here talks to the GPU directly — it describes memory layouts and provides typed access to `ArrayBuffer` objects.
+## Overview
 
-Three concerns live in this package:
-1. **Descriptors** — objects that encode the byte size, alignment, and packing of a GPU-compatible type.
-2. **Memory buffers** — typed wrappers that read/write a specific region of an `ArrayBuffer` according to a descriptor.
-3. **Math** — Vec2/3/4, Mat2/3/4, Quat implemented as operations over memory buffers.
+`metis-data` is the type system and math library for **GPU-compatible memory
+layouts**. It describes how bytes are arranged in an `ArrayBuffer` and hands back
+typed views over them — it never touches the GPU, WebGPU, or SDL. It has no
+dependency on any other package in the monorepo (its only runtime dependency is
+`type-fest`, for tuple/index type helpers); `metis-engine` consumes *it*.
 
----
+Its reason to exist is the engine's data path. `metis-engine`'s archetype ECS
+stores each archetype's entities as **packed array-of-structs rows in one
+growable `ArrayBuffer`**, and every component is a `metis-data` descriptor
+(`StructOf`, `Vec`, `F32`, …); `getComponent` returns a live `metis-data` view
+into that buffer, not a copy. The same descriptors describe the std140/std430
+uniform and storage buffers the renderer uploads. So this package sits on the
+hottest data path in the engine — it is built and read every frame, for
+potentially tens of thousands of entities — which is why **speed is a
+first-class concern here alongside correctness** (see "Performance intent" and
+the benchmark below).
 
-## Packing Strategies
+Three layers, each an independent subtree of `src/`:
 
-Every composite descriptor takes an optional `PackingType` parameter (default: `Dense`).
+1. **Descriptors** (`src/descriptors/`) — immutable objects encoding a type's
+   `byteSize`, `alignment`, `arrayPitch`, and packing. Pure layout math; built
+   once, shared freely.
+2. **Memory buffers** (`src/memory/`) — cheap typed views that read/write a
+   region of an `ArrayBuffer` according to a descriptor.
+3. **Math** (`src/math/`) — `Vec2/3/4`, `Mat2/3/4`, `Quat` as out-first
+   operations over memory buffers. Already audited and tested; this doc's
+   war stories are about the descriptor/buffer layers.
 
-```typescript
-enum PackingType {
-    Dense   = 0,   // tightly packed (scalar alignment) — vertex/index buffers
-    Std140  = 1,   // std140 uniform-block layout — @group uniform bindings
-}
+## Read [`DOC.md`](DOC.md) first
+
+[`DOC.md`](DOC.md) is this package's **API reference**: the packing table, every
+descriptor factory and its properties, the memory-buffer `get`/`set`/`at`
+surface, and the full math namespace — with signatures and recipes.
+
+**Consult it before opening source files.** It exists so a task doesn't start
+with a dozen `Read` calls. Drop to source only when it doesn't cover what you
+need — then consider whether the gap belongs in the doc.
+
+**Keep it current.** Changing a public API — a factory signature, the meaning of
+a packing rule, a documented invariant — means updating `DOC.md` **in the same
+change**. A stale doc is worse than none, because it will be trusted.
+
+This `CLAUDE.md` explains *why* (the layout rules, the design split, the
+debugging history below). `DOC.md` explains *what to call*. Keep that split —
+don't duplicate war stories into `DOC.md`, don't grow an API listing here.
+
+## Commands
+
+Run from `packages/metis-data/` unless noted.
+
+```powershell
+# Install deps (from repo root)
+bun install
+
+# Run the whole test suite (descriptors + memory + math)
+bun test
+
+# A single test file
+bun test src/descriptors/test/std430.test.ts
+
+# Type-check this package
+bunx tsc --noEmit
+
+# Performance + memory benchmark vs flat typed arrays and plain objects
+bun run bench
 ```
 
-| Type | Dense alignment | Dense byteSize | Std140 alignment | Std140 byteSize | Std140 arrayPitch |
-|------|----------------|----------------|-------------------|------------------|-------------------|
-| `Vec2<F32>` | 4 | 8 | 8 | 8 | 16 |
-| `Vec3<F32>` | 4 | 12 | 16 | **12** | 16 |
-| `Vec4<F32>` | 4 | 16 | 16 | 16 | 16 |
-| `Mat4<F32>` | 4 | 64 | 16 | 64 | 64 |
-| `Array(Vec3<F32>, 10)` | 4 | 120 | 16 | 160 | 160 |
-
-**Rule of thumb:** vertex attributes → Dense; `@group` uniform bindings → Std140.
-Storage-buffer (std430) layout is not covered yet — a `Std430` mode is TODO.
-
-**Size vs. stride:** a Std140 `byteSize` is the *unpadded* extent (`Vec3<F32>` is 12,
-so a trailing scalar packs into offset 12 — `{ vec3, f32 }` is 16 bytes, not 32).
-Only *alignment* (placement) and *arrayPitch* (array element stride, always a
-multiple of 16) get padded.
-
-**Packing is not inherited.** Each descriptor's packing is frozen when it is built,
-so a `Std140` struct *validates* its composite members and throws if any was left
-`Dense`. Always pass `PackingType.Std140` to every member as well as to the struct.
-
----
-
-## Scalar Descriptors
-
-Singleton constants. Import and use directly.
-
-```typescript
-import { Bool, I32, U32, F16, F32, F64 } from "metis-data";
-```
-
-| Constant | TypedArray | byteSize | alignment |
-|----------|-----------|---------|-----------|
-| `Bool` | `Uint32Array` | 4 | 4 |
-| `I32` | `Int32Array` | 4 | 4 |
-| `U32` | `Uint32Array` | 4 | 4 |
-| `F16` | `Float16Array` | 2 | 2 |
-| `F32` | `Float32Array` | 4 | 4 |
-| `F64` | `Float64Array` | 8 | 8 |
-
----
-
-## Vector Descriptors
-
-```typescript
-function Vec<S extends ScalarDescriptor, N extends 2 | 3 | 4>(
-    scalar: S,
-    n: N,
-    packing?: PackingType,
-): VecDescriptor<S, N>
-```
-
-```typescript
-const pos  = Vec(F32, 3);               // Dense Vec3<f32>
-const upos = Vec(F32, 3, PackingType.Std140); // Std140 Vec3<f32>
-```
-
-`VecDescriptor` properties: `type` (`"vec2" | "vec3" | "vec4"`), `scalar`, `length`, `byteSize`, `alignment`, `arrayPitch`.
-
----
-
-## Matrix Descriptors
-
-```typescript
-function Mat<S extends ScalarDescriptor, N extends 2 | 3 | 4>(
-    scalar: S,
-    n: N,
-    packing?: PackingType,
-): MatDescriptor<S, N>
-```
-
-Stored **column-major**. `MatDescriptor` adds `column` (a `VecDescriptor`) and `columnStride`.
-
-```typescript
-const mvp = Mat(F32, 4, PackingType.Std140);
-// columnStride = 16, byteSize = 64, alignment = 16
-```
-
-Access a column's typed view:
-```typescript
-desc.col(buffer, offset, colIndex);  // → Float32Array of that column
-```
-
----
-
-## Array Descriptors
-
-```typescript
-function ArrayOf<Item extends Descriptor<any>, N extends number>(
-    item: Item,
-    length: N,
-    packing?: PackingType,
-): ArrayDescriptor<Item, N>
-```
-
-```typescript
-const joints = ArrayOf(Mat(F32, 4, PackingType.Std140), 64);
-// byteSize = 64 * 64 = 4096
-```
-
-`ArrayDescriptor` adds `offsetAt(index): number` and `at(buffer, offset, index)`.
-
----
-
-## Struct Descriptors
-
-```typescript
-function StructOf<Members extends Record<string, Descriptor<any>>>(
-    members: Members,
-    packing?: PackingType,
-): StructDescriptor<Members>
-```
-
-Members are laid out in definition order. Each member is aligned to its own alignment; the struct's total size is rounded up to the maximum member alignment.
-
-```typescript
-const VertexDesc = StructOf({
-    position: Vec(F32, 3),
-    uv:       Vec(F32, 2),
-    normal:   Vec(F32, 3),
-});
-// Dense: pos@0(12), uv@12(8), normal@20(12) → byteSize=32
-
-const Std140Desc = StructOf({
-    mvp:   Mat(F32, 4, PackingType.Std140),
-    color: Vec(F32, 4, PackingType.Std140),
-}, PackingType.Std140);
-// mvp@0(64), color@64(16) → byteSize=80, alignment=16
-```
-
-`StructDescriptor` adds `offsetOf(name): number` and `member(buffer, offset, name)`.
-
----
-
-## Memory Buffers
-
-A memory buffer wraps a region of an `ArrayBuffer` and provides typed `.get()` / `.set()` / `.at()` access. The generic parameter tracks which descriptor the buffer was created from.
-
-### Creating Buffers
-
-```typescript
-// Allocate a new ArrayBuffer sized to the descriptor
-const buf = allocate(VertexDesc);
-
-// Wrap an existing ArrayBuffer at a byte offset
-const buf = wrap(VertexDesc, existingBuffer, byteOffset);
-```
-
-### Buffer Types and Their API
-
-**ScalarMemoryBuffer**
-```typescript
-buf.get(): number
-buf.set(value: number): void
-buf.view(): Float32Array    // (or Int32Array, Uint32Array, etc.)
-buf.buffer: ArrayBuffer
-buf.offset: number
-```
-
-**BoolMemoryBuffer**
-```typescript
-buf.get(): boolean          // true if stored uint32 !== 0
-buf.set(value: boolean): void
-```
-
-**VecMemoryBuffer\<S, N\>**
-```typescript
-buf.get(): TupleOf<N, number>           // e.g. [x, y, z] for Vec3
-buf.set([x, y, z]: TupleOf<N, number>): void
-buf.at(index): ScalarMemoryBuffer<S>    // access individual component
-```
-
-**MatMemoryBuffer\<S, N\>**
-```typescript
-buf.at(colIndex): VecMemoryBuffer<S, N>    // access one column
-buf.get(colIndex): TupleOf<N, number>
-buf.set(colIndex, value: TupleOf<N, number>): void
-```
-
-**ArrayMemoryBuffer\<Item, N\>**
-```typescript
-buf.at(index): DescriptorToMemoryBuffer<Item>
-buf[Symbol.iterator]()                     // for...of support
-```
-
-**StructMemoryBuffer\<Members\>**
-```typescript
-buf.get("position"): VecMemoryBuffer<...>   // returns sub-buffer for that field
-buf.set({ position: [0,1,2], uv: [0,0], normal: [0,1,0] })
-buf.members: Members
-```
-
-### Conditional Types
-
-The type of the buffer returned by `allocate` / `wrap` is inferred automatically via `DescriptorToMemoryBuffer<T>`. You almost never need to name these types explicitly.
-
-```typescript
-// TypeScript infers the return type correctly:
-const v = allocate(Vec(F32, 3));   // VecMemoryBuffer<F32Descriptor, 3>
-v.get();                           // → [number, number, number]
-```
-
----
-
-## Math Module
-
-All math objects are namespace singletons (plain objects with methods). Every mutating operation takes an `out` parameter first and returns it — no hidden allocations.
-
-```typescript
-import { Vec2, Vec3, Vec4, Mat2, Mat3, Mat4, Quat } from "metis-data";
-```
-
-The scalar descriptor parameter (`scalar?`) defaults to `F32` when omitted.
-
-### Vec2 / Vec3 / Vec4
-
-All three share the same core operations. `Vec3` and `Vec4` add dimension-appropriate extras.
-
-```typescript
-Vec3.create(F32, 1, 2, 3)                             // allocate + fill
-Vec3.set(out, x, y, z)
-Vec3.copy(out, src)
-Vec3.add(out, a, b)
-Vec3.subtract(out, a, b)
-Vec3.multiply(out, a, b)        // component-wise
-Vec3.divide(out, a, b)          // component-wise
-Vec3.scale(out, v, scalar)
-Vec3.dot(a, b): number
-Vec3.cross(out, a, b)           // Vec2.cross returns scalar (z-component)
-Vec3.length(v): number
-Vec3.lengthSquared(v): number
-Vec3.distance(a, b): number
-Vec3.distanceSquared(a, b): number
-Vec3.normalize(out, v)
-Vec3.negate(out, v)
-Vec3.lerp(out, a, b, t)
-Vec3.equals(a, b): boolean
-Vec3.transformQuat(out, v, q)   // Vec3 only
-```
-
-### Quat
-
-Operates on `VecMemoryBuffer<S, 4>` with XYZW component layout.
-
-```typescript
-Quat.identity(F32)                         // [0, 0, 0, 1]
-Quat.fromAxisAngle(out, axis, angle)       // angle in radians
-Quat.fromEuler(out, x, y, z)              // XYZ order (qX·qY·qZ; matches engine Transform)
-Quat.multiply(out, a, b)
-Quat.rotateX/Y/Z(out, q, angle)
-Quat.normalize(out, q)
-Quat.conjugate(out, q)                     // [−x, −y, −z, w]
-Quat.invert(out, q)
-Quat.slerp(out, a, b, t)
-Quat.lerp(out, a, b, t)
-Quat.fromRotationTo(out, fromVec3, toVec3)
-Quat.dot(a, b): number
-Quat.getAngle(q): number
-```
-
-### Mat3 (2D transforms)
-
-```typescript
-Mat3.translation(F32, x, y)
-Mat3.rotation(F32, angle)          // radians
-Mat3.scaling(F32, x, y)
-Mat3.fromTRS(F32, tx, ty, angle, sx, sy)
-Mat3.translate(out, m, x, y)
-Mat3.rotate(out, m, angle)
-Mat3.scaleMatrix(out, m, x, y)
-Mat3.decompose(m)                  // → [tx, ty, angle, sx, sy]
-Mat3.getTranslation(m)             // → [x, y]
-Mat3.getRotation(m)                // → angle
-Mat3.getScale(m)                   // → [x, y]
-Mat3.multiply(out, a, b)
-Mat3.invert(out, m)
-Mat3.transpose(out, m)
-```
-
-### Mat4 (3D transforms)
-
-```typescript
-Mat4.translation(F32, x, y, z)
-Mat4.fromAxisAngle(F32, axis, angle)
-Mat4.fromEuler(F32, x, y, z)
-Mat4.scaling(F32, x, y, z)
-Mat4.lookAt(F32, eye, center, up)                     // right-handed, camera looks down -z
-Mat4.perspective(F32, fovy, aspect, near, far)        // WebGPU z∈[0,1]; far may be Infinity
-Mat4.perspectiveReverseZ(F32, fovy, aspect, near, far?) // near→1, far/∞→0; far defaults to Infinity
-Mat4.orthographic(F32, left, right, bottom, top, near, far) // WebGPU z∈[0,1]
-Mat4.fromTRS(F32, tx, ty, tz, quat, sx, sy, sz)
-Mat4.rotate(out, m, quat)
-Mat4.decompose(m, outTranslation, outRotation, outScale)
-Mat4.toQuat(out, m)                // extract rotation quaternion
-Mat4.getLinearTransform(out3x3, m4x4)  // extract upper-left 3×3
-```
-
----
-
-## Code Style
-
-**Naming**
-- Descriptor factories: `PascalCase` — `Vec`, `Mat`, `ArrayOf`, `StructOf`
-- Scalar singleton descriptors: `PascalCase` — `F32`, `U32`, `Bool`, etc.
-- Memory buffer functions: `camelCase` — `allocate`, `wrap`
-- Math namespace objects: `PascalCase` — `Vec2`, `Mat4`, `Quat`
-- Math methods: `camelCase` — `fromAxisAngle`, `lengthSquared`
-
-**Out-first convention**
-Every math function that produces a value writes into an `out` parameter and returns it. This is consistent — even `create` takes `(scalar?, ...values)` and allocates internally.
-
-**Default scalar**
-All math `create` / factory functions accept an optional scalar descriptor as the first argument. When omitted, `F32` is used. Pass `F64` if you need double precision.
-
-**Generics**
-- Scalar type is `S extends ScalarDescriptor` — keeps the TypedArray type correct through the chain.
-- Dimension is `N extends 2 | 3 | 4` — a literal number, not just `number`.
-- Array length is `N extends number` — unconstrained so any count works.
-- The `DescriptorToMemoryBuffer<T>` conditional type maps any descriptor to its buffer type automatically.
-
-**No mutation of descriptors**
-Descriptor objects are immutable after creation (`readonly` fields throughout). Compose new descriptors; never mutate existing ones.
+The tests live next to what they cover: `src/descriptors/test/`,
+`src/memory/test/`, `src/math/test/`. `layout.test.ts` and `std430.test.ts` are
+the load-bearing ones — they pin exact byte layouts against the std140/std430
+rules a shader agrees with.
+
+## Architecture
+
+### Two layers: immutable descriptors, disposable buffers
+
+The split is deliberate and load-bearing. A **descriptor** is pure, immutable
+layout math (`readonly` throughout) — it knows a type's size/alignment/stride and
+nothing about any particular buffer. A **memory buffer** is a throwaway view: a
+`{ descriptor, ArrayBuffer, offset }` triple with typed `get`/`set`. You build a
+descriptor once (e.g. a `Vertex` struct or a `Transform` component) and reuse it
+for every instance; buffers are minted cheaply against whatever bytes you point
+them at.
+
+`allocate(desc)` mints a fresh `ArrayBuffer` sized to `desc.byteSize` and wraps
+it; `wrap(desc, buffer, offset)` views an existing buffer — which is how the ECS
+sub-allocates thousands of component views out of one archetype buffer, and how
+nested access works (`struct.get("pos")`, `array.at(i)`, `mat.at(col)` all call
+`wrap` internally). Descriptors are never mutated — compose new ones, never
+reach in.
+
+### `byteSize` is the *unpadded* extent — size vs. stride, and the vec3 bug
+
+The single most important layout invariant: a descriptor's `byteSize` is its
+**unpadded** size, not its stride. A std140 `Vec3<F32>` is **12** bytes, even
+though its *alignment* is 16. This is exactly what std140/std430 (and WGSL)
+require: a smaller-aligned field that follows a vec3 packs into the 4-byte gap,
+so `{ vec3, f32 }` is 16 bytes with the scalar at offset 12 — not 32. Only
+*placement* (`alignment`) and *array element stride* (`arrayPitch`) are ever
+padded; the size itself is not.
+
+This wasn't always right. The descriptors originally shipped **untested**, and a
+regression had `Vec3<F32>.byteSize` padded up to 16. That silently pushed any
+trailing scalar to offset 16 and corrupted every following field of every uniform
+block that used the pattern — the kind of bug that produces "the shader reads
+garbage after the third field" with no error anywhere. `layout.test.ts` exists
+because of it and pins the vec3 case (and its `{ vec3, f32 }` gap-packing
+consequence) as ground truth. Don't "simplify" `byteSize` toward `alignment`.
+
+### Packing is frozen, and not inherited — hence the struct guard
+
+Each descriptor's `PackingType` is fixed at construction. It is **not** inherited
+by composition: putting a `Dense` `Vec3` inside a `Std140` struct does *not*
+re-pack the vec — it stays Dense (alignment 4), under-aligns inside the struct,
+and silently disagrees with the shader's std140 offsets. Because that failure is
+invisible, `StructDescriptorImpl` **validates** it: a `Std140` or `Std430` struct
+throws if any composite member was built with a different packing, naming the
+member and the mismatch. Scalars carry no packing and are layout-invariant, so
+they never trip it. The takeaway for callers (and the doc): pass the *same*
+`PackingType` to every member as well as to the struct.
+
+### std140 vs std430 — one rule apart
+
+Both are the same base rules; std430 (storage buffers) simply drops std140's
+(uniform blocks') habit of rounding arrays, matrix columns, and struct alignment
+up to a 16-byte (vec4) boundary. Concretely, only these differ: `array<f32>`
+strides by 4 in std430 vs 16 in std140; `Mat2` columns pack at 8 vs 16 (matrix
+16 bytes vs 32); a `{ f32, f32 }` struct is 8 bytes/align 4 vs 16/align 16. Types
+that already align to 16 (`vec3`, `vec4`, `mat3`, `mat4`) are identical in both.
+`std430.test.ts` asserts each difference with an explicit std140-contrast line so
+the distinction can't silently rot. `Dense` is the third mode — scalar alignment,
+no padding at all — for vertex/index/particle buffers.
+
+### The array `view()` undershoot — a fixed footgun
+
+`ArrayDescriptor.view()` returns a *flat* typed array over the whole allocation.
+It once sized that view by the element's **unpadded** component count
+(`element.length × count`), which is wrong for any std140 array whose element
+carries internal padding: a 10-element `array<vec3<f32>>` is 160 bytes (16-byte
+stride), but the view covered only 120 (30 floats) and its indices skipped the
+stride — so `view()[3]` read component 0 of the *wrong* element. It wasn't
+memory-unsafe (it undershot), which is exactly why it could sit unnoticed. The
+fix sizes the view by `byteSize / scalarByteSize`, spanning the full padded
+region for both dense and std140; `array.test.ts` now asserts the flat view
+aliases the same bytes `at()`/`offsetAt()` address. Prefer `at()`/`offsetAt()`
+for element access regardless; `view()` is for bulk upload of the raw region.
+
+### Performance intent — and where the wrappers cost you
+
+The storage story is ideal: a `metis-data` buffer *is* a plain `ArrayBuffer`, and
+the descriptor adds **zero** per-element storage overhead — an `ArrayOf(Struct,
+N)` is byte-for-byte the same as a hand-packed `Float32Array`. So reading/writing
+through a long-lived `.view()` and hand-indexing hits the same floor as a raw
+typed array.
+
+The cost is in **ergonomic access**. `array.at(i)`, `struct.get(name)`, and
+`mat.at(col)` each construct a *new* memory-buffer wrapper object (via `wrap`)
+per call, and `vec.get()` allocates a fresh tuple. In a per-frame loop over tens
+of thousands of entities that is real allocation churn and GC pressure. This is
+the known hot-path tension and the reason the benchmark exists: it measures the
+wrapper path against a raw `.view()` path, a hand-indexed `Float32Array`, and an
+array of plain JS objects, for both throughput and memory, so an optimization
+(e.g. cursor/flyweight buffers that rebind an offset instead of allocating) can
+be judged against real numbers rather than a guess. Run it with `bun run bench`
+(`bench/buffers.ts`); it takes `--count`, `--iters`, and `--json`.
+
+The math layer is already built around this concern: every producing op is
+**out-first** (`Vec3.add(out, a, b)` writes into `out` and returns it), so a
+steady-state simulation loop can pre-allocate its scratch buffers and allocate
+nothing per frame.
+
+### Known limitations (not yet done)
+
+- **No runtime-sized (unbounded) arrays.** `ArrayOf` needs a fixed length; the
+  trailing runtime-sized array of a WGSL storage buffer isn't modelled.
+- **No explicit `@align`/`@size` overrides.** Layout is derived purely from type
+  + packing; you can't force a member's offset or stride the way a WGSL attribute
+  can.
+- **The ergonomic-access allocation churn above is unoptimized** — measured, not
+  yet addressed. Treat `.at()`/`.get(name)` in a tight per-entity loop as a known
+  cost until the benchmark says otherwise.
+- **`src/std140_demo.ts` and `src/test.ts` are scratch scripts**, not part of the
+  test suite or the public surface.

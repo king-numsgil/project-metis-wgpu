@@ -58,7 +58,7 @@ export class VecDescriptorImpl<
             return;
         }
 
-        // std140-like packing:
+        // std140 and std430 share the same base-alignment rules for a vector:
         // - vec2 base alignment = 2N (but at least 8)
         // - vec3/vec4 base alignment = 4N (but at least 16)
         if (n === 2) {
@@ -67,15 +67,21 @@ export class VecDescriptorImpl<
             this._alignment = Math.max(16, 4 * scalarSize);
         }
 
-        // byteSize is the UNPADDED extent (vec3<f32> = 12). std140 (and WGSL) let a
-        // smaller-aligned member — e.g. a trailing scalar — pack into the gap after a
-        // vec3, so { vec3, f32 } is 16 bytes with the scalar at offset 12. Padding the
-        // size up to `alignment` here would push that scalar to offset 16 and silently
-        // corrupt every following field. Only *placement* (alignment) and *array stride*
-        // (arrayPitch) are padded — never the size itself.
+        // byteSize is the UNPADDED extent (vec3<f32> = 12). std140/std430 (and WGSL)
+        // let a smaller-aligned member — e.g. a trailing scalar — pack into the gap
+        // after a vec3, so { vec3, f32 } is 16 bytes with the scalar at offset 12.
+        // Padding the size up to `alignment` here would push that scalar to offset 16
+        // and silently corrupt every following field. Only *placement* (alignment) and
+        // *array stride* (arrayPitch) are padded — never the size itself.
         this._byteSize = rawByteSize;
-        // Arrays round their element stride up to 16 bytes.
-        this._arrayPitch = alignTo(rawByteSize, 16);
+
+        // The one std140-vs-std430 difference for vectors is the array stride:
+        // std140 rounds every array element up to a 16-byte (vec4) boundary; std430
+        // rounds only up to the element's own alignment. So array<vec2<f32>> strides
+        // by 16 in std140 but by 8 in std430; vec3/vec4 already align to 16 in both.
+        this._arrayPitch = packingType === PackingType.Std140
+            ? alignTo(rawByteSize, 16)
+            : alignTo(rawByteSize, this._alignment);
     }
 
     public get type(): VectorTypeSelector<N> {

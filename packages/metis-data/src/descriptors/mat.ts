@@ -60,13 +60,24 @@ export class MatDescriptorImpl<
             this._columnStride = n * scalarSize;
             this._byteSize = n * this._columnStride;
             this._arrayPitch = this._byteSize;
-        } else {
-            // std140-like packing: a matrix is an array of column vectors.
-            // Arrays round their element stride up to 16 bytes.
+        } else if (packingType === PackingType.Std140) {
+            // std140: a matrix is an array of column vectors, and std140 arrays round
+            // every element up to a 16-byte (vec4) boundary — so even a mat2's vec2
+            // columns are strided to 16.
             this._alignment = alignTo(this._colDescriptor.alignment, 16);
             this._columnStride = alignTo(this._colDescriptor.byteSize, 16);
             this._byteSize = n * this._columnStride;
             this._arrayPitch = alignTo(this._byteSize, 16);
+        } else {
+            // std430: same column-vector model, but the stride rounds only up to the
+            // column's own alignment, not 16. mat2<f32> columns pack at 8 (byteSize 16
+            // vs std140's 32); mat3/mat4 are unchanged because vec3/vec4 already align
+            // to 16. The matrix size is already a multiple of its alignment, so the
+            // array stride needs no further rounding.
+            this._alignment = this._colDescriptor.alignment;
+            this._columnStride = alignTo(this._colDescriptor.byteSize, this._colDescriptor.alignment);
+            this._byteSize = n * this._columnStride;
+            this._arrayPitch = this._byteSize;
         }
     }
 

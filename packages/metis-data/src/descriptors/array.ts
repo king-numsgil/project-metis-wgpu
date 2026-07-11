@@ -62,13 +62,18 @@ export class ArrayDescriptorImpl<
         this._itemDescriptor = itemDescriptor;
         this._length = length;
         this._packing = packingType;
-        if (packingType === PackingType.Dense) {
-            this._alignment = itemDescriptor.alignment;
-            this._arrayPitch = itemDescriptor.arrayPitch;
-        } else {
-            // std140-like arrays: base alignment and stride are rounded up to a multiple of 16.
+        if (packingType === PackingType.Std140) {
+            // std140 arrays: base alignment and element stride are both rounded up to a
+            // multiple of 16 (the vec4 boundary), whatever the element type.
             this._alignment = alignTo(itemDescriptor.alignment, 16);
             this._arrayPitch = alignTo(itemDescriptor.byteSize, 16);
+        } else {
+            // Dense and std430 arrays both stride by the element's own alignment — no
+            // 16-byte rounding. The two differ only through the element descriptor's
+            // alignment (a std430 vec3 aligns to 16, a dense vec3 to 4), so the same
+            // formula yields the right stride for each.
+            this._alignment = itemDescriptor.alignment;
+            this._arrayPitch = alignTo(itemDescriptor.byteSize, itemDescriptor.alignment);
         }
         this._byteSize = length * this._arrayPitch;
     }
@@ -122,15 +127,24 @@ export class ArrayDescriptorImpl<
             return new Uint8Array(buffer, offset, this._byteSize) as DescriptorMemoryType<ItemType>;
         }
 
+        // The flat view must span the WHOLE allocation (this._byteSize), padding
+        // included. Sizing it by the element's *unpadded* extent (length * count)
+        // undershoots any std140 array whose element carries internal padding —
+        // e.g. array<vec3>, where each 12-byte vec is strided to 16: the view
+        // would cover 12/16 of the buffer and its indices would skip the stride.
+        // Dividing the true byteSize by the SCALAR size gives a full-region view
+        // for both dense and std140; for scalar items it already did.
         let itemType = this._itemDescriptor.type;
-        let elementCount = (this._byteSize / this._itemDescriptor.byteSize);
-        if (this._itemDescriptor.type === GPU_VEC2 || this._itemDescriptor.type === GPU_VEC3 || this._itemDescriptor.type === GPU_VEC4) {
-            itemType = (this._itemDescriptor as any).scalar.type;
-            elementCount = (this._itemDescriptor as any).length * this._length;
-        } else if (this._itemDescriptor.type === GPU_MAT2 || this._itemDescriptor.type === GPU_MAT3 || this._itemDescriptor.type === GPU_MAT4) {
-            itemType = (this._itemDescriptor as any).scalar.type;
-            elementCount = (this._itemDescriptor as any).length * this._length;
+        let scalarByteSize = this._itemDescriptor.byteSize;
+        if (
+            this._itemDescriptor.type === GPU_VEC2 || this._itemDescriptor.type === GPU_VEC3 || this._itemDescriptor.type === GPU_VEC4
+            || this._itemDescriptor.type === GPU_MAT2 || this._itemDescriptor.type === GPU_MAT3 || this._itemDescriptor.type === GPU_MAT4
+        ) {
+            const scalar = (this._itemDescriptor as any).scalar;
+            itemType = scalar.type;
+            scalarByteSize = scalar.byteSize;
         }
+        const elementCount = this._byteSize / scalarByteSize;
 
         const TypedArrayConstructor = TYPED_ARRAY_CONSTRUCTORS[itemType]!;
         return new TypedArrayConstructor(buffer, offset, elementCount) as DescriptorMemoryType<ItemType>;
