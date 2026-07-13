@@ -56,7 +56,7 @@ const window  = sdlCreateWindow("title", 1280, 720);
 const adapter = await requestAdapterForWindow(window, { powerPreference: "high-performance" });
 const device  = await adapter!.requestDevice();
 const surface = createSurface(adapter!, window);
-surface.configure(device, { width: window.width, height: window.height, presentMode: "fifo" });
+surface.configure(device, { width: window.width, height: window.height }); // presentMode defaults to "mailbox"
 ```
 
 `requestAdapter()` can return an adapter incompatible with the window's surface,
@@ -96,16 +96,26 @@ frame.present();                                // AFTER submit
 ```
 
 `SurfaceConfiguration`: `{ width, height, format?, presentMode?, alphaMode? }`.
-`presentMode`: `"fifo"` (vsync, default) | `"mailbox"` | `"immediate"` |
-`"auto-vsync"` | `"auto-no-vsync"`.
+`presentMode`: `"fifo"` | `"mailbox"` | `"immediate"` | `"auto-vsync"` |
+`"auto-no-vsync"`. **Omitting it defaults to `"mailbox"`** (falling back to
+`"fifo"` only if the surface lacks mailbox support). `mailbox` is tear-free and
+low-latency but does *not* cap the frame rate — pair it with a software frame
+limiter (see `metis-engine`'s `FrameLimiter`) if you want a cap.
 
 ### Timing / vsync
 
+**`"fifo"`/`"auto-vsync"` can stall.** On some Vulkan drivers, when the app
+renders far faster than refresh, `getCurrentTexture()` blocks for a periodic
+multi-vblank burst (~50 ms) instead of pacing smoothly — a visible stutter. This
+is why the default moved to `"mailbox"`, which does not exhibit it. Prefer
+`mailbox` + a frame limiter over native fifo for capped, tear-free rendering.
+
 **The vsync wait lands in `getCurrentTexture()`, not `present()`** (D3D and
-Vulkan). Any timer that spans `getCurrentTexture()` measures the refresh
-interval, not your work. Use `presentMode: "immediate"` to measure real CPU/GPU
-cost. Even then, `getCurrentTexture()` can block on swapchain-image acquire
-(compositor back-pressure) — time it separately from your encode.
+Vulkan). Any timer that spans `getCurrentTexture()` under `fifo` measures the
+refresh interval, not your work. Use `presentMode: "immediate"` to measure real
+CPU/GPU cost. Even under `immediate`/`mailbox`, `getCurrentTexture()` can block
+on swapchain-image acquire (compositor back-pressure) — time it separately from
+your encode.
 
 ```ts
 const t0 = performance.now();

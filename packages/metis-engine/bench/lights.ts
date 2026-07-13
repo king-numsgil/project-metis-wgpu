@@ -9,15 +9,16 @@
 //   bun run bench/lights.ts --lights 200       # stress the per-cluster cap
 //   bun run bench/lights.ts --duration 10      # run longer
 //   bun run bench/lights.ts --width 1920 --height 1080
-//   bun run bench/lights.ts --vsync            # cap at refresh ("what it looks like live")
+//   bun run bench/lights.ts --fps 60           # cap at 60 fps ("what it looks like live")
 //
-// Presents WITHOUT vsync by default (presentMode "immediate"), because the vsync
-// wait lands in getCurrentTexture()/work-done and pins every timer to the refresh
-// interval. Each frame is split into three measurements so nothing is misleading:
-// the swapchain acquire wait (present/compositor back-pressure, not engine cost),
-// the CPU encode, and the GPU execution (submit -> onSubmittedWorkDone). "GPU
-// frame time" is the real perf metric. Under --vsync the GPU number is unreliable
-// for that same reason, and the summary says so.
+// Uses the engine's default present mode (mailbox), so the loop runs uncapped and
+// the per-frame timers reflect real work rather than the refresh interval. Each
+// frame is split into three measurements so nothing is misleading: the swapchain
+// acquire wait (present/compositor back-pressure, not engine cost), the CPU
+// encode, and the GPU execution (submit -> onSubmittedWorkDone). "GPU frame time"
+// is the real perf metric. Pass --fps N (or --vsync for 60) to cap the frame rate
+// via the engine FrameLimiter; the cap is applied AFTER the GPU measurement each
+// frame, so it only moves the achieved-frame-rate line, never the GPU number.
 import { SdlEventType, SdlKeycode, sdlPollEvents } from "bun-webgpu-rs";
 import {
     CLUSTER_COUNT_X,
@@ -26,6 +27,7 @@ import {
     ClusteredForwardRenderer,
     createDefaultPostProcessPipeline,
     createExteriorEnvironment,
+    FrameLimiter,
     type FrameTarget,
     Material,
     MAX_LIGHTS_PER_CLUSTER,
@@ -39,7 +41,6 @@ import {
     Scene,
     VectorText,
 } from "metis-engine/renderer";
-import { scheduler } from "node:timers/promises";
 import { vec3 } from "wgpu-matrix";
 
 const FONT_PATH = new URL("../../../assets/JetBrainsMono-Regular.ttf", import.meta.url).pathname.replace(
@@ -76,10 +77,11 @@ const HEIGHT = num("height", 720);
 const LIGHT_COUNT = Math.min(num("lights", 100), MAX_POINT_LIGHTS);
 const DURATION_S = num("duration", 5);
 const WARMUP_S = num("warmup", 0.75); // let auto-exposure settle before collecting stats
-// Default to no vsync so the frame-time numbers are real. With vsync the present
-// wait lands in getCurrentTexture()/work-done and pins every measurement to the
-// refresh interval (~16.6ms), telling you nothing about actual GPU cost.
-const VSYNC = flag("vsync");
+// Frame-rate cap (0 = uncapped, the default, so timings reflect real work).
+// --fps N sets it; --vsync is back-compat for 60. The FrameLimiter applies the
+// cap AFTER the GPU measurement each frame, so — unlike native fifo, which parks
+// the wait inside getCurrentTexture() — it never pollutes the GPU/encode numbers.
+const CAP_FPS = num("fps", flag("vsync") ? 60 : 0);
 
 // The plane the lights hover over, and the volume the lights animate within.
 const PLANE_SIZE = 60;
@@ -172,9 +174,10 @@ const ctx = await RenderContext.createWindowed(`metis-engine — light bench (${
     width: WIDTH,
     height: HEIGHT,
     powerPreference: "high-performance",
-    presentMode: VSYNC ? "fifo" : "immediate",
+    // Default present mode (mailbox); pacing is handled by the FrameLimiter below.
     label: "metis-engine-bench-lights",
 });
+const limiter = new FrameLimiter(CAP_FPS);
 const forward = new ClusteredForwardRenderer(ctx.device);
 const post = createDefaultPostProcessPipeline(ctx.device);
 const hud = new VectorText(ctx.device, ctx.outputFormat);
@@ -249,7 +252,7 @@ if (validationError) {
 console.log("═".repeat(72));
 console.log("  metis-engine — clustered-forward light benchmark (windowed)");
 console.log("═".repeat(72));
-console.log(`    Resolution ............ ${ctx.width} x ${ctx.height}  (4x MSAA, ${VSYNC ? "vsync present" : "no vsync / immediate"})`);
+console.log(`    Resolution ............ ${ctx.width} x ${ctx.height}  (4x MSAA, mailbox, ${CAP_FPS ? `${CAP_FPS} fps cap` : "uncapped"})`);
 console.log(`    Point lights .......... ${LIGHT_COUNT}`);
 console.log(`    Cluster grid .......... ${CLUSTER_COUNT_X} x ${CLUSTER_COUNT_Y} x ${CLUSTER_COUNT_Z} = ${NUM_CLUSTERS} clusters`);
 console.log(`    Max lights / cluster .. ${MAX_LIGHTS_PER_CLUSTER}   (capacity cap)`);
@@ -319,7 +322,7 @@ while (running) {
         lastHudUpdate = now;
     }
 
-    await scheduler.yield();
+    await limiter.wait();
 }
 
 // ── Summary ────────────────────────────────────────────────────────────────────
@@ -334,13 +337,9 @@ if (gpuSamples.length === 0) {
     const acquire = summarize(acquireSamples);
 
     console.log(`  Measured ${gpuSamples.length} frames over ${(collectedElapsed / 1000).toFixed(2)}s`);
-    console.log(`\n  ${VSYNC ? "On-screen frame rate  (vsync-limited — what you saw)" : "Achieved frame rate  (no vsync — full real-time frame incl. present)"}`);
+    console.log(`\n  ${CAP_FPS ? `Achieved frame rate  (capped at ${CAP_FPS} fps — what you saw)` : "Achieved frame rate  (uncapped — full real-time frame incl. present)"}`);
     console.log(`    ${observedFps.toFixed(1)} fps   (${ms(1000 / observedFps)}/frame avg interval)`);
     console.log(`\n  GPU frame time  (submit -> work-done, the GPU execution cost — the real perf metric)`);
-    if (VSYNC) {
-        console.log(`    (unreliable under --vsync: present back-pressure bleeds into the work-done`);
-        console.log(`     wait — re-run without --vsync for the true GPU cost)`);
-    }
     console.log(`    mean ....... ${ms(gpu.mean)}   ->  headroom for ${(1000 / gpu.mean).toFixed(0)} fps`);
     console.log(`    median ..... ${ms(gpu.median)}`);
     console.log(`    min / max .. ${ms(gpu.min)}  /  ${ms(gpu.max)}`);
@@ -350,7 +349,7 @@ if (gpuSamples.length === 0) {
     console.log(`    mean ....... ${ms(encode.mean)}   (p95 ${ms(encode.p95)})`);
     console.log(`\n  Swapchain acquire wait  (beginFrame back-pressure — present/compositor, not engine)`);
     console.log(`    mean ....... ${ms(acquire.mean)}   (p95 ${ms(acquire.p95)})`);
-    if (!VSYNC && acquire.mean > gpu.mean) {
+    if (!CAP_FPS && acquire.mean > gpu.mean) {
         console.log(`    -> the frame rate above is gated by present back-pressure, not GPU work;`);
         console.log(`       GPU headroom is ~${(1000 / gpu.mean).toFixed(0)} fps.`);
     }

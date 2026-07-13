@@ -120,6 +120,8 @@ export type GPUQueryType = 'occlusion' | 'timestamp'
 
 export type GPUErrorFilter = 'validation' | 'out-of-memory' | 'internal'
 
+export type GPUDeviceLostReason = 'unknown' | 'destroyed'
+
 export type GPUPresentMode = 'fifo' | 'mailbox' | 'immediate' | 'auto-no-vsync' | 'auto-vsync'
 
 export type GPUAlphaMode = 'premultiplied' | 'postmultiplied' | 'inherit'

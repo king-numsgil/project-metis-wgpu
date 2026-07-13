@@ -1,6 +1,7 @@
 export { RenderContext } from "./rhi/context.ts";
 export type { Backend, FrameTarget, PowerPreference, RenderContextOptions } from "./rhi/context.ts";
 export { DEPTH_FORMAT, HDR_COLOR_FORMAT, RenderTargets } from "./rhi/targets.ts";
+export { FrameLimiter } from "./frameLimiter.ts";
 
 export { Camera } from "./math/camera.ts";
 export { createTransform, normalMatrixFromModel, transformToMat4 } from "./math/transform.ts";

@@ -14,7 +14,7 @@
 //
 // WASD + QE to fly, arrows to look (hold Up to find the Moon), Esc / close to quit.
 import {
-    createSurface,
+    createSurface, type GPUPresentMode,
     requestAdapterForWindow,
     sdlCreateWindow,
     SdlEventType,
@@ -35,6 +35,7 @@ import {
     createDefaultPostProcessPipeline,
     createExteriorEnvironment,
     cube,
+    FrameLimiter,
     Material,
     Mesh,
     mulberry32,
@@ -44,8 +45,8 @@ import {
     uvSphere,
     VectorText,
 } from "metis-engine/renderer";
-import { scheduler } from "node:timers/promises";
 import { vec3 } from "wgpu-matrix";
+import { FrameProfiler } from "./frameProfiler";
 
 const LIGHT_COUNT = 100;
 const FIELD_HALF = 24; // lights scatter over [-24, 24] in x/z
@@ -98,7 +99,13 @@ if (!adapter) {
 const device = await adapter.requestDevice({label: "metis-device"});
 const surface = createSurface(adapter, wnd);
 const fmt = surface.getPreferredFormat();
-surface.configure(device, {width: wnd.width, height: wnd.height});
+// Present mode: omitted → the binding default, `mailbox`, which avoids the
+// periodic ~50 ms getCurrentTexture() stall that `auto-vsync`/`fifo` exhibit on
+// this Vulkan setup (see frameProfiler.ts). Override with
+// METIS_PRESENT=fifo|immediate|auto-vsync to compare.
+const presentMode = process.env.METIS_PRESENT as GPUPresentMode | undefined;
+console.log(`[present] mode = ${presentMode ?? "mailbox (default)"}`);
+surface.configure(device, {width: wnd.width, height: wnd.height, presentMode});
 
 // ── Engine: everything below is derived from `device` alone ─────────────────
 let width = wnd.width;
@@ -218,7 +225,7 @@ function resize(w: number, h: number) {
     }
     width = w;
     height = h;
-    surface.configure(device, {width, height});
+    surface.configure(device, {width, height, presentMode});
     targets.resize(device, width, height);
     scene.camera.setAspectFromSize(width, height);
 }
@@ -257,8 +264,14 @@ let elapsed = 0;
 let fpsEma = 60;
 let lastTime = performance.now();
 let running = true;
+const profiler = new FrameProfiler();
+// Uncapped by default; METIS_FPS=60 (or your refresh) turns the cap on.
+const capFps = Number(process.env.METIS_FPS) || 0;
+if (capFps) console.log(`[limiter] capping to ${capFps} fps (METIS_FPS)`);
+const limiter = new FrameLimiter(capFps);
 
 while (running) {
+    profiler.begin();
     const now = performance.now();
     const dt = Math.min((now - lastTime) / 1000, 0.1);
     lastTime = now;
@@ -330,11 +343,13 @@ while (running) {
     vec3.add(scene.camera.position, forwardDir, scene.camera.target);
 
     animateLights(elapsed);
+    profiler.lap("update+encode"); // CPU: input, sim, light animation
 
-    const frame = surface.getCurrentTexture();
+    const frame = surface.getCurrentTexture(); // vsync wait lands here (Vulkan/D3D)
     if (frame.suboptimal) {
-        surface.configure(device, {width, height});
+        surface.configure(device, {width, height, presentMode});
     }
+    profiler.lap("acquire");
     const view = frame.createView();
 
     const encoder = device.createCommandEncoder();
@@ -360,8 +375,12 @@ while (running) {
     hud.render(encoder, view, width, height, [0.85, 0.95, 1.0, 1.0]);
 
     device.queue.submit([encoder.finish()]);
+    profiler.lap("update+encode"); // fold the record/submit cost into CPU work
     frame.present();
-    await scheduler.yield();
+    profiler.lap("present");
+    await limiter.wait(); // frame cap ("vsync on") + event-loop yield; no-op when uncapped
+    profiler.lap("yield");
+    profiler.end();
 }
 
 // Teardown, in dependency order (DOC.md §1.3).

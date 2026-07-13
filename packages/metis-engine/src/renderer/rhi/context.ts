@@ -28,10 +28,11 @@ export interface RenderContextOptions {
     backend?: Backend;
     label?: string;
     /**
-     * Swapchain present mode (windowed only). Defaults to `"fifo"` (vsync). Use
-     * `"immediate"` to disable vsync — required to measure raw CPU/GPU frame
-     * cost, since on D3D/Vulkan the vsync wait otherwise lands in
-     * `getCurrentTexture()`/work-done and pollutes any per-frame timing.
+     * Swapchain present mode (windowed only). Omit to take the binding default,
+     * `"mailbox"` — tear-free, low-latency, and free of the periodic
+     * getCurrentTexture() stall that `"fifo"`/`"auto-vsync"` show on some Vulkan
+     * drivers. Pair it with a {@link FrameLimiter} for a frame cap. Use
+     * `"immediate"` to measure raw CPU/GPU frame cost (no present back-pressure).
      */
     presentMode?: GPUPresentMode;
 }
@@ -58,7 +59,8 @@ export class RenderContext {
 
     private readonly window: SdlWindow | null;
     private readonly surface: GpuSurface | null;
-    private readonly presentMode: GPUPresentMode;
+    // undefined = take the binding's default present mode (mailbox); see configure().
+    private readonly presentMode: GPUPresentMode | undefined;
     // takeScreenshot (bun-webgpu-rs/tests/helpers/screenshot.ts) can only read
     // back tight rgba8unorm, so the offscreen path is pinned to that format.
     private readonly offscreenFormat: GPUTextureFormat = "rgba8unorm";
@@ -72,7 +74,7 @@ export class RenderContext {
         height: number,
         window: SdlWindow | null,
         surface: GpuSurface | null,
-        presentMode: GPUPresentMode = "fifo",
+        presentMode?: GPUPresentMode,
     ) {
         this.device = device;
         this.adapter = adapter;
@@ -135,7 +137,8 @@ export class RenderContext {
         }
         const device = await adapter.requestDevice({label: options.label ?? "metis-engine-windowed"});
         const surface = createSurface(adapter, window);
-        const presentMode = options.presentMode ?? "fifo";
+        // Omitting presentMode lets the binding pick its default (mailbox).
+        const presentMode = options.presentMode;
         surface.configure(device, {width: window.width, height: window.height, presentMode});
         return new RenderContext(device, adapter, window.width, window.height, window, surface, presentMode);
     }

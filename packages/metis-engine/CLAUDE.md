@@ -122,6 +122,8 @@ src/renderer/   — the entire renderer; import via "metis-engine/renderer"
                                  in Rust, supports PNG/JPG/WebP/…; replaced the former from-scratch
                                  PNG decoder) + getMaterialDefaults() (the shared 1x1 neutral
                                  placeholders every unset material texture slot falls back to)
+  frameLimiter.ts — software frame-rate cap ("vsync on" knob); await once per frame after
+                  present(). Separate from present mode by design (see "Present mode" below)
   index.ts      — renderer barrel (re-exports RenderContext, Scene, ClusteredForwardRenderer, …);
                   reached from outside as "metis-engine/renderer"
 examples/       exterior-demo.ts, interior-demo.ts — windowed, interactive, SDL-loop-driven
@@ -202,6 +204,26 @@ scene, output, dt)` call was proposed and **deliberately declined** — the expl
 wiring keeps the data flow (and the resolved-vs-multisampled view choice) visible
 at the call site. Don't add one without a fresh reason; do keep `RenderContext`
 strictly optional, and don't let engine types acquire a window/surface dependency.
+
+### Present mode is `mailbox`, and pacing is a separate `FrameLimiter`
+
+The default present mode is **`mailbox`** (the `bun-webgpu-rs` binding default;
+`RenderContext` passes no `presentMode` unless you set one). This came out of a
+stutter hunt: native `fifo`/`auto-vsync` periodically stall `getCurrentTexture()`
+for a ~50 ms multi-vblank burst on this machine's Vulkan driver when the loop
+outruns refresh — a metronomic hitch. `mailbox` is tear-free and free of that
+stall, but it does **not** cap the frame rate, so an idle loop renders flat-out.
+
+Frame-rate capping is therefore a *separate* concern, handled by **`FrameLimiter`**
+(`src/renderer/frameLimiter.ts`, exported from `metis-engine/renderer`), not by the
+present mode. Construct it with a target fps (`0` = uncapped) and `await
+limiter.wait()` once per frame after `present()`; it sleeps for all but the last
+~2 ms and busy-spins the tail for jitter-free pacing, and yields to the event loop
+even when uncapped. This is the load-bearing split: **tearing is the present
+mode's job (`mailbox`), the frame cap is the limiter's job.** Don't try to get a
+cap back by switching to `fifo` — that reintroduces the stall. The demos and
+`bench/lights.ts` all wire an (uncapped) `FrameLimiter`; the bench calls `wait()`
+*after* its GPU-timing readback so a cap never pollutes the measurement.
 
 ### Reverse-Z with an infinite far plane — and why the near plane is now free
 

@@ -8,6 +8,7 @@ import {
     createDefaultPostProcessPipeline,
     createInteriorEnvironment,
     cube,
+    FrameLimiter,
     Material,
     Mesh,
     plane,
@@ -16,7 +17,6 @@ import {
     Scene,
     VectorText,
 } from "metis-engine/renderer";
-import { scheduler } from "node:timers/promises";
 import { vec3 } from "wgpu-matrix";
 import { loadMetalPlateTextures, makeEmissivePanelTexture } from "./demoAssets";
 
@@ -25,7 +25,10 @@ const FONT_PATH = new URL("../../../assets/JetBrainsMono-Regular.ttf", import.me
     "$1",
 );
 
+// Default present mode (mailbox). Uncapped frame limiter — construct with a
+// target fps (e.g. new FrameLimiter(60)) to cap for lower power.
 const ctx = await RenderContext.createWindowed("metis-engine — interior demo", {width: 1280, height: 720});
+const limiter = new FrameLimiter();
 const forward = new ClusteredForwardRenderer(ctx.device);
 // Ambient occlusion quality dial — press O to cycle None / SSAO / HBAO.
 const AO_CYCLE = [AoTechnique.None, AoTechnique.SSAO, AoTechnique.HBAO];
@@ -176,7 +179,7 @@ while (running) {
     hud.render(encoder, frame.view, ctx.width, ctx.height, [0.85, 0.95, 1.0, 1.0]);
     ctx.device.queue.submit([encoder.finish()]);
     frame.present();
-    await scheduler.yield();
+    await limiter.wait();
 }
 
 ctx.destroy();

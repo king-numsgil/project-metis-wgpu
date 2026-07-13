@@ -164,7 +164,8 @@ impl GpuSurface {
     }
 
     /// Configure the swapchain. Must be called before the first `getCurrentTexture()` and
-    /// again whenever the window is resized.
+    /// again whenever the window is resized. When `present_mode` is omitted the
+    /// default is `Mailbox` (falling back to `Fifo` if the surface lacks it).
     #[napi]
     pub fn configure(&self, device: &GpuDevice, config: SurfaceConfiguration) -> napi::Result<()> {
         if config.width == 0 || config.height == 0 {
@@ -189,7 +190,19 @@ impl GpuSurface {
             Some("mailbox") => wgpu::PresentMode::Mailbox,
             Some("immediate") => wgpu::PresentMode::Immediate,
             Some("auto-no-vsync") => wgpu::PresentMode::AutoNoVsync,
-            _ => wgpu::PresentMode::AutoVsync,
+            Some("auto-vsync") => wgpu::PresentMode::AutoVsync,
+            // Default: prefer Mailbox — tear-free and low-latency, and it avoids
+            // the periodic multi-vblank stall in getCurrentTexture() that Fifo/
+            // AutoVsync exhibit on some Vulkan drivers when the app renders far
+            // faster than refresh. Fall back to Fifo (universally guaranteed) on
+            // surfaces that don't advertise Mailbox.
+            _ => {
+                if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
+                    wgpu::PresentMode::Mailbox
+                } else {
+                    wgpu::PresentMode::Fifo
+                }
+            }
         };
 
         let alpha_mode = match config.alpha_mode.as_deref() {

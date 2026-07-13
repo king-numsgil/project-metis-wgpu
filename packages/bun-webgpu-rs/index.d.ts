@@ -120,6 +120,8 @@ export type GPUQueryType = 'occlusion' | 'timestamp'
 
 export type GPUErrorFilter = 'validation' | 'out-of-memory' | 'internal'
 
+export type GPUDeviceLostReason = 'unknown' | 'destroyed'
+
 export type GPUPresentMode = 'fifo' | 'mailbox' | 'immediate' | 'auto-no-vsync' | 'auto-vsync'
 
 export type GPUAlphaMode = 'premultiplied' | 'postmultiplied' | 'inherit'
@@ -315,7 +317,8 @@ export declare class GpuSurface {
   getPreferredFormat(): GPUTextureFormat
   /**
    * Configure the swapchain. Must be called before the first `getCurrentTexture()` and
-   * again whenever the window is resized.
+   * again whenever the window is resized. When `present_mode` is omitted the
+   * default is `Mailbox` (falling back to `Fifo` if the surface lacks it).
    */
   configure(device: GpuDevice, config: SurfaceConfiguration): void
   /**

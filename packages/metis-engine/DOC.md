@@ -35,11 +35,13 @@ entirely — see §1.3.
 ### 1.1 Windowed (interactive)
 
 ```ts
-import { scheduler } from "node:timers/promises";
 import { SdlEventType, SdlKeycode, sdlPollEvents } from "bun-webgpu-rs";
 import { vec3 } from "wgpu-matrix";
 
+// Default present mode is "mailbox" (tear-free, no fifo stall). The FrameLimiter
+// paces the loop: new FrameLimiter(0) = uncapped, new FrameLimiter(60) = 60 fps.
 const ctx = await RenderContext.createWindowed("title", { width: 1280, height: 720 });
+const limiter = new FrameLimiter();
 const forward = new ClusteredForwardRenderer(ctx.device);
 const post = createDefaultPostProcessPipeline(ctx.device);
 
@@ -74,7 +76,7 @@ while (running) {
     });
     ctx.device.queue.submit([encoder.finish()]);
     frame.present();
-    await scheduler.yield();
+    await limiter.wait(); // frame cap (if any) + event-loop yield
 }
 ctx.destroy();
 ```
@@ -183,7 +185,7 @@ interface RenderContextOptions {
     powerPreference?: "low-power" | "high-performance";
     backend?: "vulkan" | "dx12" | "metal" | "gl";
     label?: string;
-    presentMode?: GPUPresentMode; // windowed only; default "fifo" (vsync)
+    presentMode?: GPUPresentMode; // windowed only; omit → binding default "mailbox"
 }
 
 static createWindowed(title: string, options: RenderContextOptions): Promise<RenderContext>
@@ -204,9 +206,26 @@ resize(width: number, height: number): void;
 destroy(): void;
 ```
 
-`presentMode: "immediate"` disables vsync. Required for meaningful frame timing:
-with vsync the present wait lands inside `getCurrentTexture()` and the
-work-done wait, polluting every measurement. See `bench/lights.ts`.
+Present mode defaults to `"mailbox"` (tear-free, and free of the periodic
+`getCurrentTexture()` stall that native `"fifo"`/`"auto-vsync"` show on some
+Vulkan drivers). `"immediate"` also disables vsync and is useful for raw frame
+timing, since under `"fifo"` the present wait lands inside `getCurrentTexture()`
+and the work-done wait, polluting measurements. See `bench/lights.ts`.
+
+### `FrameLimiter`
+
+Software frame-rate cap — the "vsync on" knob, since `mailbox` is tear-free but
+uncapped. Construct with a target fps (`0` = uncapped) and `await limiter.wait()`
+once per frame after `present()`; it sleeps + busy-spins the tail for jitter-free
+pacing, and yields to the event loop even when uncapped. Prefer this over native
+`fifo` for a cap. When benchmarking, call `wait()` *after* the GPU-timing
+readback so the cap never pollutes the measurement.
+
+```ts
+const limiter = new FrameLimiter(Number(process.env.METIS_FPS) || 0);
+// ... per frame, after frame.present():
+await limiter.wait();
+```
 
 ### `RenderTargets`
 
@@ -544,7 +563,8 @@ automated check and `test/ao.test.ts` covers the AO kernels + a GPU-readback
 assertion. Run them manually.
 
 `bench/lights.ts` flags: `--lights N` (≤256), `--duration S`, `--warmup S`,
-`--width`, `--height`, `--vsync`. Defaults to no-vsync so timings are real.
+`--width`, `--height`, `--fps N` (`--vsync` = `--fps 60`). Uncapped by default so
+timings are real; the cap is applied after GPU timing, so it never skews numbers.
 
 ---
 

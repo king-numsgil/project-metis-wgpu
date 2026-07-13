@@ -122,6 +122,7 @@ src/
 - Always use `requestAdapterForWindow(window)` (not `requestAdapter()`) for windowed rendering. It creates a temp `Surface<'static>` so the adapter is guaranteed surface-compatible.
 - Surface format (e.g. `bgra8unorm-srgb`) can't be read back. For screenshots, render to a separate `rgba8unorm` texture.
 - VSync throttling happens in `getCurrentTexture()` (not `present()`) on DirectX backends. Use `presentMode: 'immediate'` to measure raw CPU costs.
+- **`configure()`'s default present mode is `Mailbox`** (fifo fallback if unsupported) — set in `surface.rs`. This is deliberate: `Fifo`/`AutoVsync` were found to stall `getCurrentTexture()` for a periodic ~50 ms burst on this machine's Vulkan driver when the app renders faster than refresh (a metronomic stutter, diagnosed via a per-phase frame profiler in `metis-game`). `Mailbox` is tear-free and doesn't exhibit it, but is uncapped — pair it with `metis-engine`'s `FrameLimiter` for a frame cap. Don't "restore" a fifo default without re-checking that stall.
 
 ---
 
