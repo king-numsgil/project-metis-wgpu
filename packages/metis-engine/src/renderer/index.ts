@@ -48,4 +48,9 @@ export { LuminanceAveragePass } from "./postprocess/luminanceAverage.ts";
 export { AutoExposurePass } from "./postprocess/autoExposure.ts";
 export { TonemapPass } from "./postprocess/tonemap.ts";
 
-export { VectorText } from "./text/vectorText.ts";
+export { MAX_PALETTE_COLORS, type Rgba, VectorText } from "./text/vectorText.ts";
+
+export { GpuProfiler, gpuProfilerFeatures, gpuProfilerSupport } from "./debug/gpuProfiler.ts";
+export type { GpuProfilerSupport, ProfileSpan } from "./debug/gpuProfiler.ts";
+export { DEBUG_THEME, DebugOverlay, History, profileSpansToRows } from "./debug/widgets.ts";
+export type { GraphSeries, GraphSpec, TreeRow, TreeSpec } from "./debug/widgets.ts";

@@ -10,8 +10,11 @@
 //   bun run bench/lights.ts --duration 10      # run longer
 //   bun run bench/lights.ts --width 1920 --height 1080
 //   bun run bench/lights.ts --fps 60           # cap at 60 fps ("what it looks like live")
+//   bun run bench/lights.ts --profile            # per-pass GPU timings via timestamp queries
 //
-// Uses the engine's default present mode (mailbox), so the loop runs uncapped and
+// Uses `immediate` present mode — tearing is irrelevant to a benchmark, and it
+// removes the present back-pressure that otherwise parks inside
+// getCurrentTexture() and inflates the acquire number. The loop runs uncapped so
 // the per-frame timers reflect real work rather than the refresh interval. Each
 // frame is split into three measurements so nothing is misleading: the swapchain
 // acquire wait (present/compositor back-pressure, not engine cost), the CPU
@@ -27,8 +30,11 @@ import {
     ClusteredForwardRenderer,
     createDefaultPostProcessPipeline,
     createExteriorEnvironment,
+    DebugOverlay,
     FrameLimiter,
     type FrameTarget,
+    GpuProfiler,
+    History,
     Material,
     MAX_LIGHTS_PER_CLUSTER,
     MAX_POINT_LIGHTS,
@@ -37,9 +43,10 @@ import {
     NUM_CLUSTERS,
     plane,
     type PointLight,
+    type ProfileSpan,
+    profileSpansToRows,
     RenderContext,
     Scene,
-    VectorText,
 } from "metis-engine/renderer";
 import { vec3 } from "wgpu-matrix";
 
@@ -82,6 +89,10 @@ const WARMUP_S = num("warmup", 0.75); // let auto-exposure settle before collect
 // cap AFTER the GPU measurement each frame, so — unlike native fifo, which parks
 // the wait inside getCurrentTexture() — it never pollutes the GPU/encode numbers.
 const CAP_FPS = num("fps", flag("vsync") ? 60 : 0);
+// --profile turns on timestamp queries + the on-screen widgets. Off by default:
+// the queries are cheap but not free, and the point of the bench is the
+// unprofiled cost.
+const PROFILE = flag("profile");
 
 // The plane the lights hover over, and the volume the lights animate within.
 const PLANE_SIZE = 60;
@@ -174,14 +185,27 @@ const ctx = await RenderContext.createWindowed(`metis-engine — light bench (${
     width: WIDTH,
     height: HEIGHT,
     powerPreference: "high-performance",
-    // Default present mode (mailbox); pacing is handled by the FrameLimiter below.
+    // `immediate`: no present back-pressure, so the acquire/GPU numbers are the
+    // engine's own cost. Pacing is handled by the FrameLimiter below.
+    presentMode: "immediate",
+    profiling: PROFILE,
     label: "metis-engine-bench-lights",
 });
 const limiter = new FrameLimiter(CAP_FPS);
 const forward = new ClusteredForwardRenderer(ctx.device);
 const post = createDefaultPostProcessPipeline(ctx.device);
-const hud = new VectorText(ctx.device, ctx.outputFormat);
+// DebugOverlay owns a VectorText, so it doubles as the plain HUD text renderer.
+const hud = new DebugOverlay(ctx.device, ctx.outputFormat);
 hud.loadFont("mono", FONT_PATH);
+
+const profiler = PROFILE ? GpuProfiler.create(ctx.device) : null;
+if (PROFILE && !profiler) {
+    console.warn("[bench] --profile requested but this adapter has no timestamp-query support; continuing without it");
+}
+if (profiler) {
+    forward.profiler = profiler;
+}
+const gpuHistory = new History(120);
 
 const scene = new Scene();
 scene.environment = createExteriorEnvironment({ambientIntensity: 0.02});
@@ -202,8 +226,11 @@ const triangles = floorMesh.indexCount / 3;
 /**
  * Records + submits one frame. `hudLine` is drawn as an overlay. Returns the
  * acquired frame (call `present()` after draining) plus a timing split:
- *   * acquireMs — `beginFrame()`, i.e. waiting for a free swapchain image. This
- *                 is windowing/present back-pressure, NOT engine cost.
+ *   * acquireMs — the whole of `beginFrame()`: getCurrentTexture + createView.
+ *                 Under `immediate` this should be ~0.05 ms; anything bigger is
+ *                 real work hiding inside beginFrame, not present back-pressure.
+ *                 It once read ~6 ms because beginFrame re-queried the surface's
+ *                 preferred format every frame — a WSI round-trip.
  *   * encodeMs  — the real JS work: animate is already done, this is the encode
  *                 of every pass + submit.
  */
@@ -212,6 +239,7 @@ function renderFrame(dt: number, hudLine: string): { frame: FrameTarget; acquire
     const frame = ctx.beginFrame();
     const t1 = performance.now();
     const encoder = ctx.device.createCommandEncoder();
+    profiler?.beginFrame(encoder);
     forward.render(encoder, ctx.targets, scene);
     post.pipeline.run(encoder, {
         device: ctx.device,
@@ -222,9 +250,38 @@ function renderFrame(dt: number, hudLine: string): { frame: FrameTarget; acquire
         width: ctx.width,
         height: ctx.height,
         deltaTime: dt,
+        profiler: profiler ?? undefined,
     });
-    hud.drawText(hudLine, "mono", 18, 14, 26);
-    hud.render(encoder, frame.view, ctx.width, ctx.height, [0.85, 0.95, 1.0, 1.0]);
+    if (profiler) {
+        gpuHistory.push(profiler.frameTotalMs);
+    }
+    // Staging tessellates every glyph, which would cost more per frame than the
+    // whole GPU frame being measured — rebuild at a readable rate and replay the
+    // geometry in between. `hudLine` already only changes ~4x/sec.
+    if (hud.due()) {
+        hud.label(hudLine, 14, 26, [0.85, 0.95, 1.0, 1.0], 18);
+        if (profiler) {
+            const x = ctx.width - 320;
+            hud.graph({
+                x,
+                y: 12,
+                width: 308,
+                height: 96,
+                title: "GPU frame time",
+                unit: "ms",
+                series: [{label: "gpu", values: gpuHistory}],
+            });
+            hud.tree({
+                x,
+                y: 118,
+                width: 308,
+                title: `GPU passes — ${profiler.frameTotalMs.toFixed(3)} ms`,
+                rows: profileSpansToRows(profiler.spans, profiler.frameTotalMs),
+            });
+        }
+    }
+    hud.render(encoder, frame.view, ctx.width, ctx.height);
+    profiler?.endFrame(encoder);
     ctx.device.queue.submit([encoder.finish()]);
     const t2 = performance.now();
     return {frame, acquireMs: t1 - t0, encodeMs: t2 - t1};
@@ -252,7 +309,8 @@ if (validationError) {
 console.log("═".repeat(72));
 console.log("  metis-engine — clustered-forward light benchmark (windowed)");
 console.log("═".repeat(72));
-console.log(`    Resolution ............ ${ctx.width} x ${ctx.height}  (4x MSAA, mailbox, ${CAP_FPS ? `${CAP_FPS} fps cap` : "uncapped"})`);
+console.log(`    Resolution ............ ${ctx.width} x ${ctx.height}  (4x MSAA, immediate, ${CAP_FPS ? `${CAP_FPS} fps cap` : "uncapped"})`);
+console.log(`    GPU profiler .......... ${profiler ? `on (draw zones: ${profiler.canProfileDraws})` : "off  (--profile to enable)"}`);
 console.log(`    Point lights .......... ${LIGHT_COUNT}`);
 console.log(`    Cluster grid .......... ${CLUSTER_COUNT_X} x ${CLUSTER_COUNT_Y} x ${CLUSTER_COUNT_Z} = ${NUM_CLUSTERS} clusters`);
 console.log(`    Max lights / cluster .. ${MAX_LIGHTS_PER_CLUSTER}   (capacity cap)`);
@@ -347,11 +405,36 @@ if (gpuSamples.length === 0) {
     console.log(`    stddev ..... ${ms(gpu.stddev)}`);
     console.log(`\n  CPU encode time  (JS: encode every pass + submit, per frame)`);
     console.log(`    mean ....... ${ms(encode.mean)}   (p95 ${ms(encode.p95)})`);
-    console.log(`\n  Swapchain acquire wait  (beginFrame back-pressure — present/compositor, not engine)`);
+    console.log(`\n  beginFrame  (getCurrentTexture + createView)`);
     console.log(`    mean ....... ${ms(acquire.mean)}   (p95 ${ms(acquire.p95)})`);
-    if (!CAP_FPS && acquire.mean > gpu.mean) {
-        console.log(`    -> the frame rate above is gated by present back-pressure, not GPU work;`);
-        console.log(`       GPU headroom is ~${(1000 / gpu.mean).toFixed(0)} fps.`);
+    // Under `immediate` there is no present back-pressure by construction, so a
+    // big number here means something expensive is running inside beginFrame —
+    // not that the compositor is throttling us. Don't restore a "gated by
+    // present back-pressure" conclusion: under this present mode it can only
+    // ever be wrong, and it's exactly what disguised the ~6 ms per-frame
+    // getPreferredFormat() call that used to live in beginFrame.
+    if (acquire.mean > 1.0) {
+        console.log(`    -> unexpectedly slow for 'immediate', which has no present back-pressure.`);
+        console.log(`       Something costly is running inside beginFrame — go measure it.`);
+    }
+
+    if (profiler && profiler.spans.length > 0) {
+        console.log(`
+  GPU pass breakdown  (timestamp queries, last completed frame)`);
+        const printSpan = (span: ProfileSpan, depth: number) => {
+            const indent = "    " + "  ".repeat(depth + 1);
+            const pct = profiler.frameTotalMs > 0 ? (span.gpuMs / profiler.frameTotalMs) * 100 : 0;
+            console.log(`${indent}${span.label.padEnd(30 - depth * 2)} ${ms(span.gpuMs).padStart(10)}  ${pct.toFixed(1).padStart(5)}%`);
+            for (const child of span.children) {
+                printSpan(child, depth + 1);
+            }
+        };
+        for (const span of profiler.spans) {
+            printSpan(span, 0);
+        }
+        if (!profiler.canProfileFrameTotal) {
+            console.log(`    (no timestamp-query-inside-encoders — total is the sum of passes, excluding gaps between them)`);
+        }
     }
 }
 console.log("═".repeat(72));
@@ -359,4 +442,5 @@ console.log("═".repeat(72));
 forward.destroy();
 post.pipeline.destroy();
 hud.destroy();
+profiler?.destroy();
 ctx.destroy();

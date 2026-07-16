@@ -475,42 +475,51 @@ pub fn power_preference(s: &str) -> napi::Result<wgpu::PowerPreference> {
     })
 }
 
-pub fn feature_to_wgpu(name: &str) -> Option<wgpu::Features> {
-    Some(match name {
-        "depth-clip-control" => wgpu::Features::DEPTH_CLIP_CONTROL,
-        "depth32float-stencil8" => wgpu::Features::DEPTH32FLOAT_STENCIL8,
-        "texture-compression-bc" => wgpu::Features::TEXTURE_COMPRESSION_BC,
-        "texture-compression-bc-sliced-3d" => wgpu::Features::TEXTURE_COMPRESSION_BC_SLICED_3D,
-        "texture-compression-etc2" => wgpu::Features::TEXTURE_COMPRESSION_ETC2,
-        "texture-compression-astc" => wgpu::Features::TEXTURE_COMPRESSION_ASTC,
-        "timestamp-query" => wgpu::Features::TIMESTAMP_QUERY,
-        "indirect-first-instance" => wgpu::Features::INDIRECT_FIRST_INSTANCE,
-        "shader-f16" => wgpu::Features::SHADER_F16,
-        "rg11b10ufloat-renderable" => wgpu::Features::RG11B10UFLOAT_RENDERABLE,
-        "bgra8unorm-storage" => wgpu::Features::BGRA8UNORM_STORAGE,
-        "float32-filterable" => wgpu::Features::FLOAT32_FILTERABLE,
-        "dual-source-blending" => wgpu::Features::DUAL_SOURCE_BLENDING,
-        _ => return None,
-    })
+/// Every feature name `requiredFeatures` accepts and `features` reports.
+///
+/// Both directions of the mapping read this one table, so a name can't be
+/// requestable but unreportable (or vice versa).
+///
+/// The second block is **not** in the WebGPU spec — those are wgpu native
+/// extensions, and anything depending on them will not run in a browser. Keep
+/// them behind an adapter `features.has(...)` check; unlike the spec features,
+/// there is no guarantee a given backend exposes them.
+const FEATURES: &[(&str, wgpu::Features)] = &[
+    // ── WebGPU spec — https://www.w3.org/TR/webgpu/#gpufeaturename ────────────
+    ("depth-clip-control", wgpu::Features::DEPTH_CLIP_CONTROL),
+    ("depth32float-stencil8", wgpu::Features::DEPTH32FLOAT_STENCIL8),
+    ("texture-compression-bc", wgpu::Features::TEXTURE_COMPRESSION_BC),
+    ("texture-compression-bc-sliced-3d", wgpu::Features::TEXTURE_COMPRESSION_BC_SLICED_3D),
+    ("texture-compression-etc2", wgpu::Features::TEXTURE_COMPRESSION_ETC2),
+    ("texture-compression-astc", wgpu::Features::TEXTURE_COMPRESSION_ASTC),
+    ("timestamp-query", wgpu::Features::TIMESTAMP_QUERY),
+    ("indirect-first-instance", wgpu::Features::INDIRECT_FIRST_INSTANCE),
+    ("shader-f16", wgpu::Features::SHADER_F16),
+    ("rg11b10ufloat-renderable", wgpu::Features::RG11B10UFLOAT_RENDERABLE),
+    ("bgra8unorm-storage", wgpu::Features::BGRA8UNORM_STORAGE),
+    ("float32-filterable", wgpu::Features::FLOAT32_FILTERABLE),
+    ("dual-source-blending", wgpu::Features::DUAL_SOURCE_BLENDING),
+    // ── wgpu native-only extensions ───────────────────────────────────────────
+    ("timestamp-query-inside-encoders", wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS),
+    ("timestamp-query-inside-passes", wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES),
+    ("multi-draw-indirect", wgpu::Features::MULTI_DRAW_INDIRECT),
+    ("push-constants", wgpu::Features::PUSH_CONSTANTS),
+];
+
+/// Rejects unknown names rather than dropping them. The spec has `requestDevice`
+/// throw a `TypeError` for an unrecognised feature; silently ignoring a typo
+/// hands back a device that's missing the feature and fails much later, far from
+/// the cause.
+pub fn feature_to_wgpu(name: &str) -> napi::Result<wgpu::Features> {
+    FEATURES
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, bits)| *bits)
+        .ok_or_else(|| invalid_enum("GPUFeatureName", name))
 }
 
 pub fn features_to_vec(f: wgpu::Features) -> Vec<&'static str> {
-    const MAPPING: &[(&str, wgpu::Features)] = &[
-        ("depth-clip-control", wgpu::Features::DEPTH_CLIP_CONTROL),
-        ("depth32float-stencil8", wgpu::Features::DEPTH32FLOAT_STENCIL8),
-        ("texture-compression-bc", wgpu::Features::TEXTURE_COMPRESSION_BC),
-        ("texture-compression-bc-sliced-3d", wgpu::Features::TEXTURE_COMPRESSION_BC_SLICED_3D),
-        ("texture-compression-etc2", wgpu::Features::TEXTURE_COMPRESSION_ETC2),
-        ("texture-compression-astc", wgpu::Features::TEXTURE_COMPRESSION_ASTC),
-        ("timestamp-query", wgpu::Features::TIMESTAMP_QUERY),
-        ("indirect-first-instance", wgpu::Features::INDIRECT_FIRST_INSTANCE),
-        ("shader-f16", wgpu::Features::SHADER_F16),
-        ("rg11b10ufloat-renderable", wgpu::Features::RG11B10UFLOAT_RENDERABLE),
-        ("bgra8unorm-storage", wgpu::Features::BGRA8UNORM_STORAGE),
-        ("float32-filterable", wgpu::Features::FLOAT32_FILTERABLE),
-        ("dual-source-blending", wgpu::Features::DUAL_SOURCE_BLENDING),
-    ];
-    MAPPING
+    FEATURES
         .iter()
         .filter(|(_, bits)| f.contains(*bits))
         .map(|(name, _)| *name)

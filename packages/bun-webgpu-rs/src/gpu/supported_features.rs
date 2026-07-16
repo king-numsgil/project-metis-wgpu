@@ -29,17 +29,20 @@ impl GpuSupportedFeatures {
     }
 
     #[napi]
-    pub fn has(&self, key: String) -> bool {
+    pub fn has(
+        &self,
+        #[napi(ts_arg_type = "GPUFeatureName | GPUNativeFeatureName")] key: String,
+    ) -> bool {
         self.features.iter().any(|f| f == &key)
     }
 
     /// Returns an iterator-compatible array of feature name strings (keys == values for a set).
-    #[napi]
+    #[napi(ts_return_type = "Array<GPUFeatureName | GPUNativeFeatureName>")]
     pub fn keys(&self) -> Vec<String> {
         self.features.clone()
     }
 
-    #[napi]
+    #[napi(ts_return_type = "Array<GPUFeatureName | GPUNativeFeatureName>")]
     pub fn values(&self) -> Vec<String> {
         self.features.clone()
     }

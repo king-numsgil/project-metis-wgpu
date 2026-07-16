@@ -152,6 +152,14 @@ unsafe impl Sync for GpuSurface {}
 #[napi]
 impl GpuSurface {
     /// Returns the adapter's preferred texture format for this surface.
+    ///
+    /// **Call this once at setup, never per frame.** It is not a cheap getter:
+    /// `get_capabilities` is a window-system round-trip (measured at ~6 ms on a
+    /// GTX 1070 / Vulkan / Windows), because it re-queries the surface's formats,
+    /// present modes and alpha modes from the driver every call. The result is a
+    /// property of the surface+adapter pair and doesn't change with window size,
+    /// so cache it — a render pipeline is built against one format anyway, so a
+    /// value that could change mid-run would be a bug, not a feature.
     #[napi(ts_return_type = "GPUTextureFormat")]
     pub fn get_preferred_format(&self) -> napi::Result<String> {
         let caps = self.inner.get_capabilities(&self.adapter);

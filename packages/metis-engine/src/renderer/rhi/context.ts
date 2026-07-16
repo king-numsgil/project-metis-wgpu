@@ -16,6 +16,7 @@ import {
     sdlQuit,
     type SdlWindow,
 } from "bun-webgpu-rs";
+import { gpuProfilerFeatures } from "../debug/gpuProfiler.ts";
 import { RenderTargets } from "./targets.ts";
 
 export type PowerPreference = "low-power" | "high-performance";
@@ -35,6 +36,17 @@ export interface RenderContextOptions {
      * `"immediate"` to measure raw CPU/GPU frame cost (no present back-pressure).
      */
     presentMode?: GPUPresentMode;
+    /**
+     * Request the timestamp-query features `GpuProfiler` needs. Off by default:
+     * they're optional (and two are native-only wgpu extensions), so a device
+     * shouldn't carry them unless something intends to profile.
+     *
+     * Only the tiers this adapter actually advertises are requested — asking for
+     * a feature the adapter lacks fails `requestDevice` outright — so setting
+     * this on a GPU with no timestamp support degrades to a normal device rather
+     * than throwing. `GpuProfiler.create(ctx.device)` then returns `null`.
+     */
+    profiling?: boolean;
 }
 
 export interface FrameTarget {
@@ -64,6 +76,17 @@ export class RenderContext {
     // takeScreenshot (bun-webgpu-rs/tests/helpers/screenshot.ts) can only read
     // back tight rgba8unorm, so the offscreen path is pinned to that format.
     private readonly offscreenFormat: GPUTextureFormat = "rgba8unorm";
+    /**
+     * Resolved once, never per frame. `surface.getPreferredFormat()` is a
+     * `get_capabilities()` WSI round-trip costing **~6 ms** on this machine's
+     * Vulkan backend — when `outputFormat` was a plain getter, `beginFrame()`
+     * paid that on every single windowed frame, halving the frame rate
+     * regardless of GPU work (200-light bench: 72 -> 149 fps once cached).
+     * The format is a property of the surface+adapter pair and doesn't change
+     * with size, so caching it is sound — and a format that could change
+     * mid-run would be a bug anyway, since pipelines are built against one.
+     */
+    private readonly windowedFormat: GPUTextureFormat | null;
     private offscreenTarget: GpuTexture | null = null;
     private offscreenView: GpuTextureView | null = null;
 
@@ -83,6 +106,7 @@ export class RenderContext {
         this.window = window;
         this.surface = surface;
         this.presentMode = presentMode;
+        this.windowedFormat = surface ? surface.getPreferredFormat() : null;
         this.targets = new RenderTargets(device, width, height);
         if (!surface) {
             this.createOffscreenTarget();
@@ -97,9 +121,9 @@ export class RenderContext {
         return this.surface !== null;
     }
 
-    /** Format the final post-process pass must target this frame. */
+    /** Format the final post-process pass must target this frame. Cached — see `windowedFormat`. */
     get outputFormat(): GPUTextureFormat {
-        return this.surface ? this.surface.getPreferredFormat() : this.offscreenFormat;
+        return this.windowedFormat ?? this.offscreenFormat;
     }
 
     /** The texture backing the offscreen target — `null` in windowed mode. Read this back with `takeScreenshot`. */
@@ -113,7 +137,10 @@ export class RenderContext {
         if (!adapter) {
             throw new Error("metis-engine: no GPU adapter available");
         }
-        const device = await adapter.requestDevice({label: options.label ?? "metis-engine-offscreen"});
+        const device = await adapter.requestDevice({
+            label: options.label ?? "metis-engine-offscreen",
+            requiredFeatures: options.profiling ? gpuProfilerFeatures(adapter) : undefined,
+        });
         return new RenderContext(device, adapter, options.width, options.height, null, null);
     }
 
@@ -135,7 +162,10 @@ export class RenderContext {
             sdlQuit();
             throw new Error("metis-engine: no GPU adapter compatible with this window");
         }
-        const device = await adapter.requestDevice({label: options.label ?? "metis-engine-windowed"});
+        const device = await adapter.requestDevice({
+            label: options.label ?? "metis-engine-windowed",
+            requiredFeatures: options.profiling ? gpuProfilerFeatures(adapter) : undefined,
+        });
         const surface = createSurface(adapter, window);
         // Omitting presentMode lets the binding pick its default (mailbox).
         const presentMode = options.presentMode;

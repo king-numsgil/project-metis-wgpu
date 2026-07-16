@@ -118,6 +118,106 @@ src/
 - Variadic SDL log functions: use `SDL_Log(c"%s".as_ptr(), msg.as_ptr())` — never pass a Rust format string as the first argument.
 - `SDL_GetJoysticks` / `SDL_GetGamepads` return heap-allocated arrays — call `SDL_free` after copying to Vec.
 
+### Features: the spec set, and the first deliberate departure from it
+
+`convert.rs` has **one** `FEATURES` table that both `feature_to_wgpu` (request)
+and `features_to_vec` (report) read. It used to be two duplicated lists — a name
+could become requestable but unreportable. Don't split it again.
+
+The table's second block is this crate's **first intentional break from the
+WebGPU spec**: `timestamp-query-inside-encoders`, `timestamp-query-inside-passes`,
+`multi-draw-indirect`, `push-constants`. They're wgpu extensions with no spec
+equivalent, so they're typed as a separate `GPUNativeFeatureName` union (in
+`dts-header.ts`) rather than folded into `GPUFeatureName` — the type is the
+documentation that using one is a native-only decision. Keep that split when
+adding more.
+
+`feature_to_wgpu` **errors** on an unknown name rather than dropping it. The old
+`if let Some(wf) = … {}` silently ignored typos, handing back a device missing
+the feature that then failed somewhere far away; the spec has `requestDevice`
+reject for exactly this reason.
+
+**`requestDevice` used to unconditionally OR in `PUSH_CONSTANTS`** regardless of
+what the caller asked for — which would fail device creation outright on any
+adapter lacking it, with no opt-out. It had no consumers anywhere in the repo.
+It's gone; `push-constants` is now a normal opt-in feature. Note it's inert
+without also raising the `maxPushConstantSize` limit (wgpu defaults it to 0), and
+that the *reported* limit is called `maxImmediateSize` (wgpu's
+`max_push_constant_size` under the spec's newer name).
+
+### VectorContext: lyon panics, and the one rule behind all of them
+
+**Every point handed to lyon must be finite and have an open sub-path, or lyon
+asserts — and a Rust panic across the napi boundary aborts the process rather
+than throwing something JS can catch.** That is the single root cause behind a
+whole family of bugs found here; they were found by probing each edge case in its
+own process (a panic kills the test runner, so they can't be catalogued in one
+run).
+
+**Canvas is a reference here, not a target.** This API is not chasing canvas
+conformance, and shouldn't start. It's just that canvas already had a sane,
+non-crashing answer for each of these cases, so borrowing its behaviour was
+cheaper than inventing one. The bar is "no panic, no silent garbage" — where
+canvas would go further (throwing on a negative `arc` radius, say), we don't.
+
+What used to abort the process:
+
+| Input | Was |
+|---|---|
+| `beginPath → moveTo → lineTo → stroke()` (an open polyline!) | `"build() called before end()"` |
+| `lineTo`/`quadTo`/`cubicTo` before any `moveTo` | `private.rs:45` assert |
+| any segment after `closePath()` | `private.rs:45` assert |
+| any `NaN`/`Infinity` coordinate, or a non-finite transform | `assertion failed: p.x.is_finite()` |
+| `drawText` at a non-finite position, then `stroke()` | same assert (and `fill()` silently emitted NaN vertices) |
+
+The state that makes it work is `subpath_open` + `subpath_start`. `take_path`
+ends an open sub-path with `end(false)` — unclosed, so no phantom closing
+segment. `open_subpath` implements canvas's rules for a segment with no current
+sub-path (and, after a `closePath()`, resumes at the closed sub-path's start
+point). `finite()` guards every point *after* the local transform, since a
+non-finite transform turns finite inputs non-finite.
+
+**`arc` had an unbounded step count**, `steps = |sweep|/2π * 64`, with no clamp:
+`arc(…, sweep = 1e6)` tessellated to **~92M indices (~370 MB of buffers)** from a
+single innocuous call. `|sweep|` is now clamped to one full turn.
+
+**Transforms nested in the wrong order.** `push_transform` did
+`current.then(&t)`, applying the *parent* to a point before the child — the
+reverse of canvas/SVG/Skia, and backwards for the only thing a transform stack is
+for (expressing a child's coordinates in its parent's local space). Verified by
+pixel readback: `translate(100,0)` + `scale(2)` put a point at `(10,10)` at
+`(220,20)` instead of `(120,20)`. Now `t.then(&parent)`. Nothing in the repo used
+`pushTransform`, so this broke no callers — but it *is* a semantics change, not a
+crash fix. A non-finite matrix is ignored but still pushes a level, so a matching
+`popTransform` can't silently discard the enclosing transform.
+
+**Tests.** `tests/vector.test.ts` covers index counts + the degenerate/panic
+matrix; `tests/vector-render.test.ts` renders offscreen and asserts on **pixels**,
+which is the only way to catch the ones that matter — an open path that gets
+wrongly closed still tessellates to plenty of indices, and a broken transform
+order still produces geometry. Both mutation-checked (reverting a fix fails the
+matching test).
+
+### VectorContext: two performance bugs
+
+**`draw_text` did its work twice.** It called `render_text` (cached,
+pre-tessellated geometry → `pending_render`) *and* `expand_text_path` (re-parse
+the face, outline every glyph, build a full lyon `Path` → `current_path`). But
+`push_fill_command` takes `pending_render` and returns early, so for the normal
+`drawText + fill()` the entire outline was computed and discarded — ~2x the cost
+of every string. Only `stroke()` consumes `current_path`, so the outline is now
+built lazily from a retained `TextPathSource` on the first `take_path` that needs
+it.
+
+**Still slow, and known:** glyphs are cached pre-tessellated *in font units* with
+a fixed `tolerance = 0.25` (`prewarm_cache`), i.e. 0.25 *font units* — at
+upm 1000 and 11 px text that's ~90x finer than the pixel grid can show.
+Measured: `"cascade0-depth"` (14 glyphs, 11 px) = **1651 triangles**, ~118 per
+glyph. Because the cache is size-independent it can't simply use a per-size
+tolerance; fixing it properly means keying the cache by (glyph, size bucket).
+Not done. Consumers that redraw static text every frame should reuse `drawCalls`
+instead (see `DOC.md` §9).
+
 ### wgpu / surface
 - Always use `requestAdapterForWindow(window)` (not `requestAdapter()`) for windowed rendering. It creates a temp `Surface<'static>` so the adapter is guaranteed surface-compatible.
 - Surface format (e.g. `bgra8unorm-srgb`) can't be read back. For screenshots, render to a separate `rgba8unorm` texture.
@@ -284,6 +384,8 @@ encoder.popDebugGroup()
 ---
 
 ## Performance profiling
+
+CPU-side wall clock (see `DOC.md` §5 for GPU-side timestamp queries):
 
 ```ts
 const freq = sdlGetPerformanceFrequency()

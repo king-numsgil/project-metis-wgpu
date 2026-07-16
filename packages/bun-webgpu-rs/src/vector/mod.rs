@@ -82,11 +82,28 @@ struct PendingDraw {
 ///    b. `bindBuffers(pass)` — sets vertex buffer (slot 0, stride 16,
 ///       layout `[x, y, u, v]`) and index buffer (Uint32) on the pass.
 ///    c. Iterate `drawCalls`, set per-call bind groups, call `drawIndexed`.
+///
+/// Paths need not be closed: `stroke()` on an open path draws it open, and
+/// `fill()` closes it implicitly (as canvas does).
 #[napi]
 pub struct VectorContext {
     // ── Drawing state ─────────────────────────────────────────────────────────
     path_builder:      Option<lyon_path::path::Builder>,
     current_path:      Option<Path>,
+    /// Deferred outline for the last `draw_text`. Building the lyon `Path` for a
+    /// string means re-parsing the face and outlining every glyph — far more
+    /// expensive than the cached, pre-tessellated geometry `fill()` uses, and
+    /// only `stroke()` ever needs it. So keep the inputs and expand on demand.
+    text_path_source:  Option<TextPathSource>,
+    /// Whether `begin()` has been called without a matching `end()`/`close()`.
+    /// lyon panics if `build()` runs with a sub-path still open, or if `begin()`
+    /// is called while one is — so every entry point that opens or consumes a
+    /// sub-path has to keep this straight.
+    subpath_open:      bool,
+    /// Start point of the most recent sub-path. Canvas resumes from here after a
+    /// `closePath()`, and lyon panics on a segment with no sub-path open, so the
+    /// two requirements are the same bookkeeping.
+    subpath_start:     Option<lyon_path::math::Point>,
     path_is_from_text: bool,
     text_fill_rule:    FillRule,
     pending_render:    Option<(Vec<[f32; 2]>, Vec<u32>, FillRule)>,
@@ -111,8 +128,33 @@ pub struct VectorContext {
 unsafe impl Send for VectorContext {}
 unsafe impl Sync for VectorContext {}
 
+/// Everything `expand_text_path` needs, so a `draw_text` outline can be built
+/// lazily on the first `stroke()` instead of eagerly on every call.
+struct TextPathSource {
+    font_name: String,
+    size_px:   f32,
+    text:      String,
+    x:         f32,
+    y:         f32,
+    transform: Transform2D<f32>,
+}
+
 fn current_local(stack: &[Transform2D<f32>]) -> Transform2D<f32> {
     stack.last().copied().unwrap_or_else(Transform2D::identity)
+}
+
+/// lyon **asserts** every point is finite and panics if not — and a panic across
+/// the napi boundary aborts the process rather than throwing something JS can
+/// catch. Canvas instead ignores non-finite arguments, which is both safer and
+/// the semantics this API is modelled on. Checked after the local transform,
+/// since a non-finite transform turns finite inputs non-finite.
+fn finite(p: lyon_path::math::Point) -> bool {
+    p.x.is_finite() && p.y.is_finite()
+}
+
+fn transform_finite(t: &Transform2D<f32>) -> bool {
+    t.m11.is_finite() && t.m12.is_finite() && t.m21.is_finite()
+        && t.m22.is_finite() && t.m31.is_finite() && t.m32.is_finite()
 }
 
 #[napi]
@@ -127,6 +169,9 @@ impl VectorContext {
         Ok(VectorContext {
             path_builder: None,
             current_path: None,
+            text_path_source: None,
+            subpath_open: false,
+            subpath_start: None,
             path_is_from_text: false,
             text_fill_rule: FillRule::NonZero,
             pending_render: None,
@@ -158,9 +203,15 @@ impl VectorContext {
 
     // ── Transform API ─────────────────────────────────────────────────────────
 
-    /// Push a 2-D affine transform onto the stack, composing it with the
+    /// Push a 2-D affine transform onto the stack, nesting it *inside* the
     /// current top.  `matrix` is 6 floats in column-major order:
-    /// `[m00, m01, m10, m11, m20, m21]`.
+    /// `[m00, m01, m10, m11, m20, m21]` — the same layout as canvas's
+    /// `setTransform(a, b, c, d, e, f)`.
+    ///
+    /// Nesting means a point is transformed by the innermost (most recently
+    /// pushed) transform first, then outward — so pushing `translate(100, 0)`
+    /// and then `scale(2)` draws a point at `(10, 10)` at `(120, 20)`: scaled in
+    /// the translated group's local space. This matches canvas/SVG.
     #[napi]
     pub fn push_transform(&mut self, matrix: napi::bindgen_prelude::Float32Array) {
         let m = matrix.as_ref();
@@ -172,7 +223,19 @@ impl VectorContext {
             m.get(4).copied().unwrap_or(0.0),
             m.get(5).copied().unwrap_or(0.0),
         );
-        let combined = current_local(&self.local_stack).then(&t);
+        // A non-finite matrix would make every transformed point non-finite and
+        // panic lyon. Canvas ignores such a transform; still push a level, so the
+        // caller's matching popTransform doesn't pop the parent instead.
+        // `a.then(&b)` applies a, then b — so nesting is t.then(parent): the new
+        // (inner) transform first, then the enclosing one. The reverse
+        // (parent.then(&t)) applies the parent to the point first, which makes a
+        // transform *stack* useless for its only purpose, since a child's
+        // coordinates would not be in its parent's local space.
+        let combined = if transform_finite(&t) {
+            t.then(&current_local(&self.local_stack))
+        } else {
+            current_local(&self.local_stack)
+        };
         self.local_stack.push(combined);
     }
 
@@ -187,6 +250,9 @@ impl VectorContext {
     pub fn begin_path(&mut self) {
         self.path_builder = Some(Path::builder());
         self.current_path = None;
+        self.text_path_source = None;
+        self.subpath_open = false;
+        self.subpath_start = None;
         self.pending_render = None;
         self.path_is_from_text = false;
         self.text_fill_rule = FillRule::NonZero;
@@ -196,13 +262,27 @@ impl VectorContext {
     pub fn move_to(&mut self, x: f64, y: f64) {
         let lt = current_local(&self.local_stack);
         let p = lt.transform_point(point(x as f32, y as f32));
-        if let Some(b) = &mut self.path_builder { b.begin(p); }
+        if !finite(p) { return; }
+        if let Some(b) = &mut self.path_builder {
+            // A second moveTo starts a new sub-path; the previous one has to be
+            // ended (unclosed) first or lyon panics.
+            if self.subpath_open { b.end(false); }
+            b.begin(p);
+            self.subpath_open = true;
+            self.subpath_start = Some(p);
+        }
     }
 
     #[napi]
     pub fn line_to(&mut self, x: f64, y: f64) {
         let lt = current_local(&self.local_stack);
         let p = lt.transform_point(point(x as f32, y as f32));
+        if !finite(p) { return; }
+        // Canvas: a lineTo with no sub-path *at all* is just a moveTo — it starts
+        // one and draws no segment.
+        let fresh = !self.subpath_open && self.subpath_start.is_none();
+        if !self.open_subpath(p) { return; }
+        if fresh { return; }
         if let Some(b) = &mut self.path_builder { b.line_to(p); }
     }
 
@@ -211,6 +291,10 @@ impl VectorContext {
         let lt = current_local(&self.local_stack);
         let ctrl = lt.transform_point(point(cx as f32, cy as f32));
         let end  = lt.transform_point(point(x  as f32, y  as f32));
+        if !finite(ctrl) || !finite(end) { return; }
+        // Canvas: with no sub-path, one starts at the first control point and the
+        // curve is still drawn (unlike lineTo).
+        if !self.open_subpath(ctrl) { return; }
         if let Some(b) = &mut self.path_builder { b.quadratic_bezier_to(ctrl, end); }
     }
 
@@ -220,6 +304,8 @@ impl VectorContext {
         let c1  = lt.transform_point(point(c1x as f32, c1y as f32));
         let c2  = lt.transform_point(point(c2x as f32, c2y as f32));
         let end = lt.transform_point(point(x   as f32, y   as f32));
+        if !finite(c1) || !finite(c2) || !finite(end) { return; }
+        if !self.open_subpath(c1) { return; }
         if let Some(b) = &mut self.path_builder { b.cubic_bezier_to(c1, c2, end); }
     }
 
@@ -233,21 +319,36 @@ impl VectorContext {
         let r     = radius as f32;
         let start = start_angle as f32;
         let sweep = sweep_angle as f32;
+        if !cx.is_finite() || !cy.is_finite() || !r.is_finite()
+            || !start.is_finite() || !sweep.is_finite() { return; }
+        // Clamp to one full turn, as canvas does. Without this the step count
+        // grows with |sweep| without bound: arc(…, sweep = 1e6) tessellated to
+        // ~92M indices (~370 MB of buffers) from a single call.
+        let sweep = sweep.clamp(-2.0 * PI, 2.0 * PI);
         let steps = ((sweep.abs() / (2.0 * PI)) * 64.0).ceil().max(4.0) as usize;
         let step_angle = sweep / steps as f32;
         let first = lt.transform_point(point(cx + r * start.cos(), cy + r * start.sin()));
+        if !finite(first) { return; }
         let builder = match &mut self.path_builder { Some(b) => b, None => return };
+        if self.subpath_open { builder.end(false); }
         builder.begin(first);
+        self.subpath_open = true;
+        self.subpath_start = Some(first);
         for i in 1..=steps {
             let angle = start + step_angle * i as f32;
             let p = lt.transform_point(point(cx + r * angle.cos(), cy + r * angle.sin()));
-            builder.line_to(p);
+            if finite(p) { builder.line_to(p); }
         }
     }
 
     #[napi]
     pub fn close_path(&mut self) {
-        if let Some(b) = &mut self.path_builder { b.close(); }
+        if let Some(b) = &mut self.path_builder {
+            if self.subpath_open {
+                b.close();
+                self.subpath_open = false;
+            }
+        }
     }
 
     // ── Paint ─────────────────────────────────────────────────────────────────
@@ -258,14 +359,52 @@ impl VectorContext {
     #[napi]
     pub fn stroke(&mut self, width: f64) { self.push_stroke_command(width as f32); }
 
+    /// Opens a sub-path if none is current, per canvas:
+    /// - after `closePath()`, the new sub-path starts at the *closed* sub-path's
+    ///   start point (so a following segment is drawn from there);
+    /// - if no sub-path was ever started, it begins at `fallback`.
+    ///
+    /// Returns whether the builder is ready to take a segment. lyon panics on a
+    /// segment with no open sub-path, so every segment method goes through this.
+    fn open_subpath(&mut self, fallback: lyon_path::math::Point) -> bool {
+        if self.subpath_open { return true; }
+        let start = self.subpath_start.unwrap_or(fallback);
+        let Some(b) = &mut self.path_builder else { return false };
+        b.begin(start);
+        self.subpath_open = true;
+        self.subpath_start = Some(start);
+        true
+    }
+
     fn take_path(&mut self) -> Option<Path> {
-        if let Some(builder) = self.path_builder.take() {
+        if let Some(mut builder) = self.path_builder.take() {
+            // An open sub-path is the normal case for stroke() — a polyline that
+            // shouldn't have a closing segment. End it without closing so build()
+            // doesn't panic and the geometry stays open.
+            if self.subpath_open {
+                builder.end(false);
+                self.subpath_open = false;
+            }
+            self.subpath_start = None;
             let path = builder.build();
             self.current_path = Some(path.clone());
-            Some(path)
-        } else {
-            self.current_path.clone()
+            return Some(path);
         }
+        // A path was requested for text that only had its fill geometry built —
+        // expand the outline now (see `text_path_source`).
+        if self.current_path.is_none() {
+            if let Some(src) = self.text_path_source.take() {
+                let mut builder = Path::builder();
+                // Can't realistically fail: draw_text resolved this same font
+                // through render_text before recording the source.
+                font::expand_text_path(
+                    &self.fonts, &src.font_name, src.size_px, &src.text,
+                    src.x, src.y, &src.transform, &mut builder,
+                ).ok()?;
+                self.current_path = Some(builder.build());
+            }
+        }
+        self.current_path.clone()
     }
 
     fn push_fill_command(&mut self) {
@@ -314,6 +453,13 @@ impl VectorContext {
             ));
         }
         let lt = current_local(&self.local_stack);
+        // Non-finite position/size would put NaN vertices straight into the
+        // buffer via the cached fill path (silently drawing nothing), and panic
+        // lyon via the outline path on stroke(). Ignore, as canvas does.
+        if !(x as f32).is_finite() || !(y as f32).is_finite()
+            || !(size_px as f32).is_finite() || !transform_finite(&lt) {
+            return Ok(());
+        }
         let mut pre_verts: Vec<[f32; 2]> = Vec::new();
         let mut pre_idxs:  Vec<u32>      = Vec::new();
         let fill_rule = font::render_text(
@@ -324,11 +470,15 @@ impl VectorContext {
         ).map_err(napi::Error::from_reason)?;
         self.pending_render = Some((pre_verts, pre_idxs, fill_rule.clone()));
 
-        let mut builder = Path::builder();
-        font::expand_text_path(&self.fonts, &font_name, size_px as f32, &text, x as f32, y as f32, &lt, &mut builder)
-            .map_err(napi::Error::from_reason)?;
-        self.current_path = Some(builder.build());
+        // Only record what an outline would need; expanding it here would double
+        // the cost of every drawText and be discarded by the usual fill() path.
+        self.text_path_source = Some(TextPathSource {
+            font_name, size_px: size_px as f32, text, x: x as f32, y: y as f32, transform: lt,
+        });
+        self.current_path = None;
         self.path_builder = None;
+        self.subpath_open = false;
+        self.subpath_start = None;
         self.path_is_from_text = true;
         self.text_fill_rule = fill_rule;
         Ok(())
@@ -373,6 +523,9 @@ impl VectorContext {
         let pending = std::mem::take(&mut self.pending);
         self.current_path   = None;
         self.path_builder   = None;
+        self.text_path_source = None;
+        self.subpath_open   = false;
+        self.subpath_start  = None;
         self.pending_render = None;
         self.local_stack.clear();
         self.draw_calls.clear();
@@ -470,6 +623,9 @@ impl VectorContext {
         self.pending.clear();
         self.current_path   = None;
         self.path_builder   = None;
+        self.text_path_source = None;
+        self.subpath_open   = false;
+        self.subpath_start  = None;
         self.pending_render = None;
         self.local_stack.clear();
         self.draw_calls.clear();

@@ -3,6 +3,7 @@ import {
     type GpuAdapter,
     GPUBufferUsage,
     type GpuDevice,
+    type GPUFeatureName,
     GPUMapMode,
     GPUShaderStage,
     GPUTextureUsage,
@@ -37,7 +38,10 @@ describe("requestAdapter", () => {
         expect(typeof features.size).toBe("number");
         expect(typeof features.has).toBe("function");
         expect(Array.isArray(features.keys())).toBe(true);
-        expect(features.has("__definitely_not_a_real_feature__")).toBe(false);
+        // has() is typed to GPUFeatureName | GPUNativeFeatureName, but the cast
+        // is the point: an unknown name reaching it at runtime must answer
+        // false, not throw.
+        expect(features.has("__definitely_not_a_real_feature__" as GPUFeatureName)).toBe(false);
     });
 
     it("adapter has limits object", () => {

@@ -62,13 +62,19 @@ export class LuminanceAveragePass implements PostProcessPass {
             });
         }
 
-        const tilePass = encoder.beginComputePass({label: "metis-engine/luminance-tile-pass"});
+        const tilePass = encoder.beginComputePass({
+            label: "metis-engine/luminance-tile-pass",
+            timestampWrites: ctx.profiler?.pass("luminance-tile"),
+        });
         tilePass.setPipeline(this.tilePipeline);
         tilePass.setBindGroup(0, this.tileBindGroup);
         tilePass.dispatchWorkgroups(tileCountX, tileCountY);
         tilePass.end();
 
-        const finalPass = encoder.beginComputePass({label: "metis-engine/luminance-final-pass"});
+        const finalPass = encoder.beginComputePass({
+            label: "metis-engine/luminance-final-pass",
+            timestampWrites: ctx.profiler?.pass("luminance-final"),
+        });
         finalPass.setPipeline(this.finalPipeline);
         finalPass.setBindGroup(0, this.finalBindGroup);
         finalPass.dispatchWorkgroups(1);

@@ -63,12 +63,66 @@ surface.configure(device, { width: window.width, height: window.height }); // pr
 which then fails at `configure()` with `"No supported surface formats"`.
 `requestAdapterForWindow` builds a temp surface to guarantee compatibility.
 
+> **`surface.getPreferredFormat()` is not a cheap getter — never call it per
+> frame.** It re-queries the driver (`get_capabilities`: formats, present modes,
+> alpha modes) on every call: **~6 ms** on a GTX 1070 / Vulkan / Windows. Resolve
+> it once at setup and hold the value; it can't change with window size, and your
+> pipelines are built against a single format anyway. Not hypothetical:
+> `metis-engine`'s `RenderContext.outputFormat` was a getter wrapping it, so
+> `beginFrame()` paid ~6 ms every windowed frame. Caching it doubled the
+> 200-light bench: 72 -> 149 fps.
+
 `adapter.info` → `{ vendor, architecture, device, description, backendType, deviceType, ... }`.
 **`description`** is the human-readable name (`"NVIDIA GeForce GTX 1070"`);
 `device` is a numeric PCI id as a string.
 
 `adapter.features` / `device.features` are spec-setlike: `.has(name)`, `.size`,
 `.keys()`. Not an array.
+
+### Features — spec vs. native
+
+`requiredFeatures` is typed `Array<GPUFeatureName | GPUNativeFeatureName>`.
+
+- **`GPUFeatureName`** — the [WebGPU spec set](https://www.w3.org/TR/webgpu/#gpufeaturename)
+  (`timestamp-query`, `float32-filterable`, `texture-compression-bc`, …). Portable.
+- **`GPUNativeFeatureName`** — wgpu extensions with **no spec equivalent**. Code
+  using one is native-only by construction:
+
+| Name | Unlocks |
+|---|---|
+| `timestamp-query-inside-encoders` | `encoder.writeTimestamp()` — timing between passes |
+| `timestamp-query-inside-passes` | `pass.writeTimestamp()` — timing individual draws |
+| `multi-draw-indirect` | batched indirect draws from a GPU buffer |
+| `push-constants` | `setImmediates()`; **also needs `maxPushConstantSize`** (below) |
+
+**Every feature is opt-in, and requesting an unsupported one fails
+`requestDevice` outright.** So always filter by the adapter:
+
+```ts
+const wanted = (["timestamp-query", "timestamp-query-inside-passes"] as const)
+  .filter((f) => adapter.features.has(f));
+const device = await adapter.requestDevice({ requiredFeatures: [...wanted] });
+```
+
+An unrecognised name throws (`GPUFeatureName: invalid value`) rather than being
+silently dropped — a typo fails at `requestDevice`, not later at the first use.
+
+### Limits
+
+`requiredLimits` accepts a subset of the spec limits. One trap:
+**`maxPushConstantSize` defaults to 0**, so requesting the `push-constants`
+feature *alone* yields a device that accepts no push constants:
+
+```ts
+const device = await adapter.requestDevice({
+  requiredFeatures: ["push-constants"],
+  requiredLimits: { maxPushConstantSize: 128 },   // without this, immediates are unusable
+});
+```
+
+It's reported back on `limits` as **`maxImmediateSize`** — wgpu's
+`max_push_constant_size`, which the spec later renamed "immediate size". Same
+limit, two names.
 
 ---
 
@@ -223,12 +277,53 @@ pass.end();
 
 ### Timestamp queries
 
-`device.createQuerySet({ type: "timestamp", count })`, then per-pass
-`timestampWrites: { querySet, beginningOfPassWriteIndex?, endOfPassWriteIndex? }`
-on the render/compute pass descriptor, then
-`encoder.resolveQuerySet(qs, first, count, dstBuffer, dstOffset)`. Requires the
-`timestamp-query` feature in `requestDevice({ requiredFeatures: [...] })`.
-There is **no** `encoder.writeTimestamp` — timestamps are per-pass only.
+GPU-side timing. Needs the `timestamp-query` feature (optional — check the
+adapter first, see §2).
+
+```ts
+const qs = device.createQuerySet({ label: "timings", type: "timestamp", count: 2 });
+
+// Per-pass (WebGPU spec): brackets the whole pass.
+const pass = encoder.beginRenderPass({
+  colorAttachments: [...],
+  timestampWrites: { querySet: qs, beginningOfPassWriteIndex: 0, endOfPassWriteIndex: 1 },
+});
+pass.end();
+
+// Resolve -> a QUERY_RESOLVE buffer, then copy to a MAP_READ buffer to read it.
+const resolve  = device.createBuffer({ size: 2 * 8, usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC });
+const readback = device.createBuffer({ size: 2 * 8, usage: GPUBufferUsage.COPY_DST  | GPUBufferUsage.MAP_READ });
+encoder.resolveQuerySet(qs, 0, 2, resolve, 0);
+encoder.copyBufferToBuffer(resolve, 0, readback, 0, 2 * 8);
+device.queue.submit([encoder.finish()]);
+
+await readback.mapAsync(GPUMapMode.READ);
+const bytes = readback.getMappedRange();
+// Reinterpret the BYTES as u64. `new BigUint64Array(bytes)` converts *values* —
+// a real bug this repo has hit before.
+const ticks = new BigUint64Array(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + 16));
+const ms = Number(ticks[1] - ticks[0]) * device.queue.getTimestampPeriod() / 1e6;
+readback.unmap();
+```
+
+**Timestamps are raw ticks, not nanoseconds.** `queue.getTimestampPeriod()` is the
+ns-per-tick multiplier (not in the WebGPU spec, which gives no way to interpret
+timestamp values at all). Only compare two timestamps from the same submission.
+
+**Finer granularity — native only** (see §2's native features):
+
+| Call | Feature needed | Measures |
+|---|---|---|
+| `timestampWrites` on a pass descriptor | `timestamp-query` | one whole pass |
+| `encoder.writeTimestamp(qs, i)` | `+ timestamp-query-inside-encoders` | between passes — spans that bracket passes plus the copies between them |
+| `pass.writeTimestamp(qs, i)` | `+ timestamp-query-inside-passes` | inside a pass — individual draws/dispatches |
+
+Both `writeTimestamp` entry points are **validation errors** without their
+feature, and this binding only prints validation errors to stderr (§1) — so gate
+them on `adapter.features.has(...)`, don't just try it.
+
+`metis-engine`'s `GpuProfiler` wraps this whole flow (ring-buffered readback,
+per-pass tree, graceful degrade across all three tiers) — see its `DOC.md`.
 
 ---
 
@@ -352,8 +447,63 @@ for (const call of vc.drawCalls) pass.drawIndexed(call.indexCount, 1, call.first
 `beginPath`/`moveTo`/`lineTo`/`quadTo`/`cubicTo`/`closePath`, `pushTransform`
 (6-float column-major affine) / `popTransform`, `setId`.
 
+**Paths need not be closed.** `stroke()` on an open polyline (`beginPath` →
+`moveTo` → `lineTo`… → `stroke`) draws it open, with no closing segment; several
+`moveTo`s in one path make several sub-paths. `fill()` on an open path closes it
+implicitly, as canvas does.
+
+**Degenerate input is defined, not fatal.** These follow canvas where it had a
+sensible answer, but this is not a canvas-compatible API — don't infer behaviour
+it doesn't list:
+
+| Case | Behaviour |
+|---|---|
+| `lineTo` with no sub-path | acts as `moveTo` — starts one, draws no segment |
+| `quadTo`/`cubicTo` with no sub-path | starts one at the first control point, **draws** the curve |
+| segment after `closePath()` | new sub-path starts at the closed one's start point |
+| any non-finite (`NaN`/`Infinity`) coordinate, size, or transform | the call is ignored |
+| `arc` sweep past ±2π | clamped to one full turn |
+
+Non-finite input is ignored rather than rejected because the underlying
+tessellator *asserts* finiteness — and a Rust panic across the napi boundary
+aborts the process instead of throwing something JS can catch.
+
+**Transforms nest, innermost-first** (canvas/SVG order). `pushTransform` takes 6
+floats `[m00, m01, m10, m11, m20, m21]` — the same layout as canvas's
+`setTransform(a, b, c, d, e, f)`:
+
+```ts
+vc.pushTransform(new Float32Array([1, 0, 0, 1, 100, 0]));  // translate(100, 0)
+vc.pushTransform(new Float32Array([2, 0, 0, 2, 0, 0]));    // scale(2) INSIDE it
+// a point at (10, 10) is scaled first, then translated -> (120, 20)
+vc.popTransform();
+```
+
+`popTransform` on an empty stack is a no-op, and a non-finite matrix is ignored
+*but still pushes a level*, so a matching `popTransform` can't accidentally
+discard the enclosing transform.
+
+`setId(n)` tags every subsequent draw call with `n`, surfaced as `drawCalls[i].id`
+after `flush()`. That's the hook for per-call state (colour, transform) — the
+context owns geometry only. `metis-engine`'s `VectorText` uses it to index a
+colour palette. `drawCalls` come out in **staging order**; `flush()` does not
+sort or merge them by id.
+
+`flush()` with nothing staged **empties `drawCalls`** — it is not a no-op. To
+re-draw the previous geometry, skip `flush()` entirely and re-issue the existing
+`drawCalls` (the GPU buffers stay valid until the next `flush()`).
+
+**Cost: `drawText` tessellates every glyph outline on every call** — order
+100 µs+ for a short string, so a HUD that re-stages its text each frame at a few
+hundred fps will spend more time on text than on the scene. Glyph geometry is
+cached per font in font units, but the transform+copy into the output buffers is
+per call. `flush()` uploads to persistent buffers and leaves `drawCalls`
+populated, so if the text hasn't changed you can skip re-staging entirely and
+just re-issue the previous `drawCalls` (what `metis-engine`'s
+`VectorText.renderCached` / `DebugOverlay.due()` do).
+
 `metis-engine`'s `VectorText` wraps all of this (pipeline + ortho projection +
-flat paint colour) — prefer it if you're already in the engine.
+palette paint colours) — prefer it if you're already in the engine.
 
 ---
 

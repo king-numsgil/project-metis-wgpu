@@ -33,8 +33,11 @@ export class Mesh {
     readonly indexCount: number;
     /** Max local-space distance from (0,0,0) across all vertices — used to fit the shadow frustum around a mesh even when it isn't centered on its own origin (e.g. a room's floor at y=0). */
     readonly boundingRadius: number;
+    /** Debug name, as passed to the constructor. Names this mesh's GPU buffers and its per-draw zone in the profiler tree. */
+    readonly label: string | undefined;
 
     constructor(device: GpuDevice, data: MeshData, label?: string) {
+        this.label = label;
         let maxDistSq = 0;
         for (let i = 0; i < data.vertices.length; i += 12) {
             const x = data.vertices[i]!;

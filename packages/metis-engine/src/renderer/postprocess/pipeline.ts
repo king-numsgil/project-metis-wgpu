@@ -1,4 +1,5 @@
 import type { GpuCommandEncoder, GpuDevice, GPUTextureFormat, GpuTextureView } from "bun-webgpu-rs";
+import type { GpuProfiler } from "../debug/gpuProfiler.ts";
 import { AutoExposurePass } from "./autoExposure.ts";
 import { ExposureState } from "./exposureState.ts";
 import { LuminanceAveragePass } from "./luminanceAverage.ts";
@@ -16,6 +17,8 @@ export interface PostProcessFrameContext {
     width: number;
     height: number;
     deltaTime: number;
+    /** Optional GPU profiler; each pass hands it `timestampWrites`. Absent = no profiling, zero cost. */
+    profiler?: GpuProfiler;
 }
 
 /**

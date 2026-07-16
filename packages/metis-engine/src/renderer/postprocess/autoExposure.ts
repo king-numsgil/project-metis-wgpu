@@ -28,7 +28,10 @@ export class AutoExposurePass implements PostProcessPass {
         params.vec4(ctx.deltaTime, this.adaptationTau, this.exposureCompensation, 0);
         this.device.queue.writeBuffer(this.paramsBuffer, 0, params.toBytes());
 
-        const pass = encoder.beginComputePass({label: "metis-engine/auto-exposure-pass"});
+        const pass = encoder.beginComputePass({
+            label: "metis-engine/auto-exposure-pass",
+            timestampWrites: ctx.profiler?.pass("auto-exposure"),
+        });
         pass.setPipeline(this.pipeline);
         pass.setBindGroup(0, this.bindGroup);
         pass.dispatchWorkgroups(1);

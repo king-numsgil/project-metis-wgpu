@@ -1,16 +1,21 @@
 // Interactive windowed demo — ship exterior: hard directional sun, near-zero
-// ambient, a couple of point "running lights". WASD+QE to fly, Escape/close
-// to quit. Mirrors metis-game/src/index.ts's SDL event-loop pattern.
+// ambient, a couple of point "running lights". WASD+QE to fly, P toggles the
+// GPU profiler overlay, Escape/close to quit. Mirrors metis-game/src/index.ts's
+// SDL event-loop pattern.
 import { SdlEventType, SdlKeycode, sdlPollEvents } from "bun-webgpu-rs";
 import {
     ClusteredForwardRenderer,
     createDefaultPostProcessPipeline,
     createExteriorEnvironment,
     cube,
+    DebugOverlay,
     FrameLimiter,
+    GpuProfiler,
+    History,
     Material,
     Mesh,
     plane,
+    profileSpansToRows,
     RenderContext,
     Scene,
     uvSphere,
@@ -24,14 +29,41 @@ const FONT_PATH = new URL("../../../assets/JetBrainsMono-Regular.ttf", import.me
     "$1",
 );
 
-// Default present mode (mailbox). Uncapped frame limiter — construct with a
-// target fps (e.g. new FrameLimiter(60)) to cap for lower power.
-const ctx = await RenderContext.createWindowed("metis-engine — exterior demo", {width: 1280, height: 720});
+// `immediate` present mode: this is a development demo, so raw frame cost
+// matters more than tearing — it removes the present back-pressure that would
+// otherwise sit in getCurrentTexture() and skew the profiler's numbers. The
+// binding default stays `mailbox`, which is the right default for a real app.
+// Uncapped frame limiter — construct with a target fps (e.g. new
+// FrameLimiter(60)) to cap for lower power.
+const ctx = await RenderContext.createWindowed("metis-engine — exterior demo", {
+    width: 1280,
+    height: 720,
+    presentMode: "immediate",
+    profiling: true,
+});
 const limiter = new FrameLimiter();
 const forward = new ClusteredForwardRenderer(ctx.device);
 const post = createDefaultPostProcessPipeline(ctx.device);
 const hud = new VectorText(ctx.device, ctx.outputFormat);
 hud.loadFont("mono", FONT_PATH);
+
+// Profiling is opt-in twice over: null here if the GPU has no timestamp-query,
+// and even then nothing is measured until `forward.profiler` is assigned below.
+const profiler = GpuProfiler.create(ctx.device);
+const debug = new DebugOverlay(ctx.device, ctx.outputFormat);
+debug.loadFont("mono", FONT_PATH);
+const cpuHistory = new History(120);
+const gpuHistory = new History(120);
+let showProfiler = false;
+if (profiler) {
+    forward.profiler = profiler;
+    console.log(
+        `[demo] GPU profiler ready — press P. draw zones: ${profiler.canProfileDraws}, ` +
+            `measured frame total: ${profiler.canProfileFrameTotal}`,
+    );
+} else {
+    console.log("[demo] this adapter has no timestamp-query support — profiler unavailable");
+}
 
 const scene = new Scene();
 scene.environment = createExteriorEnvironment();
@@ -101,6 +133,9 @@ while (running) {
         if (e.type === SdlEventType.KeyDown) {
             if (e.keycode === SdlKeycode.Escape) {
                 running = false;
+            } else if (e.keycode === SdlKeycode.P && !keys.has(SdlKeycode.P)) {
+                showProfiler = !showProfiler;
+                keys.add(SdlKeycode.P);
             } else if (e.keycode !== undefined) {
                 keys.add(e.keycode);
             }
@@ -148,7 +183,9 @@ while (running) {
     vec3.add(scene.camera.position, forwardDir, scene.camera.target);
 
     const frame = ctx.beginFrame();
+    const encodeStart = performance.now();
     const encoder = ctx.device.createCommandEncoder();
+    profiler?.beginFrame(encoder);
     forward.render(encoder, ctx.targets, scene);
     post.pipeline.run(encoder, {
         device: ctx.device,
@@ -159,12 +196,56 @@ while (running) {
         width: ctx.width,
         height: ctx.height,
         deltaTime: dt,
+        profiler: profiler ?? undefined,
     });
-    hud.drawText("METIS-ENGINE // EXTERIOR — WASD+QE fly, arrows look, Esc quit", "mono", 16, 12, 24);
+    hud.drawText("METIS-ENGINE // EXTERIOR — WASD+QE fly, arrows look, P profiler, Esc quit", "mono", 16, 12, 24);
     hud.render(encoder, frame.view, ctx.width, ctx.height, [0.85, 0.95, 1.0, 1.0]);
+
+    cpuHistory.push(performance.now() - encodeStart);
+    if (profiler) {
+        gpuHistory.push(profiler.frameTotalMs);
+    }
+    if (showProfiler && profiler) {
+        // Staging re-tessellates every glyph, so rebuild at a human-readable
+        // rate and replay the geometry in between.
+        if (debug.due()) {
+            drawProfilerOverlay();
+        }
+        debug.render(encoder, frame.view, ctx.width, ctx.height);
+    }
+
+    // endFrame records the resolve/copy, so it must be encoded before submit;
+    // the readback itself is kicked from the next beginFrame.
+    profiler?.endFrame(encoder);
     ctx.device.queue.submit([encoder.finish()]);
     frame.present();
     await limiter.wait();
+}
+
+function drawProfilerOverlay() {
+    if (!profiler) {
+        return;
+    }
+    const x = ctx.width - 320;
+    debug.graph({
+        x,
+        y: 12,
+        width: 308,
+        height: 96,
+        title: "frame time",
+        unit: "ms",
+        series: [
+            {label: "gpu", values: gpuHistory},
+            {label: "cpu", values: cpuHistory},
+        ],
+    });
+    debug.tree({
+        x,
+        y: 118,
+        width: 308,
+        title: `GPU passes — ${profiler.frameTotalMs.toFixed(3)} ms`,
+        rows: profileSpansToRows(profiler.spans, profiler.frameTotalMs),
+    });
 }
 
 ctx.destroy();

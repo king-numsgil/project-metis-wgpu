@@ -14,33 +14,67 @@ import { mat4 } from "wgpu-matrix";
 import { Std140Writer } from "../shading/std140.ts";
 import vectorWgsl from "./wgsl/vector.wgsl" with { type: "text" };
 
+/** Linear (not sRGB) RGBA in 0..1 — the HDR targets and the swapchain both want linear. */
+export type Rgba = readonly [number, number, number, number];
+
+/**
+ * Upper bound on distinct colors in one `render()` call. Sized for the debug
+ * widgets (a handful of series colors + text + chrome); the palette buffer costs
+ * `MAX_PALETTE_COLORS * minUniformBufferOffsetAlignment` bytes (typically 16 KB),
+ * so raising it is cheap if a widget ever needs more.
+ */
+export const MAX_PALETTE_COLORS = 64;
+
 /**
  * Thin wrapper over bun-webgpu-rs's `VectorContext` for screen-space HUD
- * text: loads a TTF, exposes `drawText`, and composites the tessellated
- * glyph geometry with a flat paint color + orthographic pixel-space
- * projection. `VectorContext` is fully implemented in the native addon but
- * had no consumer anywhere in the repo before this — see
- * test/vectorText.smoke.ts for the standalone validation render.
+ * text and 2D debug vector graphics: loads a TTF, exposes `drawText`, and
+ * composites the tessellated geometry with an orthographic pixel-space
+ * projection.
+ *
+ * Color comes from a **palette indexed by `VectorContext.setId()`**. Tag
+ * geometry with `ctx.setId(i)` before filling it, pass an array of colors to
+ * `render()`, and each draw call is painted with `palette[id]`. Passing a
+ * single color instead paints everything with it (id is then ignored), which is
+ * the plain-HUD-text case.
  */
 export class VectorText {
     readonly context: VectorContext;
 
     private readonly device: GpuDevice;
     private readonly pipeline: GpuRenderPipeline;
-    private readonly uniformBuffer: GpuBuffer;
+    private readonly frameBuffer: GpuBuffer;
+    private readonly paletteBuffer: GpuBuffer;
     private readonly bindGroup: GpuBindGroup;
+    /** Dynamic-offset stride: one palette slot per alignment unit, not per 16 bytes. */
+    private readonly paletteStride: number;
+    private readonly paletteStaging: Uint8Array;
+    /** Palette from the last `render()`, so `renderCached` can repaint without re-staging. */
+    private lastPalette: readonly Rgba[] = [];
 
     constructor(device: GpuDevice, outputFormat: GPUTextureFormat) {
         this.device = device;
         this.context = new VectorContext(device);
 
+        // A dynamic offset must be a multiple of minUniformBufferOffsetAlignment,
+        // so each palette entry occupies a full alignment unit even though only
+        // its first 16 bytes (one vec4) are ever read.
+        this.paletteStride = Math.max(16, device.limits.minUniformBufferOffsetAlignment);
+        this.paletteStaging = new Uint8Array(this.paletteStride * MAX_PALETTE_COLORS);
+
         const bindGroupLayout = device.createBindGroupLayout({
             label: "metis-engine/vector-text-bgl",
-            entries: [{
-                binding: 0,
-                visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
-                buffer: {bindingType: "uniform"},
-            }],
+            entries: [
+                {
+                    binding: 0,
+                    visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+                    buffer: {bindingType: "uniform"},
+                },
+                {
+                    binding: 1,
+                    visibility: GPUShaderStage.FRAGMENT,
+                    buffer: {bindingType: "uniform", hasDynamicOffset: true, minBindingSize: 16},
+                },
+            ],
         });
         const module = device.createShaderModule({label: "metis-engine/vector-text-shader", code: vectorWgsl});
         this.pipeline = device.createRenderPipeline({
@@ -75,15 +109,25 @@ export class VectorText {
             primitive: {topology: "triangle-list"},
         });
 
-        this.uniformBuffer = device.createBuffer({
-            label: "metis-engine/vector-text-uniforms",
-            size: 80, // mat4 + vec4
+        this.frameBuffer = device.createBuffer({
+            label: "metis-engine/vector-text-frame",
+            size: 64, // mat4
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+        this.paletteBuffer = device.createBuffer({
+            label: "metis-engine/vector-text-palette",
+            size: this.paletteStride * MAX_PALETTE_COLORS,
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
         this.bindGroup = device.createBindGroup({
             label: "metis-engine/vector-text-bind-group",
             layout: bindGroupLayout,
-            entries: [{binding: 0, buffer: {buffer: this.uniformBuffer}}],
+            entries: [
+                {binding: 0, buffer: {buffer: this.frameBuffer}},
+                // size 16 (not the whole buffer) — the dynamic offset slides this
+                // 16-byte window over the palette.
+                {binding: 1, buffer: {buffer: this.paletteBuffer, size: 16}},
+            ],
         });
     }
 
@@ -102,9 +146,15 @@ export class VectorText {
     }
 
     /**
-     * Flushes pending draw commands and renders them into `view` with a flat
-     * `color`, using a top-left-origin, y-down pixel-space orthographic
-     * projection matching `drawText`'s (x, y) baseline coordinates.
+     * Flushes pending draw commands and renders them into `view`, using a
+     * top-left-origin, y-down pixel-space orthographic projection matching
+     * `drawText`'s (x, y) baseline coordinates.
+     *
+     * `paint` is either one color for everything, or a palette that each draw
+     * call indexes with the id it was tagged with via `context.setId()`. Ids at
+     * or past the palette's length (or >= `MAX_PALETTE_COLORS`) fall back to
+     * palette entry 0 rather than reading a stale slot.
+     *
      * `loadOp` defaults to `"load"` so text composites on top of whatever is
      * already in `view` (e.g. the tonemapped scene).
      */
@@ -113,7 +163,7 @@ export class VectorText {
         view: GpuTextureView,
         width: number,
         height: number,
-        color: [number, number, number, number] = [1, 1, 1, 1],
+        paint: Rgba | readonly Rgba[] = [1, 1, 1, 1],
         loadOp: "load" | "clear" = "load",
     ) {
         this.context.flush();
@@ -122,12 +172,38 @@ export class VectorText {
             return;
         }
 
+        const palette: readonly Rgba[] = typeof paint[0] === "number" ? [paint as Rgba] : (paint as readonly Rgba[]);
+        this.lastPalette = palette;
+        const used = Math.min(palette.length, MAX_PALETTE_COLORS);
+
         const proj = mat4.ortho(0, width, height, 0, -1, 1);
         const w = new Std140Writer();
         w.mat4(proj);
-        w.vec4(color[0], color[1], color[2], color[3]);
-        this.device.queue.writeBuffer(this.uniformBuffer, 0, w.toBytes());
+        this.device.queue.writeBuffer(this.frameBuffer, 0, w.toBytes());
 
+        // One writeBuffer for the whole palette: the staging array is laid out at
+        // the dynamic-offset stride so each color lands where its offset points.
+        const f32 = new Float32Array(this.paletteStaging.buffer);
+        for (let i = 0; i < used; i++) {
+            const c = palette[i]!;
+            const base = (i * this.paletteStride) / 4;
+            f32[base] = c[0];
+            f32[base + 1] = c[1];
+            f32[base + 2] = c[2];
+            f32[base + 3] = c[3];
+        }
+        this.device.queue.writeBuffer(this.paletteBuffer, 0, this.paletteStaging.subarray(0, used * this.paletteStride));
+
+        this.encodePass(encoder, view, loadOp, calls, used);
+    }
+
+    private encodePass(
+        encoder: GpuCommandEncoder,
+        view: GpuTextureView,
+        loadOp: "load" | "clear",
+        calls: ReadonlyArray<{firstIndex: number; indexCount: number; id: number}>,
+        used: number,
+    ) {
         const pass = encoder.beginRenderPass({
             label: "metis-engine/vector-text-pass",
             colorAttachments: [
@@ -140,15 +216,56 @@ export class VectorText {
             ],
         });
         pass.setPipeline(this.pipeline);
-        pass.setBindGroup(0, this.bindGroup);
         this.context.bindBuffers(pass);
+        let boundSlot = -1;
         for (const call of calls) {
+            const slot = call.id < used ? call.id : 0;
+            // drawCalls are in staging order — flush() does not group or merge by
+            // id — so this only skips the rebind for runs that happen to share a
+            // colour. Cheap either way; setBindGroup is not the cost here.
+            if (slot !== boundSlot) {
+                pass.setBindGroup(0, this.bindGroup, [slot * this.paletteStride]);
+                boundSlot = slot;
+            }
             pass.drawIndexed(call.indexCount, 1, call.firstIndex);
         }
         pass.end();
     }
 
+    /**
+     * Re-draws the geometry from the last `render()` without re-tessellating it.
+     *
+     * `flush()` uploads to persistent vertex/index buffers and leaves
+     * `drawCalls` populated, so replaying them is valid until the next `flush()`.
+     * Text is expensive to tessellate (every glyph outline, every call), which
+     * makes this the difference between a debug HUD that costs a fraction of a
+     * millisecond and one that costs tens.
+     *
+     * Only valid if **nothing has been staged since** the last `render()` — a
+     * staged-but-unflushed path would silently not appear.
+     */
+    renderCached(
+        encoder: GpuCommandEncoder,
+        view: GpuTextureView,
+        width: number,
+        height: number,
+        loadOp: "load" | "clear" = "load",
+    ) {
+        const calls = this.context.drawCalls;
+        if (calls.length === 0) {
+            return;
+        }
+        // The projection still has to be rewritten: the window may have resized
+        // since the geometry was built.
+        const proj = mat4.ortho(0, width, height, 0, -1, 1);
+        const w = new Std140Writer();
+        w.mat4(proj);
+        this.device.queue.writeBuffer(this.frameBuffer, 0, w.toBytes());
+        this.encodePass(encoder, view, loadOp, calls, Math.min(this.lastPalette.length, MAX_PALETTE_COLORS));
+    }
+
     destroy() {
-        this.uniformBuffer.destroy();
+        this.frameBuffer.destroy();
+        this.paletteBuffer.destroy();
     }
 }

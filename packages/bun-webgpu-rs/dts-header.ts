@@ -118,6 +118,48 @@ export type GPUStoreOp = 'store' | 'discard'
 
 export type GPUQueryType = 'occlusion' | 'timestamp'
 
+/**
+ * The WebGPU spec's feature set — https://www.w3.org/TR/webgpu/#gpufeaturename
+ * Anything here is portable to a browser implementation.
+ */
+export type GPUFeatureName =
+  | 'depth-clip-control'
+  | 'depth32float-stencil8'
+  | 'texture-compression-bc'
+  | 'texture-compression-bc-sliced-3d'
+  | 'texture-compression-etc2'
+  | 'texture-compression-astc'
+  | 'timestamp-query'
+  | 'indirect-first-instance'
+  | 'shader-f16'
+  | 'rg11b10ufloat-renderable'
+  | 'bgra8unorm-storage'
+  | 'float32-filterable'
+  | 'dual-source-blending'
+
+/**
+ * wgpu extensions with **no WebGPU spec equivalent**. They're separated from
+ * `GPUFeatureName` on purpose: code using one of these is native-only by
+ * construction and cannot run in a browser.
+ *
+ * Unlike spec features, support is genuinely patchy across backends — always
+ * `adapter.features.has(...)` before putting one in `requiredFeatures`, and
+ * keep a path that works without it.
+ *
+ * - `timestamp-query-inside-encoders` — `encoder.writeTimestamp()`, for timing
+ *   spans between passes.
+ * - `timestamp-query-inside-passes` — `pass.writeTimestamp()`, for timing
+ *   individual draws/dispatches inside one pass.
+ * - `multi-draw-indirect` — batched indirect draws from a GPU buffer.
+ * - `push-constants` — small inline uniforms via `setImmediates()`. Also needs
+ *   the `maxPushConstantSize` limit raised from its default of 0.
+ */
+export type GPUNativeFeatureName =
+  | 'timestamp-query-inside-encoders'
+  | 'timestamp-query-inside-passes'
+  | 'multi-draw-indirect'
+  | 'push-constants'
+
 export type GPUErrorFilter = 'validation' | 'out-of-memory' | 'internal'
 
 export type GPUDeviceLostReason = 'unknown' | 'destroyed'

@@ -9,6 +9,7 @@ import {
 } from "bun-webgpu-rs";
 import { AmbientOcclusion } from "../ao/ambientOcclusion.ts";
 import { AoTechnique } from "../ao/aoConfig.ts";
+import type { GpuProfiler } from "../debug/gpuProfiler.ts";
 import { DEPTH_FORMAT, HDR_COLOR_FORMAT, MSAA_SAMPLE_COUNT, type RenderTargets } from "../rhi/targets.ts";
 import { MESH_VERTEX_LAYOUT } from "../scene/mesh.ts";
 import type { Scene } from "../scene/scene.ts";
@@ -50,6 +51,21 @@ export class ClusteredForwardRenderer {
      * cascade 0 crisp without starving the far cascades.
      */
     cascadeSplitLambda = CASCADE_SPLIT_LAMBDA_DEFAULT;
+    /**
+     * Opt-in GPU profiling. Leave `undefined` (the default) and every pass
+     * encodes exactly as before — the hooks are `profiler?.` calls that cost
+     * nothing when absent.
+     *
+     * Assign a `GpuProfiler` and each pass gets `timestampWrites`; read the
+     * result back from `profiler.spans` and feed it to `DebugOverlay.tree` via
+     * `profileSpansToRows`. The profiler can only be constructed on a device
+     * that enabled `timestamp-query` (see `GpuProfiler.create`), so this can't
+     * silently produce validation errors.
+     *
+     * The caller must drive `beginFrame`/`endFrame` around its own encoder —
+     * the renderer only owns the passes, not the frame.
+     */
+    profiler?: GpuProfiler;
 
     private readonly device: GpuDevice;
     private readonly pipeline: GpuRenderPipeline;
@@ -147,16 +163,16 @@ export class ClusteredForwardRenderer {
     render(encoder: GpuCommandEncoder, targets: RenderTargets, scene: Scene) {
         this.writeFrameUniforms(scene);
         this.culler.write(scene, targets);
-        this.shadows.render(encoder, scene, this.shadowDistance, this.cascadeSplitLambda);
-        this.culler.cull(encoder);
+        this.shadows.render(encoder, scene, this.shadowDistance, this.cascadeSplitLambda, this.profiler);
+        this.culler.cull(encoder, this.profiler);
 
         // Ambient occlusion (feeds the forward pass's ambient term). `None`
         // clears the result to white so the forward multiply is a no-op.
         this.ao.ensureSize(targets.width, targets.height);
         if (this.ao.technique === AoTechnique.None) {
-            this.ao.clearToWhite(encoder);
+            this.ao.clearToWhite(encoder, this.profiler);
         } else {
-            this.ao.render(encoder, scene, targets);
+            this.ao.render(encoder, scene, targets, this.profiler);
         }
 
         const frameBindGroup = this.device.createBindGroup({
@@ -176,6 +192,7 @@ export class ClusteredForwardRenderer {
 
         const pass = encoder.beginRenderPass({
             label: "metis-engine/forward-pass",
+            timestampWrites: this.profiler?.pass("forward"),
             colorAttachments: [
                 {
                     view: targets.hdrColorMultisampledView,
@@ -197,12 +214,16 @@ export class ClusteredForwardRenderer {
         pass.setBindGroup(0, frameBindGroup);
         pass.setBindGroup(3, this.culler.bindGroup);
 
-        for (const instance of scene.instances) {
+        scene.instances.forEach((instance, i) => {
             pass.setBindGroup(1, instance.material.getBindGroup(this.device, this.materialBindGroupLayout));
             pass.setBindGroup(2, instance.getModelBindGroup(this.device, this.modelBindGroupLayout));
             instance.mesh.bind(pass);
+            // Per-draw zones nest under the "forward" span. No-ops unless the
+            // device enabled timestamp-query-inside-passes.
+            this.profiler?.beginZone(pass, instance.mesh.label ?? `instance ${i}`);
             instance.mesh.draw(pass);
-        }
+            this.profiler?.endZone(pass);
+        });
 
         pass.end();
     }

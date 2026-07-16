@@ -13,6 +13,7 @@ import {
     type GpuTextureView,
 } from "bun-webgpu-rs";
 import { mat4, type Mat4Arg, vec3 } from "wgpu-matrix";
+import type { GpuProfiler } from "../debug/gpuProfiler.ts";
 import { MESH_VERTEX_LAYOUT } from "../scene/mesh.ts";
 import type { Scene } from "../scene/scene.ts";
 import { Std140Writer } from "./std140.ts";
@@ -282,7 +283,13 @@ export class ShadowCascades {
      * moment resolve, then cascades 1..N single-sample depth into the array. Fit
      * to `[camera.near, shadowDistance]` by the practical split (`splitLambda`).
      */
-    render(encoder: GpuCommandEncoder, scene: Scene, shadowDistance: number, splitLambda: number) {
+    render(
+        encoder: GpuCommandEncoder,
+        scene: Scene,
+        shadowDistance: number,
+        splitLambda: number,
+        profiler?: GpuProfiler,
+    ) {
         const cascades = this.computeCascades(scene, shadowDistance, splitLambda);
 
         // Per-cascade render matrix (one 64-byte mat4 per 256-byte slice).
@@ -313,6 +320,7 @@ export class ShadowCascades {
         // Cascade 0 (MSM): multisampled depth -> per-texel moment resolve.
         const depth0 = encoder.beginRenderPass({
             label: "metis-engine/cascade0-depth-pass",
+            timestampWrites: profiler?.pass("cascade0-depth"),
             colorAttachments: [],
             depthStencilAttachment: {
                 view: this.cascade0DepthMsaaView,
@@ -327,6 +335,7 @@ export class ShadowCascades {
 
         const resolvePass = encoder.beginRenderPass({
             label: "metis-engine/cascade0-moment-resolve-pass",
+            timestampWrites: profiler?.pass("cascade0-moment-resolve"),
             colorAttachments: [
                 {view: this.momentsView, loadOp: "clear", storeOp: "store", clearValue: {r: 1, g: 1, b: 1, a: 1}},
             ],
@@ -340,6 +349,7 @@ export class ShadowCascades {
         for (let c = 1; c < CASCADE_COUNT; c++) {
             const pass = encoder.beginRenderPass({
                 label: `metis-engine/pcf-cascade-${c}-depth-pass`,
+                timestampWrites: profiler?.pass(`pcf-cascade-${c}-depth`),
                 colorAttachments: [],
                 depthStencilAttachment: {
                     view: this.pcfDepthLayerViews[c - 1]!,

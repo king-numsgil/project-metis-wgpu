@@ -29,6 +29,7 @@ export class TonemapPass implements PostProcessPass {
 
         const pass = encoder.beginRenderPass({
             label: "metis-engine/tonemap-pass",
+            timestampWrites: ctx.profiler?.pass("tonemap"),
             colorAttachments: [
                 {
                     view: ctx.outputView,

@@ -11,7 +11,7 @@ what `examples/`, `test/`, `bench/`, and `metis-game` import from
 (`import { ClusteredForwardRenderer, … } from "metis-engine/renderer"`). The root
 `metis-engine` barrel re-exports the renderer as the `Renderer` namespace and the
 ECS as `ECS`. The archetype **ECS** (`src/ecs/`, imported as `metis-engine/ecs`)
-is separate and covered in §11; it is not yet wired to the renderer.
+is separate and covered in §12; it is not yet wired to the renderer.
 
 > **Scope / trust.** Signatures here are transcribed from source. If a task
 > depends on an exact signature, spot-check that one symbol. If you change a
@@ -186,6 +186,7 @@ interface RenderContextOptions {
     backend?: "vulkan" | "dx12" | "metal" | "gl";
     label?: string;
     presentMode?: GPUPresentMode; // windowed only; omit → binding default "mailbox"
+    profiling?: boolean;          // request the timestamp-query features GpuProfiler needs (§10)
 }
 
 static createWindowed(title: string, options: RenderContextOptions): Promise<RenderContext>
@@ -198,7 +199,7 @@ width: number; height: number;
 
 get sdlWindow(): SdlWindow | null;
 get isWindowed(): boolean;
-get outputFormat(): GPUTextureFormat;   // swapchain preferred format, or "rgba8unorm" offscreen
+get outputFormat(): GPUTextureFormat;   // swapchain preferred format (cached), or "rgba8unorm" offscreen
 get captureTexture(): GpuTexture | null; // offscreen only; read back with takeScreenshot
 
 beginFrame(): FrameTarget;  // { view, format, present() } — call present() AFTER queue.submit()
@@ -538,7 +539,7 @@ the FFI boundary, and concurrent loads decode in parallel.
 const hud = new VectorText(device, ctx.outputFormat);
 hud.loadFont("mono", absolutePathToTtf);
 hud.drawText(text, "mono", sizePx, x, y);      // y is the baseline, y-down from top-left
-hud.render(encoder, frame.view, width, height, color = [1,1,1,1], loadOp = "load");
+hud.render(encoder, frame.view, width, height, paint = [1,1,1,1], loadOp = "load");
 hud.destroy();
 ```
 
@@ -546,29 +547,153 @@ Call `render()` **after** the post-process chain so text composites on top
 (`loadOp: "load"`). `drawText` already calls the underlying `fill()`; `render()`
 no-ops if nothing was staged.
 
+**`paint` is one colour or a palette.** Pass a single `Rgba` and everything is
+that colour. Pass an array and each draw call is painted with `palette[id]`,
+where `id` is whatever `context.setId(id)` was set to when the geometry was
+staged (ids at or past the palette length fall back to slot 0;
+`MAX_PALETTE_COLORS` = 64):
+
+```ts
+hud.context.setId(0); hud.drawText("ok",  "mono", 12, 10, 20);
+hud.context.setId(1); hud.drawText("bad", "mono", 12, 10, 40);
+hud.render(encoder, view, w, h, [[0,1,0,1], [1,0,0,1]]);   // green, red
+```
+
+Colours are **linear**, and `render()` targets the tonemapped output — don't draw
+into the HDR target or ACES will wash them out.
+
+```ts
+hud.renderCached(encoder, view, width, height, loadOp = "load");
+```
+
+Re-draws the last `render()`'s geometry **without re-tessellating**. `drawText`
+costs 100 microseconds+ per string (see `bun-webgpu-rs/DOC.md` §9), so a HUD that
+re-stages every frame can cost more than the scene. Only valid if nothing has
+been staged since the last `render()`. `DebugOverlay` (§10) automates this.
+
 ---
 
-## 10. Commands
+## 10. `debug/` — profiler + widgets
+
+Opt-in, off by default, and nothing here runs unless you wire it.
+
+### `DebugOverlay` — graph + tree widgets
+
+```ts
+const debug = new DebugOverlay(device, ctx.outputFormat);
+debug.loadFont("mono", absolutePathToTtf);
+
+// Per frame, after the post chain has written frame.view:
+if (debug.due()) {                       // throttles re-staging; see below
+    debug.graph({ x, y, width, height, title: "frame time", unit: "ms",
+                  series: [{ label: "gpu", values: gpuHistory }] });
+    debug.tree({ x, y, width, title: "GPU passes", rows });
+    debug.label("some text", x, y);
+}
+debug.render(encoder, frame.view, width, height);
+debug.destroy();
+```
+
+- `graph(spec)` — line plot of one or more series over a shared Y axis. `values`
+  is a `number[]` or a `History`. Omit `max` to autoscale.
+- `tree(spec)` — hierarchical rows with indent guides, a proportional bar
+  (`fraction` 0..1) and a right-aligned `value` string. Height is derived from
+  the row count.
+- `label(text, x, y, color?, fontSize?)` — plain text.
+- `History(capacity)` — rolling sample buffer (`push`, `values()`, `mean`, `max`,
+  `latest`), the shape `graph` plots.
+- `DEBUG_THEME` — default colours (`panel`/`border`/`grid`/`text`/`good`/`warn`/
+  `bad`/`series[]`).
+
+**`due()` is load-bearing, not optional.** Staging tessellates every glyph;
+`due()` returns true at most every `rebuildIntervalMs` (default 100), and
+`render()` replays the previous geometry on the frames it returns false.
+Measured on `bench/lights.ts --profile`: ~20 ms -> ~5.4 ms mean CPU encode. Stage
+unconditionally only if a widget must be frame-exact.
+
+### `GpuProfiler` — per-pass GPU timing
+
+```ts
+// 1. The device must enable the features (RenderContext does it with profiling: true,
+//    or filter them yourself for a caller-owned device):
+const device = await adapter.requestDevice({ requiredFeatures: gpuProfilerFeatures(adapter) });
+
+// 2. null if the device has no timestamp-query — always handle it.
+const profiler = GpuProfiler.create(device);
+if (profiler) renderer.profiler = profiler;   // nothing is measured until this is set
+
+// 3. Per frame, around your own encoder:
+profiler?.beginFrame(encoder);
+renderer.render(encoder, targets, scene);
+post.pipeline.run(encoder, { ..., profiler: profiler ?? undefined });
+profiler?.endFrame(encoder);                  // BEFORE submit
+device.queue.submit([encoder.finish()]);
+
+// 4. Read results (a few frames stale) and show them:
+debug.tree({ x, y, width, title: `GPU — ${profiler.frameTotalMs.toFixed(3)} ms`,
+             rows: profileSpansToRows(profiler.spans, profiler.frameTotalMs) });
+```
+
+| Member | Meaning |
+|---|---|
+| `spans: ProfileSpan[]` | `{ label, gpuMs, children }` tree for the last completed frame |
+| `frameTotalMs` | measured whole-frame span, or the sum of passes if unavailable |
+| `canProfileDraws` | `timestamp-query-inside-passes` — per-draw zones under each pass |
+| `canProfileFrameTotal` | `timestamp-query-inside-encoders` — a real total incl. gaps between passes |
+| `beginFrame(encoder)` / `endFrame(encoder)` | frame bracket; `endFrame` must precede `submit` |
+| `beginZone(pass, label)` / `endZone(pass)` | manual per-draw zones; no-ops without `canProfileDraws` |
+| `destroy()` | releases the query set + readback ring |
+
+`gpuProfilerSupport(adapter)` reports the three tiers; `gpuProfilerFeatures(adapter)`
+returns exactly the supported ones to pass to `requiredFeatures` (requesting an
+unsupported feature fails `requestDevice`).
+
+**Results lag the live frame by ~2-3 frames** — readback is ring-buffered
+(`RING_SIZE` 3) so it never stalls the pipeline. That's the point: blocking to
+read this frame's timings would distort the timings.
+
+**Three tiers, degrading cleanly.** With only `timestamp-query` you get per-pass
+timing and a summed total; `+inside-encoders` gives a measured total that
+includes the gaps between passes; `+inside-passes` adds per-draw zones nested
+under `forward`. Every tier is checked against the **device**, not the adapter —
+a feature the adapter supports but the caller never requested would be a
+validation error, which this binding only prints to stderr.
+
+`profileSpansToRows(spans, totalMs)` converts the tree into `tree()` rows,
+grading each span green -> amber -> red by its share of the frame (a span that
+*is* the whole frame stays neutral).
+
+---
+
+## 11. Commands
 
 ```powershell
 bun run fixture          # headless render + screenshot validation -> test/output/*.png
-bun run demo:exterior    # interactive; WASD+QE fly, arrows look, Esc quit
+bun run demo:exterior    # interactive; WASD+QE fly, arrows look, P profiler, Esc quit
 bun run demo:interior    # + O cycles AO technique
 bun run bench:lights     # windowed light benchmark (see bench/lights.ts header for flags)
 bunx tsc --noEmit        # type-check
 ```
 
 There is no `bun test` suite for the whole package; `test/fixture.ts` is the
-automated check and `test/ao.test.ts` covers the AO kernels + a GPU-readback
-assertion. Run them manually.
+automated check, `test/ao.test.ts` covers the AO kernels + a GPU-readback
+assertion, `test/debugWidgets.smoke.ts` asserts the profiler's per-pass timings
+are non-zero and renders both widgets, and `test/vectorText.smoke.ts` covers text
++ the colour palette. Run them manually.
 
 `bench/lights.ts` flags: `--lights N` (≤256), `--duration S`, `--warmup S`,
-`--width`, `--height`, `--fps N` (`--vsync` = `--fps 60`). Uncapped by default so
-timings are real; the cap is applied after GPU timing, so it never skews numbers.
+`--width`, `--height`, `--fps N` (`--vsync` = `--fps 60`), `--profile` (per-pass
+GPU timings + widgets). Uncapped by default so timings are real; the cap is
+applied after GPU timing, so it never skews numbers.
+
+**The demos and the bench use `presentMode: "immediate"`** — tearing doesn't
+matter for development, and it keeps present back-pressure out of
+`getCurrentTexture()` where it would skew frame timing. The engine/binding
+default is still `"mailbox"`, which is the right default for a real app.
 
 ---
 
-## 11. `ecs/` — archetype ECS (Structure-of-Arrays)
+## 12. `ecs/` — archetype ECS (Structure-of-Arrays)
 
 Imported from **`metis-engine/ecs`** (or the `ECS` namespace off the root barrel).
 This is **storage only** — no systems, no scheduler, and **no renderer

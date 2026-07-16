@@ -91,6 +91,7 @@ pub(crate) fn limits_to_js(l: &wgpu::Limits) -> GpuSupportedLimits {
 #[napi(object)]
 pub struct GpuDeviceDescriptor {
     pub label: Option<String>,
+    #[napi(ts_type = "Array<GPUFeatureName | GPUNativeFeatureName>")]
     pub required_features: Option<Vec<String>>,
     pub required_limits: Option<GpuRequiredLimits>,
     pub default_queue: Option<GpuQueueDescriptor>,
@@ -130,6 +131,14 @@ pub struct GpuRequiredLimits {
     pub max_compute_workgroup_size_y: Option<u32>,
     pub max_compute_workgroup_size_z: Option<u32>,
     pub max_compute_workgroups_per_dimension: Option<u32>,
+    /// Bytes of push-constant data a pipeline layout may declare. Defaults to
+    /// **0**, so requesting the `push-constants` feature without also raising
+    /// this yields a device that accepts no push constants at all — set both.
+    ///
+    /// Reported back on `limits` as `maxImmediateSize`: this is wgpu's
+    /// `max_push_constant_size`, which the WebGPU spec later renamed to
+    /// "immediate size". Same limit, two names.
+    pub max_push_constant_size: Option<u32>,
 }
 
 fn required_limits_to_wgpu(r: &GpuRequiredLimits) -> wgpu::Limits {
@@ -161,6 +170,7 @@ fn required_limits_to_wgpu(r: &GpuRequiredLimits) -> wgpu::Limits {
     if let Some(v) = r.max_compute_workgroup_size_y { l.max_compute_workgroup_size_y = v; }
     if let Some(v) = r.max_compute_workgroup_size_z { l.max_compute_workgroup_size_z = v; }
     if let Some(v) = r.max_compute_workgroups_per_dimension { l.max_compute_workgroups_per_dimension = v; }
+    if let Some(v) = r.max_push_constant_size { l.max_push_constant_size = v; }
     l
 }
 
@@ -218,9 +228,7 @@ impl GpuAdapter {
             label = desc.label.clone();
             if let Some(ref feats) = desc.required_features {
                 for f in feats {
-                    if let Some(wf) = convert::feature_to_wgpu(f) {
-                        required_features |= wf;
-                    }
+                    required_features |= convert::feature_to_wgpu(f)?;
                 }
             }
             if let Some(ref lim) = desc.required_limits {
@@ -230,8 +238,6 @@ impl GpuAdapter {
                 queue_label = qd.label.clone();
             }
         }
-
-        required_features |= wgpu::Features::PUSH_CONSTANTS;
 
         let (device, queue) = adapter
             .request_device(

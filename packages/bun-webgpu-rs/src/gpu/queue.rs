@@ -20,6 +20,18 @@ impl GpuQueue {
         self.label.clone()
     }
 
+    /// Nanoseconds per timestamp-query tick — the multiplier that turns the raw
+    /// `u64` deltas written by `writeTimestamp` / `timestampWrites` into real
+    /// time. Meaningless unless the `timestamp-query` feature is enabled, and
+    /// only comparable between two timestamps from the same queue submission.
+    ///
+    /// Not in the WebGPU spec, which has no way to interpret timestamp values
+    /// at all; wgpu exposes the period instead.
+    #[napi]
+    pub fn get_timestamp_period(&self) -> f64 {
+        self.inner.get_timestamp_period() as f64
+    }
+
     #[napi]
     pub fn submit(&self, command_buffers: Vec<Reference<GpuCommandBuffer>>) -> napi::Result<()> {
         let mut bufs: Vec<wgpu::CommandBuffer> = Vec::with_capacity(command_buffers.len());

@@ -12,6 +12,7 @@ import {
     type GpuTextureView,
 } from "bun-webgpu-rs";
 import { mat4 } from "wgpu-matrix";
+import type { GpuProfiler } from "../debug/gpuProfiler.ts";
 import type { RenderTargets } from "../rhi/targets.ts";
 import { MESH_VERTEX_LAYOUT } from "../scene/mesh.ts";
 import type { Scene } from "../scene/scene.ts";
@@ -254,9 +255,10 @@ export class AmbientOcclusion {
     }
 
     /** Clears `resultView` to white (fully open) — used when the technique is `None`. */
-    clearToWhite(encoder: GpuCommandEncoder) {
+    clearToWhite(encoder: GpuCommandEncoder, profiler?: GpuProfiler) {
         const pass = encoder.beginRenderPass({
             label: "metis-engine/ao-clear",
+            timestampWrites: profiler?.pass("ao-clear"),
             colorAttachments: [
                 {view: this.aoResultView, loadOp: "clear", storeOp: "store", clearValue: {r: 1, g: 1, b: 1, a: 1}},
             ],
@@ -265,12 +267,13 @@ export class AmbientOcclusion {
     }
 
     /** Runs the prepass + selected AO technique + blur, leaving the result in `resultView`. Assumes `technique !== None`. */
-    render(encoder: GpuCommandEncoder, scene: Scene, _targets: RenderTargets) {
+    render(encoder: GpuCommandEncoder, scene: Scene, _targets: RenderTargets, profiler?: GpuProfiler) {
         this.writeUniforms(scene);
 
         // Geometry prepass -> view-space normals + depth.
         const prepass = encoder.beginRenderPass({
             label: "metis-engine/ao-prepass",
+            timestampWrites: profiler?.pass("ao-prepass"),
             colorAttachments: [
                 {view: this.normalView, loadOp: "clear", storeOp: "store", clearValue: {r: 0, g: 0, b: 0, a: 0}},
             ],
@@ -293,6 +296,7 @@ export class AmbientOcclusion {
         // Occlusion pass -> raw AO.
         const aoPass = encoder.beginRenderPass({
             label: "metis-engine/ao-compute",
+            timestampWrites: profiler?.pass("ao-compute"),
             colorAttachments: [
                 {view: this.aoRawView, loadOp: "clear", storeOp: "store", clearValue: {r: 1, g: 1, b: 1, a: 1}},
             ],
@@ -305,6 +309,7 @@ export class AmbientOcclusion {
         // Denoise blur -> result.
         const blur = encoder.beginRenderPass({
             label: "metis-engine/ao-blur",
+            timestampWrites: profiler?.pass("ao-blur"),
             colorAttachments: [
                 {view: this.aoResultView, loadOp: "clear", storeOp: "store", clearValue: {r: 1, g: 1, b: 1, a: 1}},
             ],

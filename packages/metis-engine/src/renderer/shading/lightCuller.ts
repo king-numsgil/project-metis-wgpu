@@ -9,6 +9,7 @@ import {
     GPUShaderStage,
 } from "bun-webgpu-rs";
 import { mat4, vec3 } from "wgpu-matrix";
+import type { GpuProfiler } from "../debug/gpuProfiler.ts";
 import type { RenderTargets } from "../rhi/targets.ts";
 import type { Scene } from "../scene/scene.ts";
 import {
@@ -205,14 +206,20 @@ export class LightCuller {
     }
 
     /** Records the cluster-build + light-cull compute passes. Call after `write`, before the forward pass. */
-    cull(encoder: GpuCommandEncoder) {
-        const buildPass = encoder.beginComputePass({label: "metis-engine/cluster-build-pass"});
+    cull(encoder: GpuCommandEncoder, profiler?: GpuProfiler) {
+        const buildPass = encoder.beginComputePass({
+            label: "metis-engine/cluster-build-pass",
+            timestampWrites: profiler?.pass("cluster-build"),
+        });
         buildPass.setPipeline(this.buildPipeline);
         buildPass.setBindGroup(0, this.buildBindGroup);
         buildPass.dispatchWorkgroups(DISPATCH_GROUPS);
         buildPass.end();
 
-        const cullPass = encoder.beginComputePass({label: "metis-engine/light-cull-pass"});
+        const cullPass = encoder.beginComputePass({
+            label: "metis-engine/light-cull-pass",
+            timestampWrites: profiler?.pass("light-cull"),
+        });
         cullPass.setPipeline(this.cullPipeline);
         cullPass.setBindGroup(0, this.cullBindGroup);
         cullPass.dispatchWorkgroups(DISPATCH_GROUPS);

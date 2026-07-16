@@ -118,6 +118,48 @@ export type GPUStoreOp = 'store' | 'discard'
 
 export type GPUQueryType = 'occlusion' | 'timestamp'
 
+/**
+ * The WebGPU spec's feature set — https://www.w3.org/TR/webgpu/#gpufeaturename
+ * Anything here is portable to a browser implementation.
+ */
+export type GPUFeatureName =
+  | 'depth-clip-control'
+  | 'depth32float-stencil8'
+  | 'texture-compression-bc'
+  | 'texture-compression-bc-sliced-3d'
+  | 'texture-compression-etc2'
+  | 'texture-compression-astc'
+  | 'timestamp-query'
+  | 'indirect-first-instance'
+  | 'shader-f16'
+  | 'rg11b10ufloat-renderable'
+  | 'bgra8unorm-storage'
+  | 'float32-filterable'
+  | 'dual-source-blending'
+
+/**
+ * wgpu extensions with **no WebGPU spec equivalent**. They're separated from
+ * `GPUFeatureName` on purpose: code using one of these is native-only by
+ * construction and cannot run in a browser.
+ *
+ * Unlike spec features, support is genuinely patchy across backends — always
+ * `adapter.features.has(...)` before putting one in `requiredFeatures`, and
+ * keep a path that works without it.
+ *
+ * - `timestamp-query-inside-encoders` — `encoder.writeTimestamp()`, for timing
+ *   spans between passes.
+ * - `timestamp-query-inside-passes` — `pass.writeTimestamp()`, for timing
+ *   individual draws/dispatches inside one pass.
+ * - `multi-draw-indirect` — batched indirect draws from a GPU buffer.
+ * - `push-constants` — small inline uniforms via `setImmediates()`. Also needs
+ *   the `maxPushConstantSize` limit raised from its default of 0.
+ */
+export type GPUNativeFeatureName =
+  | 'timestamp-query-inside-encoders'
+  | 'timestamp-query-inside-passes'
+  | 'multi-draw-indirect'
+  | 'push-constants'
+
 export type GPUErrorFilter = 'validation' | 'out-of-memory' | 'internal'
 
 export type GPUDeviceLostReason = 'unknown' | 'destroyed'
@@ -172,6 +214,17 @@ export declare class GpuCommandEncoder {
   copyTextureToBuffer(source: GpuImageCopyTexture, destination: GpuImageCopyBuffer, copySize: GpuExtent3D): void
   copyTextureToTexture(source: GpuImageCopyTexture, destination: GpuImageCopyTexture, copySize: GpuExtent3D): void
   clearBuffer(buffer: GpuBuffer, offset?: number | undefined | null, size?: number | undefined | null): void
+  /**
+   * Writes a timestamp into `querySet` at this point in the encoder's command
+   * stream — i.e. *between* passes, measuring a span that brackets whole
+   * passes plus the copies between them.
+   *
+   * Native-only, and needs both `timestamp-query` and
+   * `timestamp-query-inside-encoders`. Calling it without them is a
+   * validation error, which this binding only prints to stderr — gate it on
+   * `adapter.features.has("timestamp-query-inside-encoders")`.
+   */
+  writeTimestamp(querySet: GpuQuerySet, queryIndex: number): void
   resolveQuerySet(querySet: GpuQuerySet, firstQuery: number, queryCount: number, destination: GpuBuffer, destinationOffset: number): void
   pushDebugGroup(groupLabel: string): void
   popDebugGroup(): void
@@ -188,6 +241,17 @@ export declare class GpuComputePassEncoder {
   insertDebugMarker(markerLabel: string): void
   dispatchWorkgroupsIndirect(indirectBuffer: GpuBuffer, indirectOffset: number): void
   setImmediates(offset: number, data: Uint8Array): void
+  /**
+   * Writes a timestamp into `querySet` at the point the GPU reaches this
+   * command *within* the pass — e.g. between two dispatches that
+   * `timestampWrites` would lump together.
+   *
+   * Native-only, and needs both `timestamp-query` and
+   * `timestamp-query-inside-passes`. Calling it without them is a validation
+   * error, which this binding only prints to stderr — gate it on
+   * `adapter.features.has("timestamp-query-inside-passes")`.
+   */
+  writeTimestamp(querySet: GpuQuerySet, queryIndex: number): void
   end(): void
 }
 
@@ -253,6 +317,16 @@ export declare class GpuQuerySet {
 
 export declare class GpuQueue {
   get label(): string | null
+  /**
+   * Nanoseconds per timestamp-query tick — the multiplier that turns the raw
+   * `u64` deltas written by `writeTimestamp` / `timestampWrites` into real
+   * time. Meaningless unless the `timestamp-query` feature is enabled, and
+   * only comparable between two timestamps from the same queue submission.
+   *
+   * Not in the WebGPU spec, which has no way to interpret timestamp values
+   * at all; wgpu exposes the period instead.
+   */
+  getTimestampPeriod(): number
   submit(commandBuffers: Array<GpuCommandBuffer>): void
   writeBuffer(buffer: GpuBuffer, bufferOffset: number, data: Uint8Array, dataOffset?: number | undefined | null, size?: number | undefined | null): void
   writeTexture(destination: GpuImageCopyTexture, data: Uint8Array, dataLayout: GpuImageDataLayout, size: GpuExtent3D): void
@@ -278,6 +352,17 @@ export declare class GpuRenderPassEncoder {
   beginOcclusionQuery(queryIndex: number): void
   endOcclusionQuery(): void
   setImmediates(offset: number, data: Uint8Array): void
+  /**
+   * Writes a timestamp into `querySet` at the point the GPU reaches this
+   * command *within* the pass — the granularity `timestampWrites` can't give
+   * you, since that only brackets the pass as a whole.
+   *
+   * Native-only, and needs both `timestamp-query` and
+   * `timestamp-query-inside-passes`. Calling it without them is a validation
+   * error, which this binding only prints to stderr — gate it on
+   * `adapter.features.has("timestamp-query-inside-passes")`.
+   */
+  writeTimestamp(querySet: GpuQuerySet, queryIndex: number): void
   end(): void
 }
 
@@ -299,10 +384,10 @@ export declare class GpuShaderModule {
  */
 export declare class GpuSupportedFeatures {
   get size(): number
-  has(key: string): boolean
+  has(key: GPUFeatureName | GPUNativeFeatureName): boolean
   /** Returns an iterator-compatible array of feature name strings (keys == values for a set). */
-  keys(): Array<string>
-  values(): Array<string>
+  keys(): Array<GPUFeatureName | GPUNativeFeatureName>
+  values(): Array<GPUFeatureName | GPUNativeFeatureName>
   /** Returns `[[name, name], ...]` pairs (set entries: key === value). */
   entries(): Array<Array<string>>
   /**
@@ -313,7 +398,17 @@ export declare class GpuSupportedFeatures {
 }
 
 export declare class GpuSurface {
-  /** Returns the adapter's preferred texture format for this surface. */
+  /**
+   * Returns the adapter's preferred texture format for this surface.
+   *
+   * **Call this once at setup, never per frame.** It is not a cheap getter:
+   * `get_capabilities` is a window-system round-trip (measured at ~6 ms on a
+   * GTX 1070 / Vulkan / Windows), because it re-queries the surface's formats,
+   * present modes and alpha modes from the driver every call. The result is a
+   * property of the surface+adapter pair and doesn't change with window size,
+   * so cache it — a render pipeline is built against one format anyway, so a
+   * value that could change mid-run would be a bug, not a feature.
+   */
   getPreferredFormat(): GPUTextureFormat
   /**
    * Configure the swapchain. Must be called before the first `getCurrentTexture()` and
@@ -533,6 +628,9 @@ export declare class SdlWindow {
  *    b. `bindBuffers(pass)` — sets vertex buffer (slot 0, stride 16,
  *       layout `[x, y, u, v]`) and index buffer (Uint32) on the pass.
  *    c. Iterate `drawCalls`, set per-call bind groups, call `drawIndexed`.
+ *
+ * Paths need not be closed: `stroke()` on an open path draws it open, and
+ * `fill()` closes it implicitly (as canvas does).
  */
 export declare class VectorContext {
   /**
@@ -549,9 +647,15 @@ export declare class VectorContext {
    */
   setId(id: number): void
   /**
-   * Push a 2-D affine transform onto the stack, composing it with the
+   * Push a 2-D affine transform onto the stack, nesting it *inside* the
    * current top.  `matrix` is 6 floats in column-major order:
-   * `[m00, m01, m10, m11, m20, m21]`.
+   * `[m00, m01, m10, m11, m20, m21]` — the same layout as canvas's
+   * `setTransform(a, b, c, d, e, f)`.
+   *
+   * Nesting means a point is transformed by the innermost (most recently
+   * pushed) transform first, then outward — so pushing `translate(100, 0)`
+   * and then `scale(2)` draws a point at `(10, 10)` at `(120, 20)`: scaled in
+   * the translated group's local space. This matches canvas/SVG.
    */
   pushTransform(matrix: Float32Array): void
   popTransform(): void
@@ -788,7 +892,7 @@ export interface GpuDepthStencilState {
 
 export interface GpuDeviceDescriptor {
   label?: string
-  requiredFeatures?: Array<string>
+  requiredFeatures?: Array<GPUFeatureName | GPUNativeFeatureName>
   requiredLimits?: GpuRequiredLimits
   defaultQueue?: GpuQueueDescriptor
 }
@@ -970,6 +1074,16 @@ export interface GpuRequiredLimits {
   maxComputeWorkgroupSizeY?: number
   maxComputeWorkgroupSizeZ?: number
   maxComputeWorkgroupsPerDimension?: number
+  /**
+   * Bytes of push-constant data a pipeline layout may declare. Defaults to
+   * **0**, so requesting the `push-constants` feature without also raising
+   * this yields a device that accepts no push constants at all — set both.
+   *
+   * Reported back on `limits` as `maxImmediateSize`: this is wgpu's
+   * `max_push_constant_size`, which the WebGPU spec later renamed to
+   * "immediate size". Same limit, two names.
+   */
+  maxPushConstantSize?: number
 }
 
 export interface GpuSamplerBindingLayout {

@@ -96,6 +96,8 @@ if (!adapter) {
     throw new Error("No GPU adapter compatible with this window");
 }
 
+console.log("adapter features =", adapter.features.values());
+
 const device = await adapter.requestDevice({label: "metis-device"});
 const surface = createSurface(adapter, wnd);
 const fmt = surface.getPreferredFormat();

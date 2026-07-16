@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `metis-engine` is a WebGPU clustered-forward PBR renderer for the space-sim game — built directly on `bun-webgpu-rs`'s raw WebGPU/SDL3 bindings (no other rendering-facing dependency; `wgpu-matrix` is the only non-`bun-webgpu-rs` dependency, for matrix/vector math). It's a standalone package with no dependency on `metis-tui`. `metis-game` consumes it (a 100-point-light demo), and does so via the caller-owned-device path — it never touches `RenderContext`. See "The engine does not own the window" below.
 
-**`src/` is split into two independent subtrees.** `src/renderer/` is the entire renderer described in this doc; `src/ecs/` is a young archetype ECS (Structure-of-Arrays storage, no `metis-data` dependency) that will eventually feed the renderer. They do not depend on each other yet — the renderer still takes a hand-built `Scene`, not ECS data. The root `src/index.ts` re-exports them as namespaces (`export * as Renderer`, `export * as ECS`), but consumers import through the package's **subpath exports** — `metis-engine/renderer` and `metis-engine/ecs` — which is what `examples/`, `test/`, `bench/`, and `metis-game` now do (`import { ClusteredForwardRenderer, … } from "metis-engine/renderer"`). The ECS's current shape and limits are in "The ECS" below.
+**`src/` is split into two independent subtrees.** `src/renderer/` is the entire renderer described in this doc (including `renderer/debug/` — the opt-in GPU profiler and the debug widgets); `src/ecs/` is a young archetype ECS (Structure-of-Arrays storage, no `metis-data` dependency) that will eventually feed the renderer. They do not depend on each other yet — the renderer still takes a hand-built `Scene`, not ECS data. The root `src/index.ts` re-exports them as namespaces (`export * as Renderer`, `export * as ECS`), but consumers import through the package's **subpath exports** — `metis-engine/renderer` and `metis-engine/ecs` — which is what `examples/`, `test/`, `bench/`, and `metis-game` now do (`import { ClusteredForwardRenderer, … } from "metis-engine/renderer"`). The ECS's current shape and limits are in "The ECS" below.
 
 It's the first package in this monorepo to build a *real* render pipeline — depth buffer, vertex buffers, multiple bind groups, compute passes, multisample-capable targets. Every prior pipeline in `bun-webgpu-rs/tests/render*.test.ts` and `metis-game/src/index.ts` is a hardcoded no-vertex-buffer triangle, so the patterns here (vertex layouts, bind group group-index conventions, WGSL module concatenation) are this repo's first precedent, not a continuation of one.
 
@@ -113,6 +113,13 @@ src/renderer/   — the entire renderer; import via "metis-engine/renderer"
                 luminanceAverage.ts, autoExposure.ts, tonemap.ts — HDR forward output -> measure
                                  luminance -> adapt exposure -> ACES filmic tonemap
   text/         vectorText.ts — wraps bun-webgpu-rs's VectorContext for screen-space HUD text
+                                 + 2D vector debug graphics; paint colour is a palette indexed
+                                 by VectorContext.setId(), and renderCached() replays geometry
+                                 without re-tessellating (text is expensive — see "Debug widgets")
+  debug/        gpuProfiler.ts — opt-in per-pass GPU timing via timestamp queries; ring-buffered
+                                 readback, three feature tiers (see "Profiling" below)
+                widgets.ts    — DebugOverlay: graph + tree widgets drawn with VectorText, plus
+                                 History and profileSpansToRows
   assets/       primitives.ts — procedural cube/sphere/plane/room-box generation (the guaranteed,
                                  network-independent path every demo/fixture scene defaults to)
                 gltf.ts       — a deliberately narrow glTF 2.0 reader (see its doc comment for the
@@ -214,6 +221,13 @@ for a ~50 ms multi-vblank burst on this machine's Vulkan driver when the loop
 outruns refresh — a metronomic hitch. `mailbox` is tear-free and free of that
 stall, but it does **not** cap the frame rate, so an idle loop renders flat-out.
 
+**The demos and `bench/lights.ts` pass `presentMode: "immediate"`** anyway. That
+isn't a reversal of the above — it's the dev-tooling case: tearing is irrelevant
+when you're measuring, and `immediate` keeps present back-pressure out of
+`getCurrentTexture()`, where it would otherwise land on top of the frame timings
+(and on the GPU profiler's numbers). The binding/`RenderContext` default is still
+`mailbox`, which is the right default for a real app; only the tools opt out.
+
 Frame-rate capping is therefore a *separate* concern, handled by **`FrameLimiter`**
 (`src/renderer/frameLimiter.ts`, exported from `metis-engine/renderer`), not by the
 present mode. Construct it with a target fps (`0` = uncapped) and `await
@@ -224,6 +238,43 @@ mode's job (`mailbox`), the frame cap is the limiter's job.** Don't try to get a
 cap back by switching to `fifo` — that reintroduces the stall. The demos and
 `bench/lights.ts` all wire an (uncapped) `FrameLimiter`; the bench calls `wait()`
 *after* its GPU-timing readback so a cap never pollutes the measurement.
+
+### `beginFrame()` must stay cheap — the ~6 ms getter that hid in it
+
+`RenderContext.outputFormat` used to be a plain getter delegating to
+`surface.getPreferredFormat()`, and `beginFrame()` reads it to build the
+`FrameTarget`. That call is a `get_capabilities` WSI round-trip costing **~6 ms**
+(measured; see `bun-webgpu-rs/DOC.md` §2) — so every windowed frame through
+`RenderContext` paid it, capping the demos and `bench/lights.ts` near 90 fps no
+matter how little work the GPU had. It's now resolved once in the constructor
+(`windowedFormat`).
+
+Effect on the 200-light bench, A/B'd back-to-back in one machine state:
+**72.3 -> 148.6 fps** (2.06x), `beginFrame` 6.72 -> 0.16 ms. CPU encode
+(3.15 -> 2.97 ms) and GPU (2.70 -> 2.68 ms) are unchanged, as they should be —
+the fix removes a CPU stall, nothing else.
+
+Measure this kind of thing **A/B in one sitting**. Absolute fps here swings ~2x
+with machine state (thermals/clocks): the same fixed build measured 287 fps and
+153 fps hours apart. Comparing a "before" from one state against an "after" from
+another invents effects that aren't there — a first pass at this paragraph
+credited the fix with a 3x encode win and explained it via GPU downclocking, and
+the controlled A/B above shows encode barely moved.
+
+**How it hid for so long is the lesson.** The bench labelled that time
+"swapchain acquire wait — present/compositor back-pressure, not engine cost" and
+concluded "the frame rate is gated by present back-pressure". Both were
+plausible, both were wrong, and the label actively discouraged looking inside
+`beginFrame()`. It was caught by *arithmetic*, not by a profiler: the phases
+didn't sum to the frame interval (6.6 + 3.1 + 2.7 = 12.4 ms against an 11.1 ms
+frame), and back-pressure is impossible under `immediate` anyway. Then confirmed
+by timing `getCurrentTexture` / `getPreferredFormat` / `createView` separately in
+a standalone probe: 0.14 / 7.8 / 0.09 ms.
+
+Two rules out of it: **keep `beginFrame()` to acquire + view** — anything else
+per frame belongs in the constructor — and **don't let a benchmark's labels
+assert a cause it hasn't measured**; a confidently-wrong label is worse than a
+raw number.
 
 ### Reverse-Z with an infinite far plane — and why the near plane is now free
 
@@ -412,6 +463,78 @@ Every material's bind group has exactly 6 texture-related bindings (1 sampler + 
 ### WGSL module concatenation
 
 `bun-webgpu-rs`'s `createShaderModule` takes one `code: string`; WGSL has no `#include`. Every shader that needs the shared structs/BRDF/cluster-math in `common.wgsl` gets it via plain string concatenation (`` `${commonWgsl}\n${forwardWgsl}` ``) at pipeline creation — in `clusteredForwardRenderer.ts` (forward), `lightCuller.ts` (cluster_build/light_cull), and `shadowCascades.ts` (shadow; shadow_resolve is standalone, no common). `.wgsl` files are imported as raw text via Bun's `with { type: "text" }` import attribute (ambient-declared in `src/renderer/shading/wgsl.d.ts`).
+
+### Profiling is opt-in, threaded through, and tiered
+
+`GpuProfiler` (`src/renderer/debug/gpuProfiler.ts`) times each pass with
+timestamp queries and hands back a tree that `DebugOverlay.tree` renders. It is
+**off unless two separate things happen**: something constructs it (which only
+succeeds on a device that enabled `timestamp-query`), and something assigns it to
+`renderer.profiler`. Every hook is a `profiler?.pass(...)` call, so the unprofiled
+path encodes exactly as before.
+
+**Why the profiler is threaded through the collaborators rather than wrapping
+`render()`.** Per-pass timing needs `timestampWrites` *on each pass descriptor*,
+and the renderer doesn't create most of its passes — `ShadowCascades`,
+`LightCuller`, `AmbientOcclusion` and the post chain do. So each takes an optional
+trailing `profiler?: GpuProfiler` (the post chain gets it via the
+`PostProcessFrameContext` it already threads everywhere). The alternative —
+bracketing groups of passes with `encoder.writeTimestamp` purely at the renderer
+level — needs no signature changes but can only measure *groups*, not passes.
+Per-pass was the requirement, so the signatures moved.
+
+**Three tiers, checked against the device, not the adapter.** With `timestamp-query`
+alone you get per-pass timing and a summed total. `timestamp-query-inside-encoders`
+buys a *measured* whole-frame span, which is strictly better than summing passes
+because it includes the gaps between them (on the 200-light bench: 2.308 ms
+measured vs. ~2.19 ms of summed passes — the difference is real work that a sum
+silently loses). `timestamp-query-inside-passes` adds per-draw zones nested under
+`forward`. The last two are **native wgpu features with no WebGPU spec
+equivalent**, so support is genuinely patchy — always degrade, never require. The
+check is against `device.features` deliberately: an adapter can advertise a
+feature the caller never requested, and using it then is a validation error, which
+this binding only prints to stderr (see "Debugging WebGPU validation errors").
+
+**Readback is ring-buffered and results lag ~2-3 frames.** That's the design, not
+a shortcut: mapping a buffer the GPU is still writing stalls the pipeline and
+distorts the very numbers being measured. `beginFrame` kicks the maps recorded on
+*previous* frames — by then their `submit` has certainly happened, whereas kicking
+them in `endFrame` would race it and could resolve the map before the copy filled
+the buffer.
+
+Validated by `test/debugWidgets.smoke.ts`, which asserts on the numbers rather
+than eyeballing a screenshot: non-zero per-pass timings, a plausible total, the
+expected pass labels present, and per-draw zones when the tier allows. A
+mis-wired query index reads back as zeros and would otherwise look fine.
+
+### Debug widgets — and why `due()` exists
+
+`DebugOverlay` (`src/renderer/debug/widgets.ts`) is immediate-mode: stage widgets,
+then `render()`. Colour reaches the GPU through `VectorText`'s palette — geometry
+is tagged with `VectorContext.setId(slot)` and the fragment shader reads a
+dynamically-offset `vec4`. `VectorContext` owns geometry only and has no notion of
+paint, so `setId` is the intended hook; the palette is interned per build, so
+widgets just name a colour.
+
+**Text is the entire cost, and it's why `DebugOverlay.due()` is not optional
+dressing.** `drawText` re-tessellates every glyph outline per call (~100-200 µs
+per short string). The profiler overlay is ~36 strings, so re-staging it every
+frame cost **~15.6 ms of CPU encode** — on a bench whose whole GPU frame is 3 ms.
+`due()` throttles re-staging to `rebuildIntervalMs` (default 100 ms) and
+`VectorText.renderCached()` replays the previous geometry in between: `flush()`
+uploads to persistent buffers and leaves `drawCalls` populated, so replaying is
+valid until the next `flush()`. Measured on `bench/lights.ts --profile`: 20.2 ms
+-> 5.4 ms mean CPU encode (baseline 3.1 ms). Note the GPU numbers were unaffected
+either way (3.02 vs 3.22 ms) — the overlay's cost is CPU-side, so it never
+corrupted what the profiler measures.
+
+Two bugs in `bun-webgpu-rs`'s `VectorContext` were found and fixed building this
+(both documented in that package's CLAUDE.md): stroking an *open* polyline
+panicked the process via lyon, and `drawText` built a full glyph outline on every
+call that the `fill()` path then discarded. The remaining text cost is the glyph
+cache tessellating in font units at a fixed tolerance — ~118 triangles per glyph
+at 11 px, roughly 10x more than needed. Fixing that means keying the cache by
+(glyph, size bucket); not done, and the reason `due()` carries the load instead.
 
 ### Known limitations (not yet done)
 

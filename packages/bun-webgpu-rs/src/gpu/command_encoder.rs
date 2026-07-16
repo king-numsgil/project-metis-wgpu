@@ -291,6 +291,22 @@ impl GpuRenderPassEncoder {
         Ok(())
     }
 
+    /// Writes a timestamp into `querySet` at the point the GPU reaches this
+    /// command *within* the pass — the granularity `timestampWrites` can't give
+    /// you, since that only brackets the pass as a whole.
+    ///
+    /// Native-only, and needs both `timestamp-query` and
+    /// `timestamp-query-inside-passes`. Calling it without them is a validation
+    /// error, which this binding only prints to stderr — gate it on
+    /// `adapter.features.has("timestamp-query-inside-passes")`.
+    #[napi]
+    pub fn write_timestamp(&self, query_set: &GpuQuerySet, query_index: u32) -> napi::Result<()> {
+        let mut g = self.pass.lock().unwrap();
+        g.as_mut().ok_or_else(|| napi::Error::new(napi::Status::GenericFailure, "RenderPass already ended"))?
+            .write_timestamp(&query_set.inner, query_index);
+        Ok(())
+    }
+
     #[napi]
     pub fn end(&self) -> napi::Result<()> {
         // Drop pass first to release the mutable borrow of the encoder
@@ -379,6 +395,22 @@ impl GpuComputePassEncoder {
         let mut g = self.pass.lock().unwrap();
         g.as_mut().ok_or_else(|| napi::Error::new(napi::Status::GenericFailure, "ComputePass already ended"))?
             .set_push_constants(offset, &data);
+        Ok(())
+    }
+
+    /// Writes a timestamp into `querySet` at the point the GPU reaches this
+    /// command *within* the pass — e.g. between two dispatches that
+    /// `timestampWrites` would lump together.
+    ///
+    /// Native-only, and needs both `timestamp-query` and
+    /// `timestamp-query-inside-passes`. Calling it without them is a validation
+    /// error, which this binding only prints to stderr — gate it on
+    /// `adapter.features.has("timestamp-query-inside-passes")`.
+    #[napi]
+    pub fn write_timestamp(&self, query_set: &GpuQuerySet, query_index: u32) -> napi::Result<()> {
+        let mut g = self.pass.lock().unwrap();
+        g.as_mut().ok_or_else(|| napi::Error::new(napi::Status::GenericFailure, "ComputePass already ended"))?
+            .write_timestamp(&query_set.inner, query_index);
         Ok(())
     }
 
@@ -697,6 +729,22 @@ impl GpuCommandEncoder {
     pub fn clear_buffer(&self, buffer: &GpuBuffer, offset: Option<f64>, size: Option<f64>) -> napi::Result<()> {
         self.with_encoder(|enc| {
             enc.clear_buffer(&buffer.inner, offset.unwrap_or(0.0) as u64, size.map(|s| s as u64));
+            Ok(())
+        })
+    }
+
+    /// Writes a timestamp into `querySet` at this point in the encoder's command
+    /// stream — i.e. *between* passes, measuring a span that brackets whole
+    /// passes plus the copies between them.
+    ///
+    /// Native-only, and needs both `timestamp-query` and
+    /// `timestamp-query-inside-encoders`. Calling it without them is a
+    /// validation error, which this binding only prints to stderr — gate it on
+    /// `adapter.features.has("timestamp-query-inside-encoders")`.
+    #[napi]
+    pub fn write_timestamp(&self, query_set: &GpuQuerySet, query_index: u32) -> napi::Result<()> {
+        self.with_encoder(|enc| {
+            enc.write_timestamp(&query_set.inner, query_index);
             Ok(())
         })
     }
