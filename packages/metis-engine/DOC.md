@@ -331,6 +331,7 @@ class Camera {
     position, target, up: Vec3Arg;
     fovYRadians = Math.PI / 4; aspect = 16 / 9;
     near = 0.01;        // cheap to make small: reverse-Z precision is ~z * 2^-24, independent of near
+    clusterNear = 2.0;  // light-grid near — deliberately NOT `near`. See below.
     clusterFar = 1000;  // light-culling range only — NOT a clip plane. There is no `far`.
     setAspectFromSize(width, height): void;
     viewMatrix(dst?), projectionMatrix(dst?), viewProjectionMatrix(dst?): Mat4Arg;
@@ -345,13 +346,28 @@ distant precision doesn't depend on `near` either. Combined with the engine's
 logarithmic depth buffer without `frag_depth` writes. Rationale, measurements,
 and what it did *not* break: CLAUDE.md, "Reverse-Z with an infinite far plane".
 
-`clusterFar` exists because the **clustered light grid** still needs a finite
-depth range to slice exponentially. It is not a clip plane: geometry past it
-renders normally (lit by sun + ambient); only *point lights* past it stop being
-culled into clusters, and so contribute nothing. Widening `[near, clusterFar]`
-coarsens Z-slice density —
-`slices-per-doubling = CLUSTER_COUNT_Z / log2(clusterFar / near)` — so prefer a
-tight `clusterFar` for indoor scenes.
+`clusterNear` / `clusterFar` bound the **clustered light grid**, which needs a
+finite depth range to slice exponentially. Neither is a clip plane: geometry
+outside them renders normally (lit by sun + ambient); only *point lights* past
+`clusterFar` stop being culled into clusters, and so contribute nothing.
+
+**`clusterNear` is deliberately separate from `near`.** Z-slice density is
+`CLUSTER_COUNT_Z / log2(clusterFar / clusterNear)`, so the grid wants the
+*tightest* range that covers your geometry — while `near` wants to be as small
+as reverse-Z allows. Tying them together was costing ~30% of the forward pass:
+`near = 0.01` is three orders of magnitude below any real geometry, and those
+wasted slices come out of the range that matters.
+
+Geometry closer than `clusterNear` is **still lit correctly** — slice 0 is a
+catch-all whose AABB extends down to the true `near` — it just shades more
+lights than it needs, since slice 0 is a fat bucket. Set `clusterNear` to about
+the closest distance at which you have many lights and care about culling
+precision.
+
+Tuning both: it is the **ratio** that matters, and the near end is usually where
+the slack is. Raising `clusterFar` *lowers* density (200 -> 1000 measured 1.38 ->
+1.53 ms on the 200-light bench); lowering it helps only slightly and costs you
+distant lights. See CLAUDE.md, "What the forward pass actually costs".
 
 ```ts
 interface Transform { position: Vec3Arg; rotationEuler: Vec3Arg; scale: Vec3Arg }
@@ -677,9 +693,10 @@ bunx tsc --noEmit        # type-check
 
 There is no `bun test` suite for the whole package; `test/fixture.ts` is the
 automated check, `test/ao.test.ts` covers the AO kernels + a GPU-readback
-assertion, `test/debugWidgets.smoke.ts` asserts the profiler's per-pass timings
-are non-zero and renders both widgets, and `test/vectorText.smoke.ts` covers text
-+ the colour palette. Run them manually.
+assertion, `test/clusterNear.test.ts` pins that geometry nearer than
+`clusterNear` keeps its lights, `test/debugWidgets.smoke.ts` asserts the
+profiler's per-pass timings are non-zero and renders both widgets, and
+`test/vectorText.smoke.ts` covers text + the colour palette. Run them manually.
 
 `bench/lights.ts` flags: `--lights N` (≤256), `--duration S`, `--warmup S`,
 `--width`, `--height`, `--fps N` (`--vsync` = `--fps 60`), `--profile` (per-pass

@@ -26,7 +26,7 @@ import clusterBuildWgsl from "./wgsl/cluster_build.wgsl" with { type: "text" };
 import commonWgsl from "./wgsl/common.wgsl" with { type: "text" };
 import lightCullWgsl from "./wgsl/light_cull.wgsl" with { type: "text" };
 
-const CLUSTER_PARAMS_SIZE = 112; // mat4 invProj + vec4 + vec4<u32> + vec4<u32>
+const CLUSTER_PARAMS_SIZE = 128; // mat4 invProj + vec4 + vec4<u32> + vec4<u32> + vec4 (depthBounds)
 const POINT_LIGHT_STRIDE = 48; // vec3+f32, vec3+f32, vec3+f32(pad)
 const CLUSTER_AABB_STRIDE = 32; // vec3+pad, vec3+pad
 const DISPATCH_GROUPS = Math.ceil(NUM_CLUSTERS / COMPUTE_WORKGROUP_SIZE);
@@ -179,10 +179,17 @@ export class LightCuller {
         // clusterFar, not a projection far plane — the reverse-Z projection is
         // infinite. The cluster grid needs a finite range to slice
         // exponentially; lights past it simply aren't culled into any cluster.
-        params.vec4(targets.width, targets.height, scene.camera.near, scene.camera.clusterFar);
+        // The grid slices over [clusterNear, clusterFar] — deliberately not the
+        // projection's near plane, which is far too small to slice against.
+        // See Camera.clusterNear.
+        const clusterNear = Math.max(scene.camera.clusterNear, 1e-4);
+        params.vec4(targets.width, targets.height, clusterNear, scene.camera.clusterFar);
         params.vec4u(CLUSTER_COUNT_X, CLUSTER_COUNT_Y, CLUSTER_COUNT_Z, MAX_LIGHTS_PER_CLUSTER);
         const lightCount = Math.min(scene.pointLights.length, MAX_POINT_LIGHTS);
         params.vec4u(lightCount, 0, 0, 0);
+        // True camera near — slice 0's AABB reaches down to this so geometry
+        // closer than clusterNear keeps a correct light list.
+        params.vec4(scene.camera.near, 0, 0, 0);
         this.device.queue.writeBuffer(this.clusterParamsBuffer, 0, params.toBytes());
 
         const view = scene.camera.viewMatrix();

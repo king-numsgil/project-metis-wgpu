@@ -51,7 +51,15 @@ fn build(@builtin(global_invocation_id) gid: vec3<u32>) {
     let rayMaxMax = screenToViewRay(maxPixel, screenSize);
 
     // Exponential slicing (see common.wgsl's clusterZIndex for the inverse).
-    let sliceNear = zNear * pow(zFar / zNear, f32(z) / f32(countZ));
+    // Slice 0 is a **catch-all**: clusterZIndex clamps anything nearer than
+    // clusterNear into it, so its AABB must reach down to the true camera near
+    // or that geometry would read a light list built for a range it isn't in
+    // and silently lose lights. Only slice 0 pays this widening.
+    let sliceNear = select(
+        zNear * pow(zFar / zNear, f32(z) / f32(countZ)),
+        min(params.depthBounds.x, zNear),
+        z == 0u,
+    );
     let sliceFar = zNear * pow(zFar / zNear, f32(z + 1u) / f32(countZ));
 
     let p0 = intersectZPlane(rayMinMin, -sliceNear);

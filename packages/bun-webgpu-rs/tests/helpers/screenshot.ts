@@ -82,7 +82,9 @@ export function encodePng(pixels: Uint8Array, width: number, height: number): Ui
 // ── GPU texture readback ──────────────────────────────────────────────────────
 
 // Copies an rgba8unorm texture to CPU and returns tight RGBA bytes (no GPU row padding).
-async function readbackTexture(
+/** Reads a texture back as tight RGBA bytes. Exported for tests that assert on
+ * pixels without wanting a PNG on disk. */
+export async function readbackTexture(
     device: GpuDevice,
     texture: GpuTexture,
     width: number,

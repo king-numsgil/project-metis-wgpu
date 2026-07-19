@@ -31,6 +31,15 @@ This `CLAUDE.md` explains *why* (architecture, rationale, the debugging history
 below). `DOC.md` explains *what to call*. Keep that split — don't duplicate
 war stories into `DOC.md`, don't grow an API listing here.
 
+**No measured numbers in this file.** Frame times, fps, and per-pass costs go
+stale within days of active work, and a stale number in a trusted doc is worse
+than none — it invites comparison against a baseline that no longer exists.
+Record the *finding* ("the forward pass is light-loop bound"), the *reasoning*,
+and **how to re-measure it** (`bun run bench:lights --profile`). Derived facts
+that follow from the constants — VRAM footprints, precision bounds, the
+slices-per-doubling formula — are fine: they're properties of the design, not
+snapshots of a machine.
+
 ## Commands
 
 Run from `packages/metis-engine/` unless noted.
@@ -239,37 +248,33 @@ cap back by switching to `fifo` — that reintroduces the stall. The demos and
 `bench/lights.ts` all wire an (uncapped) `FrameLimiter`; the bench calls `wait()`
 *after* its GPU-timing readback so a cap never pollutes the measurement.
 
-### `beginFrame()` must stay cheap — the ~6 ms getter that hid in it
+### `beginFrame()` must stay cheap — the WSI getter that hid in it
 
 `RenderContext.outputFormat` used to be a plain getter delegating to
 `surface.getPreferredFormat()`, and `beginFrame()` reads it to build the
-`FrameTarget`. That call is a `get_capabilities` WSI round-trip costing **~6 ms**
-(measured; see `bun-webgpu-rs/DOC.md` §2) — so every windowed frame through
-`RenderContext` paid it, capping the demos and `bench/lights.ts` near 90 fps no
-matter how little work the GPU had. It's now resolved once in the constructor
-(`windowedFormat`).
+`FrameTarget`. That call is a `get_capabilities` WSI round-trip — milliseconds,
+not microseconds (see `bun-webgpu-rs/DOC.md` §2) — so every windowed frame
+through `RenderContext` paid it, roughly halving the frame rate no matter how
+little work the GPU had. It's resolved once in the constructor now
+(`windowedFormat`). Encode and GPU time were unaffected, as they should be: the
+fix removes a CPU stall and nothing else.
 
-Effect on the 200-light bench, A/B'd back-to-back in one machine state:
-**72.3 -> 148.6 fps** (2.06x), `beginFrame` 6.72 -> 0.16 ms. CPU encode
-(3.15 -> 2.97 ms) and GPU (2.70 -> 2.68 ms) are unchanged, as they should be —
-the fix removes a CPU stall, nothing else.
-
-Measure this kind of thing **A/B in one sitting**. Absolute fps here swings ~2x
-with machine state (thermals/clocks): the same fixed build measured 287 fps and
-153 fps hours apart. Comparing a "before" from one state against an "after" from
-another invents effects that aren't there — a first pass at this paragraph
-credited the fix with a 3x encode win and explained it via GPU downclocking, and
-the controlled A/B above shows encode barely moved.
+**Measure this kind of thing A/B in one sitting.** Absolute frame rate on this
+machine swings ~2x with thermal/clock state — the same unmodified build measures
+very differently hours apart. Comparing a "before" from one state against an
+"after" from another invents effects that aren't there: a first pass at this
+section credited the fix with a large CPU-encode win and explained it via GPU
+downclocking, and a controlled back-to-back A/B showed encode had barely moved.
 
 **How it hid for so long is the lesson.** The bench labelled that time
 "swapchain acquire wait — present/compositor back-pressure, not engine cost" and
 concluded "the frame rate is gated by present back-pressure". Both were
 plausible, both were wrong, and the label actively discouraged looking inside
 `beginFrame()`. It was caught by *arithmetic*, not by a profiler: the phases
-didn't sum to the frame interval (6.6 + 3.1 + 2.7 = 12.4 ms against an 11.1 ms
-frame), and back-pressure is impossible under `immediate` anyway. Then confirmed
-by timing `getCurrentTexture` / `getPreferredFormat` / `createView` separately in
-a standalone probe: 0.14 / 7.8 / 0.09 ms.
+didn't sum to the frame interval — they exceeded it, which is impossible — and
+back-pressure can't exist under `immediate` anyway. Then confirmed by timing
+`getCurrentTexture` / `getPreferredFormat` / `createView` separately in a
+standalone probe, which put essentially all of it in the format query.
 
 Two rules out of it: **keep `beginFrame()` to acquire + view** — anything else
 per frame belongs in the constructor — and **don't let a benchmark's labels
@@ -333,11 +338,11 @@ same ray, and `intersectZPlane` rescales it, so relative precision is preserved.
 The one real cost: the grid needs a *finite* range, so `Camera.clusterFar`
 (default 1000 m) replaces the projection's far plane for light culling only.
 Widening `[near, clusterFar]` coarsens Z-slice density —
-`slices-per-doubling = CLUSTER_COUNT_Z / log2(clusterFar / near)`, so dropping
-`near` 0.1 → 0.01 took the bench's 200-light scene from 2.19 to 1.68 slices per
-doubling and GPU frame time from 2.51 ms → 2.69 ms (more lights land in the same
-cluster). If that ever matters, raise `near` or lower `clusterFar` rather than
-adding slices. Lights beyond `clusterFar` are simply never culled into a cluster
+`slices-per-doubling = CLUSTER_COUNT_Z / log2(clusterFar / clusterNear)`.
+Pushing `near` very small used to coarsen this badly, because the grid was tied
+to the projection's near plane; it no longer is — see `Camera.clusterNear` and
+"What the forward pass actually costs" below. If density ever needs more, raise
+`clusterNear` or lower `clusterFar` rather than adding slices. Lights beyond `clusterFar` are simply never culled into a cluster
 and contribute nothing; geometry beyond it still renders.
 
 Verified after the change: `test/ao.test.ts` (GPU readback, creases darken), the
@@ -412,15 +417,85 @@ Verified after the change: renderer builds with no WGSL/validation error;
 interior corner-leak scene clean; earth-moon surface at near and pulled-back
 cameras shows crisp near shadows and correct attached far shadows (no bleed, no
 acne, no visible cascade seams); `test/ao.test.ts` (9/9) and the full fixture
-pass with no `wgpu` errors; 200-light bench 2.69 → 2.87 ms GPU (the +0.18 ms is
-3 extra depth passes over ~trivial geometry — a real scene pays 4× its shadow
-draw count, the standard CSM cost).
+pass with no `wgpu` errors; the 200-light bench regressed slightly on GPU time,
+which is the 3 extra depth passes over ~trivial geometry — a real scene pays 4×
+its shadow draw count, the standard CSM cost.
 
 Known rough edges, deliberate for now: no per-cascade frustum culling (every
 cascade redraws every instance); the blend band double-samples two cascades in
 the overlap; and the light frustum's ortho near is pulled generously toward the
 sun (`CASCADE_ORTHO_NEAR_SCALE`) to catch off-slice occluders rather than doing
 a proper occluder-inclusive fit.
+
+### What the forward pass actually costs — measure, don't guess
+
+Re-measure with `bun run bench:lights --profile`, which prints a per-pass GPU
+breakdown; sweep `--lights` to separate fixed cost from per-light cost.
+
+The forward pass is **light-loop bound, not shadow bound**. Sweeping light count
+gives an almost perfectly linear fit, and the constant term — which contains
+*everything else*, including all 9 MSM reconstructions per cascade-0 fragment,
+PCF for the other cascades, materials, ambient and AO — is a small minority of
+the pass at a few hundred lights. A cursory read of the shader points at the
+Hausdorff 4-moment reconstruction because it's the scariest code in the file;
+the measurement says otherwise. **Sweep a parameter before optimizing here.**
+
+Two fixes came out of that, together roughly halving the pass at 200 lights:
+
+**1. Per-fragment range rejection (the big one).** A cluster's light list is
+inherently conservative — a light is added if it touches *any* part of the
+cluster's AABB, so most fragments in that cluster are outside its range. Render
+`lightCountInCluster` and read it back and the ratio is stark: roughly four times
+as many lights assigned per fragment as are actually in range. The loop had no
+distance check, so most fragment-light pairs ran the full Cook-Torrance BRDF and
+multiplied it by an attenuation of exactly zero. `forward.wgsl` now rejects on
+squared distance first. This is *provably* free of visual consequence —
+`pointLightAttenuation`'s window term is already exactly 0 at `dist >= range` —
+and the fixture renders came back **byte-identical**, which is the assertion.
+
+**2. `Camera.clusterNear`, decoupled from `Camera.near`.** Z-slice density is
+`CLUSTER_COUNT_Z / log2(clusterFar / clusterNear)`, so tying the grid to the
+projection's near plane was ruinous: `near = 0.01` sits three orders of
+magnitude below any real geometry, and those wasted slices come straight out of
+the range that matters — clusters ended up spanning more depth than a typical
+light's whole radius. The grid now has its own near.
+
+**Slice 0 is a catch-all, and that's load-bearing.** `clusterZIndex` clamps
+anything nearer than `clusterNear` into slice 0, so `cluster_build.wgsl` widens
+slice 0's AABB down to the true camera near. Without that, a fragment closer
+than `clusterNear` reads a light list assembled for a shell it isn't in and
+*silently loses every light near it* — geometry going dark, popping as the
+camera moves. `test/clusterNear.test.ts` pins it.
+
+**That test needed a second attempt, which is the interesting part.** The first
+version used a generously-sized light and passed even with the catch-all
+deleted: the light's sphere still reached the wrongly-placed slice 0, so nothing
+was lost. Only a light whose range is *small relative to `clusterNear`* actually
+exercises the failure. Mutation-check tests in this area — "it passes" proves
+nothing when the oracle is another render of the same scene.
+
+Levers measured and **rejected** (kept so they aren't re-litigated):
+
+| lever | verdict |
+|---|---|
+| finer cluster XY grid | weak; costs memory and cull time for a few percent |
+| lowering `clusterFar` | weak, and *loses* distant lights entirely |
+| raising `clusterFar` | **worse** — it's the ratio that sets density |
+
+The near end is the lever because that's where the slack is: the projection's
+near plane sits orders of magnitude below where geometry actually starts, while
+`clusterFar` is usually within a small factor of the real far extent. Density
+goes as the log of the ratio, so you can only reclaim range that's genuinely
+empty.
+
+**Separately: cascade-0 MSM is a large, flat, scene-independent cost.**
+`cascade0-moment-resolve` plus `cascade0-depth` run at the same cost with zero
+lights and zero geometry, and are a substantial share of the GPU frame — the
+larger share the faster everything else gets. It's bandwidth-bound, not
+math-bound: the moment target is `SHADOW_MAP_SIZE²` × rgba32float, so cost
+scales with the square of that constant and halving it is a clean 4x. Not done —
+it trades near-field shadow quality, which is exactly what MSM cascade 0 exists
+to provide. It's the obvious next dial if the flat cost matters.
 
 ### Why "clustered forward," concretely
 
@@ -486,9 +561,9 @@ Per-pass was the requirement, so the signatures moved.
 **Three tiers, checked against the device, not the adapter.** With `timestamp-query`
 alone you get per-pass timing and a summed total. `timestamp-query-inside-encoders`
 buys a *measured* whole-frame span, which is strictly better than summing passes
-because it includes the gaps between them (on the 200-light bench: 2.308 ms
-measured vs. ~2.19 ms of summed passes — the difference is real work that a sum
-silently loses). `timestamp-query-inside-passes` adds per-draw zones nested under
+because it includes the gaps between them (barriers, layout transitions — a
+consistent few percent that a sum silently loses).
+`timestamp-query-inside-passes` adds per-draw zones nested under
 `forward`. The last two are **native wgpu features with no WebGPU spec
 equivalent**, so support is genuinely patchy — always degrade, never require. The
 check is against `device.features` deliberately: an adapter can advertise a
@@ -517,16 +592,14 @@ paint, so `setId` is the intended hook; the palette is interned per build, so
 widgets just name a colour.
 
 **Text is the entire cost, and it's why `DebugOverlay.due()` is not optional
-dressing.** `drawText` re-tessellates every glyph outline per call (~100-200 µs
-per short string). The profiler overlay is ~36 strings, so re-staging it every
-frame cost **~15.6 ms of CPU encode** — on a bench whose whole GPU frame is 3 ms.
-`due()` throttles re-staging to `rebuildIntervalMs` (default 100 ms) and
-`VectorText.renderCached()` replays the previous geometry in between: `flush()`
-uploads to persistent buffers and leaves `drawCalls` populated, so replaying is
-valid until the next `flush()`. Measured on `bench/lights.ts --profile`: 20.2 ms
--> 5.4 ms mean CPU encode (baseline 3.1 ms). Note the GPU numbers were unaffected
-either way (3.02 vs 3.22 ms) — the overlay's cost is CPU-side, so it never
-corrupted what the profiler measures.
+dressing.** `drawText` re-tessellates every glyph outline on every call. The
+profiler overlay is a few dozen strings, so re-staging it every frame cost
+several times the entire GPU frame in CPU encode alone. `due()` throttles
+re-staging to `rebuildIntervalMs` (default 100 ms) and `VectorText.renderCached()`
+replays the previous geometry in between: `flush()` uploads to persistent buffers
+and leaves `drawCalls` populated, so replaying is valid until the next `flush()`.
+The GPU numbers were unaffected either way — the overlay's cost is CPU-side, so
+it never corrupted what the profiler measures.
 
 Two bugs in `bun-webgpu-rs`'s `VectorContext` were found and fixed building this
 (both documented in that package's CLAUDE.md): stroking an *open* polyline

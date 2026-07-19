@@ -123,9 +123,12 @@ fn pointLightAttenuation(distance: f32, range: f32) -> f32 {
 
 struct ClusterParams {
     invProj: mat4x4<f32>,
-    screenSizeZNearFar: vec4<f32>, // x=width, y=height, z=zNear, w=zFar
+    // z = clusterNear (the grid's near, NOT the projection's near plane — see
+    // Camera.clusterNear for why they're decoupled), w = clusterFar.
+    screenSizeZNearFar: vec4<f32>, // x=width, y=height, z=clusterNear, w=clusterFar
     clusterCounts: vec4<u32>,      // x,y,z counts, w=maxLightsPerCluster
     lightCount: vec4<u32>,         // x=active point light count
+    depthBounds: vec4<f32>,        // x = true camera near (slice 0's catch-all floor)
 };
 
 struct GpuPointLight {

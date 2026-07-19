@@ -177,9 +177,10 @@ sub-path (and, after a `closePath()`, resumes at the closed sub-path's start
 point). `finite()` guards every point *after* the local transform, since a
 non-finite transform turns finite inputs non-finite.
 
-**`arc` had an unbounded step count**, `steps = |sweep|/2π * 64`, with no clamp:
-`arc(…, sweep = 1e6)` tessellated to **~92M indices (~370 MB of buffers)** from a
-single innocuous call. `|sweep|` is now clamped to one full turn.
+**`arc` had an unbounded step count**, `steps = |sweep|/2π * 64`, with no clamp,
+so a large sweep tessellated to tens of millions of indices — hundreds of MB of
+buffers — from a single innocuous call. `|sweep|` is now clamped to one full
+turn.
 
 **Transforms nested in the wrong order.** `push_transform` did
 `current.then(&t)`, applying the *parent* to a point before the child — the
@@ -210,10 +211,10 @@ built lazily from a retained `TextPathSource` on the first `take_path` that need
 it.
 
 **Still slow, and known:** glyphs are cached pre-tessellated *in font units* with
-a fixed `tolerance = 0.25` (`prewarm_cache`), i.e. 0.25 *font units* — at
-upm 1000 and 11 px text that's ~90x finer than the pixel grid can show.
-Measured: `"cascade0-depth"` (14 glyphs, 11 px) = **1651 triangles**, ~118 per
-glyph. Because the cache is size-independent it can't simply use a per-size
+a fixed `tolerance = 0.25` (`prewarm_cache`) — i.e. 0.25 *font units*, which at
+a typical upm and a HUD-sized pixel height is orders of magnitude finer than the
+pixel grid can show, producing roughly ten times the triangles a small glyph
+needs. Because the cache is size-independent it can't simply use a per-size
 tolerance; fixing it properly means keying the cache by (glyph, size bucket).
 Not done. Consumers that redraw static text every frame should reuse `drawCalls`
 instead (see `DOC.md` §9).
@@ -385,7 +386,10 @@ encoder.popDebugGroup()
 
 ## Performance profiling
 
-CPU-side wall clock (see `DOC.md` §5 for GPU-side timestamp queries):
+CPU-side wall clock (see `DOC.md` §5 for GPU-side timestamp queries). For the
+napi call-overhead baseline, **run `bun test tests/napi-overhead.test.ts`** rather
+than trusting a number written down here — it differs by an order of magnitude
+between debug and release builds of the addon:
 
 ```ts
 const freq = sdlGetPerformanceFrequency()
@@ -393,8 +397,6 @@ const t0 = sdlGetPerformanceCounter()
 // ... work ...
 const us = (sdlGetPerformanceCounter() - t0) / freq * 1e6
 
-// Baseline napi round-trip ≈ 88–100 ns on a modern desktop
-// 16.7 ms frame budget can absorb ~180 000 napi calls
 // VSync wait lands in getCurrentTexture() on D3D/Vulkan backends,
 // not in present(). Use presentMode: 'immediate' to measure raw CPU time.
 ```
