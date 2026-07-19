@@ -11,6 +11,7 @@ import {
     VectorContext,
 } from "bun-webgpu-rs";
 import { mat4 } from "wgpu-matrix";
+import type { GpuProfiler } from "../debug/gpuProfiler.ts";
 import { Std140Writer } from "../shading/std140.ts";
 import vectorWgsl from "./wgsl/vector.wgsl" with { type: "text" };
 
@@ -48,6 +49,24 @@ export class VectorText {
     /** Dynamic-offset stride: one palette slot per alignment unit, not per 16 bytes. */
     private readonly paletteStride: number;
     private readonly paletteStaging: Uint8Array;
+    /**
+     * Optional GPU profiler. Set it and this class's render pass shows up in the
+     * profiler tree alongside the renderer's own passes.
+     *
+     * **This measures GPU time only** — the pass is a handful of triangles, so
+     * expect a small number. The expensive part of text is `drawText`'s
+     * tessellation and buffer staging, which happens on the **CPU** before any
+     * command is encoded and is therefore invisible to timestamp queries. If the
+     * HUD is costing you frame time, it will show up in CPU encode, not here.
+     */
+    profiler?: GpuProfiler;
+    /**
+     * Span name used in the profiler tree. Give each instance its own name when
+     * a frame has more than one (e.g. a HUD and a debug overlay), or they're
+     * indistinguishable in the output.
+     */
+    profileLabel = "vector-text";
+
     /** Palette from the last `render()`, so `renderCached` can repaint without re-staging. */
     private lastPalette: readonly Rgba[] = [];
 
@@ -205,7 +224,8 @@ export class VectorText {
         used: number,
     ) {
         const pass = encoder.beginRenderPass({
-            label: "metis-engine/vector-text-pass",
+            label: `metis-engine/${this.profileLabel}-pass`,
+            timestampWrites: this.profiler?.pass(this.profileLabel),
             colorAttachments: [
                 {
                     view,

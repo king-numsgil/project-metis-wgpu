@@ -493,14 +493,19 @@ sort or merge them by id.
 re-draw the previous geometry, skip `flush()` entirely and re-issue the existing
 `drawCalls` (the GPU buffers stay valid until the next `flush()`).
 
-**Cost: `drawText` tessellates every glyph outline on every call** — order
-100 µs+ for a short string, so a HUD that re-stages its text each frame at a few
-hundred fps will spend more time on text than on the scene. Glyph geometry is
-cached per font in font units, but the transform+copy into the output buffers is
-per call. `flush()` uploads to persistent buffers and leaves `drawCalls`
-populated, so if the text hasn't changed you can skip re-staging entirely and
-just re-issue the previous `drawCalls` (what `metis-engine`'s
-`VectorText.renderCached` / `DebugOverlay.due()` do).
+**Cost: `drawText` transforms and copies cached glyph geometry on every call.**
+Tessellation itself is cached per (size bucket, glyph), but the copy into the
+output buffers is per call, so a HUD that re-stages its text every frame at a few
+hundred fps can still spend more time on text than on the scene. `flush()`
+uploads to persistent buffers and leaves `drawCalls` populated, so if the text
+hasn't changed you can skip re-staging entirely and re-issue the previous
+`drawCalls` (what `metis-engine`'s `VectorText.renderCached` /
+`DebugOverlay.due()` do).
+
+**The `tolerance` constructor argument applies to paths, not text.** Glyph
+geometry is flattened at a tolerance derived from the requested pixel size. Sizes
+in the prewarm set are ready at `loadFont`; an unusual size warms its own bucket
+on first use — a one-time blocking hitch, then cache hits.
 
 `metis-engine`'s `VectorText` wraps all of this (pipeline + ortho projection +
 palette paint colours) — prefer it if you're already in the engine.

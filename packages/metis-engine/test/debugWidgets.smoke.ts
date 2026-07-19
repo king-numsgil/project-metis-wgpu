@@ -51,6 +51,8 @@ async function main() {
     const post = createDefaultPostProcessPipeline(ctx.device);
     const debug = new DebugOverlay(ctx.device, ctx.outputFormat);
     debug.loadFont("mono", FONT_PATH);
+    // The overlay's own draw pass should appear in the tree it renders.
+    debug.profiler = profiler;
 
     const scene = new Scene();
     scene.environment = createExteriorEnvironment();
@@ -85,8 +87,10 @@ async function main() {
         });
         gpuHistory.push(profiler.frameTotalMs);
 
-        if (i === FRAMES - 1) {
-            // Last frame: draw the widgets over the finished image.
+        {
+            // Staged every frame, not just the last: the profiler's readback lags
+            // by a few frames, so a span that only exists on the final frame may
+            // never appear in the results that get asserted below.
             debug.graph({
                 x: W - 320,
                 y: 12,
@@ -156,7 +160,7 @@ async function main() {
 
     // The pass names the renderer hands the profiler must actually show up;
     // a silent rename would otherwise leave the tree quietly incomplete.
-    for (const want of ["forward", "cluster-build", "light-cull", "tonemap"]) {
+    for (const want of ["forward", "cluster-build", "light-cull", "tonemap", "debug-overlay"]) {
         if (!flat.some((s) => s.label === want)) {
             throw new Error(`expected a "${want}" span in the profile tree, got: ${flat.map((s) => s.label).join(", ")}`);
         }

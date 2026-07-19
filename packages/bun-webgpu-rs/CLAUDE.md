@@ -210,14 +210,76 @@ of every string. Only `stroke()` consumes `current_path`, so the outline is now
 built lazily from a retained `TextPathSource` on the first `take_path` that needs
 it.
 
-**Still slow, and known:** glyphs are cached pre-tessellated *in font units* with
-a fixed `tolerance = 0.25` (`prewarm_cache`) — i.e. 0.25 *font units*, which at
-a typical upm and a HUD-sized pixel height is orders of magnitude finer than the
-pixel grid can show, producing roughly ten times the triangles a small glyph
-needs. Because the cache is size-independent it can't simply use a per-size
-tolerance; fixing it properly means keying the cache by (glyph, size bucket).
-Not done. Consumers that redraw static text every frame should reuse `drawCalls`
-instead (see `DOC.md` §9).
+**The glyph cache is keyed by (size bucket, glyph), and that's load-bearing.**
+A glyph is flattened from curves to triangles **once, in font units**, and
+thereafter only affine-transformed — `render_text` has no tessellator in it. So
+the flattening tolerance is *baked in at cache-fill time and can never be
+adjusted later*, which is the trap: a single shared cache forces one tolerance to
+serve every size. It previously used a fixed `0.25`, which reads like a sensible
+pixel tolerance but is in **font units** — at a typical upm and HUD size that's
+hundreds of times finer than a pixel, and it produced identical geometry at every
+size (the same curved glyph cost the same triangle count at 11 px as at 64 px,
+an order of magnitude more than either needs).
+
+Each bucket now tessellates at `PIXEL_TOLERANCE * upm / size_px`, i.e. a fixed
+fraction of a *pixel* converted into font units. `PREWARM_SIZES` are warmed at
+`loadFont`; any other size snaps to a bucket within `MAX_BUCKET_RATIO`, and
+outside that a fresh bucket is warmed on demand — blocking, tessellating the
+whole prewarm glyph set, a deliberate one-time hitch in exchange for cache hits
+forever after. If a size proves common, add it to `PREWARM_SIZES` and the hitch
+moves to load time.
+
+Two consequences worth knowing:
+
+- **`VectorContext`'s `tolerance` constructor argument does not affect text.** It
+  applies to `fill`/`stroke` of *paths*, and to glyphs outside `PREWARM_RANGES`
+  only in the sense that they now use the bucket tolerance too. Setting it
+  expecting smaller text geometry does nothing — that was measured.
+- **`expand_text_path` (the `stroke()`-on-text path) doesn't touch the cache** at
+  all; it outlines glyphs fresh each call, so it's exact at any size and
+  unaffected by bucketing.
+
+The error-vs-size signature is the tell that this is right: measured against a
+near-exact reference, the difference now *shrinks* as text gets larger. Under the
+old fixed tolerance it grew. `tests/vector.test.ts` pins monotonic growth of
+triangle count with size, which fails if the tolerance conversion is reverted.
+
+### Allocation: mimalloc is global, and allocation is not a bottleneck
+
+`lib.rs` installs `mimalloc` as the `#[global_allocator]`. This matters on
+Windows specifically — the system allocator there is slow enough to show up in a
+frame budget, and mimalloc isn't. `default-features = false` on the dependency
+disables nothing (the crate's `default` feature set is empty); it's there to
+avoid picking up debug builds of mimalloc.
+
+**Verify it's actually live, don't assume:** run anything with
+`MIMALLOC_VERBOSE=1` and mimalloc prints a `process init` banner and its option
+table to stderr. A `#[global_allocator]` that silently failed to link would look
+identical in the source.
+
+**An audit concluded allocation volume is a non-issue here, and the shape of the
+result is worth keeping** so it isn't re-litigated. Method: a temporary counting
+wrapper around the global allocator plus a napi getter, then differencing the
+counter around individual calls from JS to attribute per-call cost, and a
+microbenchmark for the allocator's own round-trip time. Findings:
+
+- A full engine frame's Rust-side allocations cost a **fraction of a percent** of
+  its CPU encode time. Not worth restructuring anything for.
+- **Pass creation dominates** (the large majority of a frame's allocations), and
+  it's mostly *inherent to the napi boundary*: deserializing a
+  `#[napi(object)]` descriptor materializes a `Vec` for the attachment array and
+  an owned `String` for every label. `#[napi(object)]` fields can't borrow, so
+  labels cost several allocations each and can only be avoided by not passing
+  labels — a bad trade, since they're the names RenderDoc/PIX show.
+- `Box::new(encoder)` per pass is **load-bearing**, not waste: it's what gives the
+  encoder a stable address for the lifetime-erasure in `begin_render_pass`. Don't
+  "optimize" it away.
+- The colour-attachment `Vec` could be a `SmallVec`, saving one allocation per
+  pass. Rejected: a new dependency for a sub-percent slice of a sub-percent cost.
+
+If allocation ever *does* show up, re-derive it with the counting-allocator
+method above rather than guessing — the intuition that "a few hundred allocations
+per frame must be expensive" is wrong by two orders of magnitude here.
 
 ### wgpu / surface
 - Always use `requestAdapterForWindow(window)` (not `requestAdapter()`) for windowed rendering. It creates a temp `Surface<'static>` so the adapter is guaranteed surface-compatible.

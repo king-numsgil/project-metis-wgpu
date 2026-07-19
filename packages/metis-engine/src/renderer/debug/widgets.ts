@@ -1,6 +1,6 @@
 import type { GpuCommandEncoder, GpuDevice, GPUTextureFormat, GpuTextureView } from "bun-webgpu-rs";
 import { MAX_PALETTE_COLORS, type Rgba, VectorText } from "../text/vectorText.ts";
-import type { ProfileSpan } from "./gpuProfiler.ts";
+import type { GpuProfiler, ProfileSpan } from "./gpuProfiler.ts";
 
 /**
  * Default widget colors. Linear RGBA — these composite onto the *tonemapped*
@@ -170,6 +170,23 @@ export class DebugOverlay {
 
     constructor(device: GpuDevice, outputFormat: GPUTextureFormat) {
         this.text = new VectorText(device, outputFormat);
+        this.text.profileLabel = "debug-overlay";
+    }
+
+    /**
+     * Optional GPU profiler — forwards to the underlying `VectorText`, so the
+     * overlay's own draw pass appears in the profiler tree it is displaying.
+     *
+     * Only the GPU pass is measured. Staging the widgets (`graph`/`tree`/`label`)
+     * is CPU work that happens before encoding, so it never appears here — see
+     * `due()` for why that cost matters and how it's kept down.
+     */
+    get profiler(): GpuProfiler | undefined {
+        return this.text.profiler;
+    }
+
+    set profiler(p: GpuProfiler | undefined) {
+        this.text.profiler = p;
     }
 
     /**

@@ -580,6 +580,9 @@ into the HDR target or ACES will wash them out.
 
 ```ts
 hud.renderCached(encoder, view, width, height, loadOp = "load");
+
+hud.profiler = myProfiler;        // opt in to the GPU profiler tree (§10)
+hud.profileLabel = "hud-text";    // name the span; set per instance
 ```
 
 Re-draws the last `render()`'s geometry **without re-tessellating**. `drawText`
@@ -616,6 +619,8 @@ debug.destroy();
   (`fraction` 0..1) and a right-aligned `value` string. Height is derived from
   the row count.
 - `label(text, x, y, color?, fontSize?)` — plain text.
+- `debug.profiler = myProfiler` — puts the overlay's own draw pass into the
+  profiler tree (as `debug-overlay`). Forwards to the underlying `VectorText`.
 - `History(capacity)` — rolling sample buffer (`push`, `values()`, `mean`, `max`,
   `latest`), the shape `graph` plots.
 - `DEBUG_THEME` — default colours (`panel`/`border`/`grid`/`text`/`good`/`warn`/
@@ -659,6 +664,13 @@ debug.tree({ x, y, width, title: `GPU — ${profiler.frameTotalMs.toFixed(3)} ms
 | `beginFrame(encoder)` / `endFrame(encoder)` | frame bracket; `endFrame` must precede `submit` |
 | `beginZone(pass, label)` / `endZone(pass)` | manual per-draw zones; no-ops without `canProfileDraws` |
 | `destroy()` | releases the query set + readback ring |
+
+**Text passes measure GPU time only.** Setting `profiler` on a `VectorText` or
+`DebugOverlay` adds its draw pass to the tree, but that pass is a few thousand
+triangles and reads as a rounding error. The expensive part of text —
+`drawText`'s glyph transform + buffer staging — is **CPU** work done before any
+command is encoded, so it is invisible to timestamp queries and shows up in CPU
+encode instead. A near-zero `debug-overlay` span does not mean the HUD is free.
 
 `gpuProfilerSupport(adapter)` reports the three tiers; `gpuProfilerFeatures(adapter)`
 returns exactly the supported ones to pass to `requiredFeatures` (requesting an

@@ -57,6 +57,10 @@ const gpuHistory = new History(120);
 let showProfiler = false;
 if (profiler) {
     forward.profiler = profiler;
+    // Both text layers draw into the frame, so both belong in the tree.
+    hud.profiler = profiler;
+    hud.profileLabel = "hud-text";
+    debug.profiler = profiler;
     console.log(
         `[demo] GPU profiler ready — press P. draw zones: ${profiler.canProfileDraws}, ` +
             `measured frame total: ${profiler.canProfileFrameTotal}`,

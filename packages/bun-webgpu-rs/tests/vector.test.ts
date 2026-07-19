@@ -334,3 +334,67 @@ describe("VectorContext text", () => {
         }
     });
 });
+
+describe("glyph cache is bucketed by size", () => {
+    /** Triangles produced for a single glyph at `size`. */
+    function tris(ctx: VectorContext, glyph: string, size: number): number {
+        ctx.drawText(glyph, "mono", size, 0, 0);
+        ctx.fill();
+        ctx.flush();
+        return ctx.drawCalls.reduce((sum, c) => sum + c.indexCount, 0) / 3;
+    }
+
+    it("tessellates curved glyphs more finely as size grows", () => {
+        if (!device) {
+            return;
+        }
+        // The regression this guards: geometry is flattened once in FONT UNITS
+        // and thereafter only transformed, so a cache that isn't keyed by size
+        // bakes in one tolerance for every size. That previously meant ~0.0028 px
+        // at HUD sizes — 244 triangles for '8' at 11px, and the identical 244 at
+        // 64px. Monotonic growth here is the signature of a per-size tolerance.
+        const ctx = new VectorContext(device!);
+        ctx.loadFont("mono", FONT_PATH);
+        const small = tris(ctx, "8", 11);
+        const large = tris(ctx, "8", 64);
+        expect(small).toBeGreaterThan(0);
+        expect(large).toBeGreaterThan(small);
+        // And it must stay in the sane range — a pixel-accurate small glyph is
+        // tens of triangles, not hundreds.
+        expect(small).toBeLessThan(120);
+    });
+
+    it("keeps straight-edged glyphs cheap at every size", () => {
+        if (!device) {
+            return;
+        }
+        // 'I' has no curves, so tolerance is irrelevant to it; if this ever
+        // scales with size, something is flattening straight lines.
+        const ctx = new VectorContext(device!);
+        ctx.loadFont("mono", FONT_PATH);
+        expect(tris(ctx, "I", 64)).toBe(tris(ctx, "I", 11));
+    });
+
+    it("renders a size with no prewarmed bucket (warms on demand)", () => {
+        if (!device) {
+            return;
+        }
+        const ctx = new VectorContext(device!);
+        ctx.loadFont("mono", FONT_PATH);
+        // Far outside PREWARM_SIZES, so this must warm a fresh bucket rather
+        // than fail or render nothing.
+        expect(tris(ctx, "8", 200)).toBeGreaterThan(0);
+        expect(tris(ctx, "8", 3)).toBeGreaterThan(0);
+    });
+
+    it("still renders text at degenerate sizes", () => {
+        if (!device) {
+            return;
+        }
+        const ctx = new VectorContext(device!);
+        ctx.loadFont("mono", FONT_PATH);
+        // bucket_key clamps these; they must not panic or hang.
+        expect(tris(ctx, "8", 0)).toBeGreaterThanOrEqual(0);
+        expect(tris(ctx, "8", -12)).toBeGreaterThanOrEqual(0);
+    });
+});

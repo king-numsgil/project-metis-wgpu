@@ -547,7 +547,9 @@ impl GpuCommandEncoder {
 
     #[napi]
     pub fn begin_compute_pass(&self, descriptor: Option<GpuComputePassDescriptor>) -> napi::Result<GpuComputePassEncoder> {
-        let label = descriptor.as_ref().and_then(|d| d.label.clone());
+        // Borrow, don't clone: `descriptor` is owned by this call and outlives
+        // the pass creation below. begin_render_pass already does it this way.
+        let label = descriptor.as_ref().and_then(|d| d.label.as_deref());
 
         // Build timestamp writes as an owned value
         let ts_attachment: Option<wgpu::ComputePassTimestampWrites<'_>> =
@@ -576,7 +578,7 @@ impl GpuCommandEncoder {
             let ptr = boxed.as_mut() as *mut wgpu::CommandEncoder;
             let enc_ref: &'static mut wgpu::CommandEncoder = &mut *ptr;
             let pass = enc_ref.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: label.as_deref(),
+                label,
                 timestamp_writes: ts_attachment,
             });
             std::mem::transmute::<wgpu::ComputePass<'_>, wgpu::ComputePass<'static>>(pass)

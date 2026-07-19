@@ -637,8 +637,14 @@ export declare class VectorContext {
    * Create a new `VectorContext`.
    *
    * - `device` — the wgpu device that owns the vertex / index buffers.
-   * - `tolerance` — tessellation tolerance in pixels (default `0.25`).
-   *   Lower = smoother curves, more triangles.
+   * - `tolerance` — flattening tolerance **for paths** (`fill`/`stroke`), in
+   *   the same pixel-space coordinates the path is built in (default
+   *   `0.25`). Lower = smoother curves, more triangles.
+   *
+   * This does **not** affect text: glyph geometry is cached per size bucket
+   * and flattened at a tolerance derived from the requested pixel size (see
+   * `font.rs`), because a glyph is tessellated once in font units and then
+   * only transformed.
    */
   constructor(device: GpuDevice, tolerance?: number | undefined | null)
   /**

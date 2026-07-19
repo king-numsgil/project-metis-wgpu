@@ -204,6 +204,8 @@ if (PROFILE && !profiler) {
 }
 if (profiler) {
     forward.profiler = profiler;
+    // The HUD draws into the same frame, so it belongs in the same tree.
+    hud.profiler = profiler;
 }
 const gpuHistory = new History(120);
 

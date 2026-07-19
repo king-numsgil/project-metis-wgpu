@@ -21,6 +21,23 @@ struct CachedGlyph {
     advance: f32,
 }
 
+/// Sizes (px) whose glyph geometry is tessellated up front at `loadFont`.
+/// Chosen to cover the HUD / debug-widget range this repo actually draws at;
+/// any other size warms on first use (see `ensure_bucket`).
+const PREWARM_SIZES: &[u16] = &[11, 16, 24, 32];
+
+/// Target flattening error **in pixels** for cached glyph geometry. A quarter
+/// pixel is below what the raster can show and is what 2D canvas
+/// implementations typically use.
+const PIXEL_TOLERANCE: f32 = 0.25;
+
+/// How far a cached bucket may be stretched to serve a nearby size before a new
+/// bucket is warmed instead. Geometry tessellated for bucket `B` and drawn at
+/// size `S` has an effective error of `PIXEL_TOLERANCE * S / B`, so at 1.25 the
+/// error stays within [0.2, 0.31] px either way — invisible — while keeping the
+/// bucket count (and so the memory) small.
+const MAX_BUCKET_RATIO: f32 = 1.25;
+
 const PREWARM_RANGES: &[(u32, u32)] = &[
     (0x0020, 0x007E), // Basic Latin
     (0x00A0, 0x00FF), // Latin-1 Supplement
@@ -40,8 +57,38 @@ const PREWARM_RANGES: &[(u32, u32)] = &[
 struct FontEntry {
     bytes: Vec<u8>,
     face_index: u32,
-    glyph_cache: HashMap<u16, CachedGlyph>,
+    /// Tessellated geometry per **size bucket**, then per glyph id.
+    ///
+    /// Keying by size is the whole point: the geometry is flattened *once* at
+    /// font-unit scale, so the tolerance is baked in and cannot be adjusted when
+    /// the glyph is later scaled to a pixel size. One shared cache therefore
+    /// forces a single tolerance to serve every size — which previously meant a
+    /// fixed 0.25 *font units*, i.e. ~364x finer than a pixel at HUD sizes, and
+    /// 10-20x more triangles than a curve needs.
+    buckets: HashMap<u16, HashMap<u16, CachedGlyph>>,
     fill_rule: FillRule,
+}
+
+/// Multiplicative distance between two sizes (scale error is multiplicative,
+/// not additive — 8px vs 11px matters far more than 64px vs 67px).
+fn size_ratio(a: u16, b: u16) -> f32 {
+    let (a, b) = (a as f32, b as f32);
+    if a > b { a / b } else { b / a }
+}
+
+/// The bucket key for a requested size. Clamped so a degenerate or absurd size
+/// can't produce a nonsense key; `abs` because a negative size mirrors the text
+/// but needs the same geometry density.
+fn bucket_key(size_px: f32) -> u16 {
+    size_px.abs().round().clamp(1.0, 4096.0) as u16
+}
+
+/// Flattening tolerance **in font units** that yields `PIXEL_TOLERANCE` pixels
+/// of error once the glyph is scaled to `size_px`. Tessellation happens in font
+/// units, so the tolerance must be converted into them — passing a pixel-shaped
+/// number straight to lyon is exactly the bug this replaces.
+fn tolerance_for(size_px: f32, upm: f32) -> f32 {
+    PIXEL_TOLERANCE * upm / size_px.abs().max(1.0)
 }
 
 pub struct FontStore {
@@ -59,13 +106,56 @@ impl FontStore {
         let face = Face::parse(&bytes, face_index)
             .map_err(|e| format!("Failed to parse font '{}': {:?}", path, e))?;
         let fill_rule = detect_fill_rule(&face);
-        let glyph_cache = prewarm_cache(&face, fill_rule.clone());
-        self.fonts.insert(name, FontEntry { bytes, face_index, glyph_cache, fill_rule });
+        let mut buckets = HashMap::new();
+        for &size in PREWARM_SIZES {
+            buckets.insert(size, warm_bucket(&face, &fill_rule, size));
+        }
+        self.fonts.insert(name, FontEntry { bytes, face_index, buckets, fill_rule });
         Ok(())
     }
 
     pub fn unload(&mut self, name: &str) {
         self.fonts.remove(name);
+    }
+
+    /// Returns the bucket that should serve `size_px`, warming a new one first
+    /// if no existing bucket is within `MAX_BUCKET_RATIO`.
+    ///
+    /// Warming is **blocking and tessellates the whole prewarm glyph set** at
+    /// that size. That's deliberate: it's a one-time hitch the first time an
+    /// unusual size is drawn, after which every draw at that size is a cache
+    /// hit. If a size turns out to be common, add it to `PREWARM_SIZES` and the
+    /// hitch moves to `loadFont`.
+    fn ensure_bucket(&mut self, font_name: &str, size_px: f32) -> Result<u16, String> {
+        let want = bucket_key(size_px);
+        {
+            let entry = self.fonts.get(font_name)
+                .ok_or_else(|| format!("Unknown font: '{}'", font_name))?;
+            let best = entry
+                .buckets
+                .keys()
+                .copied()
+                .min_by(|&a, &b| {
+                    size_ratio(a, want)
+                        .partial_cmp(&size_ratio(b, want))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+            if let Some(b) = best {
+                if size_ratio(b, want) <= MAX_BUCKET_RATIO {
+                    return Ok(b);
+                }
+            }
+        }
+
+        // Borrow ends before the insert below.
+        let cache = {
+            let entry = self.fonts.get(font_name).unwrap();
+            let face = Face::parse(&entry.bytes, entry.face_index)
+                .map_err(|e| format!("Failed to parse font '{}': {:?}", font_name, e))?;
+            warm_bucket(&face, &entry.fill_rule, want)
+        };
+        self.fonts.get_mut(font_name).unwrap().buckets.insert(want, cache);
+        Ok(want)
     }
 
     fn parse<'a>(&'a self, name: &str) -> Result<(Face<'a>, FillRule), String> {
@@ -85,14 +175,15 @@ fn detect_fill_rule(face: &Face) -> FillRule {
 // Cache pre-warming
 // ---------------------------------------------------------------------------
 
-fn prewarm_cache(face: &Face, fill_rule: FillRule) -> HashMap<u16, CachedGlyph> {
+/// Tessellates the whole prewarm glyph set for one size bucket.
+fn warm_bucket(face: &Face, fill_rule: &FillRule, size_px: u16) -> HashMap<u16, CachedGlyph> {
     let mut cache = HashMap::new();
     let mut tess = FillTessellator::new();
-    let lyon_rule = to_lyon_fill_rule(&fill_rule);
-    let options = FillOptions::default()
-        .with_tolerance(0.25)
-        .with_fill_rule(lyon_rule);
+    let lyon_rule = to_lyon_fill_rule(fill_rule);
     let upm = face.units_per_em() as f32;
+    let options = FillOptions::default()
+        .with_tolerance(tolerance_for(size_px as f32, upm))
+        .with_fill_rule(lyon_rule);
     for &(lo, hi) in PREWARM_RANGES {
         for cp in lo..=hi {
             let ch = match char::from_u32(cp) { Some(c) => c, None => continue };
@@ -169,7 +260,6 @@ pub fn render_text(
     origin_y: f32,
     local_transform: &Transform2D<f32>,
     fill_tess: &mut FillTessellator,
-    tolerance: f32,
     out_vertices: &mut Vec<[f32; 2]>,
     out_indices: &mut Vec<u32>,
 ) -> Result<FillRule, String> {
@@ -179,6 +269,10 @@ pub fn render_text(
         need_tessellation: bool,
         is_notdef: bool,
     }
+
+    // Resolve (and if necessary warm) the size bucket before anything else —
+    // every cache lookup below is scoped to it.
+    let bucket = font_store.ensure_bucket(font_name, size_px)?;
 
     let fill_rule;
     let upm;
@@ -212,7 +306,10 @@ pub fn render_text(
                     }
                 }
                 Some(id) => {
-                    let in_cache = entry.glyph_cache.contains_key(&id.0);
+                    let in_cache = entry
+                        .buckets
+                        .get(&bucket)
+                        .is_some_and(|c| c.contains_key(&id.0));
                     work_items.push(GlyphWork {
                         glyph_id_u16: id.0,
                         transform: glyph_transform,
@@ -229,7 +326,12 @@ pub fn render_text(
     let has_misses = work_items.iter().any(|w| w.need_tessellation);
     if has_misses {
         let lyon_rule = to_lyon_fill_rule(&fill_rule);
-        let options = FillOptions::default().with_tolerance(tolerance).with_fill_rule(lyon_rule);
+        // Same per-bucket tolerance the prewarm used, so a glyph outside
+        // PREWARM_RANGES (CJK, emoji, …) gets geometry of the same density as
+        // its neighbours rather than whatever the context default happens to be.
+        let options = FillOptions::default()
+            .with_tolerance(tolerance_for(bucket as f32, upm))
+            .with_fill_rule(lyon_rule);
         let entry = font_store.fonts.get(font_name).unwrap();
         let face = Face::parse(&entry.bytes, entry.face_index)
             .map_err(|e| format!("Failed to parse font '{}': {:?}", font_name, e))?;
@@ -245,16 +347,18 @@ pub fn render_text(
 
     if !new_entries.is_empty() {
         let entry = font_store.fonts.get_mut(font_name).unwrap();
+        let cache = entry.buckets.entry(bucket).or_default();
         for (id, glyph) in new_entries {
-            entry.glyph_cache.insert(id, glyph);
+            cache.insert(id, glyph);
         }
     }
 
     {
         let entry = font_store.fonts.get(font_name).unwrap();
+        let cache = entry.buckets.get(&bucket);
         for item in &work_items {
             if item.is_notdef { continue; }
-            let cached = match entry.glyph_cache.get(&item.glyph_id_u16) {
+            let cached = match cache.and_then(|c| c.get(&item.glyph_id_u16)) {
                 Some(c) => c,
                 None => continue,
             };

@@ -162,8 +162,14 @@ impl VectorContext {
     /// Create a new `VectorContext`.
     ///
     /// - `device` — the wgpu device that owns the vertex / index buffers.
-    /// - `tolerance` — tessellation tolerance in pixels (default `0.25`).
-    ///   Lower = smoother curves, more triangles.
+    /// - `tolerance` — flattening tolerance **for paths** (`fill`/`stroke`), in
+    ///   the same pixel-space coordinates the path is built in (default
+    ///   `0.25`). Lower = smoother curves, more triangles.
+    ///
+    /// This does **not** affect text: glyph geometry is cached per size bucket
+    /// and flattened at a tolerance derived from the requested pixel size (see
+    /// `font.rs`), because a glyph is tessellated once in font units and then
+    /// only transformed.
     #[napi(constructor)]
     pub fn new(device: &GpuDevice, tolerance: Option<f64>) -> napi::Result<Self> {
         Ok(VectorContext {
@@ -465,7 +471,7 @@ impl VectorContext {
         let fill_rule = font::render_text(
             &mut self.fonts, &font_name, size_px as f32,
             &text, x as f32, y as f32, &lt,
-            &mut self.fill_tess, self.tolerance,
+            &mut self.fill_tess,
             &mut pre_verts, &mut pre_idxs,
         ).map_err(napi::Error::from_reason)?;
         self.pending_render = Some((pre_verts, pre_idxs, fill_rule.clone()));
