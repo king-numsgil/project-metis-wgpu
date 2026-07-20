@@ -449,6 +449,22 @@ Removing it also dropped a CMake-built C dependency tree (libpng, libjpeg,
 libwebp, …) from the build. **SDL3 itself is unaffected** — `sdl3-sys` stays;
 this only removed `sdl3-image-sys`.
 
+**An unplanned third win: decoding is now bit-identical across platforms.**
+SDL3_image's 16-bit PNG handling varied by platform — that is what the byte-order
+bug above *was* — so the same file decoded to different bytes on Windows and
+Linux. `image` is pure Rust with no platform-conditional path, so it does not.
+This was not a goal of the migration; it fell out of deleting platform-dependent
+C from the pipeline.
+
+The downstream consequence is larger than it sounds: `metis-engine`'s fixture
+goldens now reproduce **byte-for-byte** between Windows and Linux, which they
+could not while the decoder varied. That turns the screenshot fixtures into a
+real regression baseline. See "The fixture goldens are a genuine byte-exact
+baseline" in `metis-engine/CLAUDE.md` — **including its bounds**, which matter:
+decode determinism is guaranteed by construction and holds anywhere, but the
+observed *render* identity was measured across two configurations sharing one
+GPU and driver, and is not a cross-vendor guarantee.
+
 `tests/image-16bit.test.ts` still pins both SDL_image bugs (byte order and the
 grayscale overflow) as behaviour the replacement must also get right. They are
 regression tests for a decoder that is gone, deliberately: they are the cases

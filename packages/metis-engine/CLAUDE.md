@@ -49,8 +49,11 @@ Run from `packages/metis-engine/` unless noted.
 bun install
 
 # Headless render + screenshot validation — writes PNGs to test/output/,
-# via bun-webgpu-rs's native readTexturePixels/saveTextureToFile
-bun run fixture
+# via bun-webgpu-rs's native readTexturePixels/saveTextureToFile.
+# The goldens are byte-exact: a clean `git status` after this means the render
+# path reproduced exactly. A diff is signal — read "The fixture goldens are a
+# genuine byte-exact baseline" below before reverting it.
+bun run fixture && git status --short test/output
 
 # Interactive windowed demos (WASD+QE fly, arrows look, Esc quit)
 bun run demo:exterior
@@ -510,6 +513,64 @@ There's no `if (interior)` branch anywhere in the shading code. `Environment.amb
 ### Ambient occlusion is a swappable enum, and only touches the ambient term
 
 `ClusteredForwardRenderer` owns an `AmbientOcclusion` (`src/renderer/ao/`); set `renderer.ao.technique` to `AoTechnique.None`, `.SSAO`, or `.HBAO` (a runtime quality dial — the interior demo cycles it with the `O` key). When active it runs three passes *before* the forward pass — a geometry prepass (view-space normals + depth), the chosen occlusion technique (`ssao.wgsl`/`hbao.wgsl`, fullscreen), and a box blur — and `forward.wgsl` multiplies the result into **only** the flat ambient term. That last part is the load-bearing correctness point: AO approximates occlusion of *indirect/bounce* light, so it must never darken the sun or point lights (their occlusion is the shadow map's job). Multiplying the whole lit image by AO — which some engines do — double-darkens shadowed creases and is wrong. `None` is branchless: the renderer clears the AO buffer to white so the forward multiply is a no-op, mirroring the always-bound-placeholder pattern the material textures already use. Both techniques' math (and the deliberate normal-oriented HBAO tangent simplification) is in `math/Ambient occlusion formulas.md`; `test/ao.test.ts` validates the kernel generators on the CPU and, via GPU readback + a `pushErrorScope`, that each technique darkens a box's contact creases without any swallowed WGSL validation error. The prepass is a *second* geometry pass (a production engine would share a depth prepass); at this engine's scale the duplicate draw is cheap and keeps AO decoupled from the forward path.
+
+### The fixture goldens are a genuine byte-exact baseline — and the exact bounds of that
+
+`test/output/*.png` reproduce **byte-for-byte** between this repo's Linux (WSL)
+and Windows runs. Verified 2026-07-20: a full Windows suite run against
+Linux-generated goldens produced no diff at all.
+
+This was **not** true before the image decoder was replaced, and the reason is
+the whole point. SDL3_image's 16-bit PNG handling was platform-dependent (the
+"works on Windows, garbage on Linux" byte-order bug — see `bun-webgpu-rs`'s
+`CLAUDE.md`), so the two platforms were feeding *different texture bytes* into an
+otherwise identical render. The renders differed because the **inputs** differed.
+The pure-Rust `image` crate decodes bit-identically everywhere, which removed
+that variable and collapsed the two platforms onto each other.
+
+Worth stating plainly: cross-platform reproducibility was never a design goal of
+that migration. It fell out of deleting platform-dependent C from the pipeline.
+
+**Correction to the record — do not repeat this mistake.** During the migration,
+the first Linux fixture run produced goldens a few hundred bytes different from
+the committed Windows ones (`exterior.png` 97453 → 97643). That was diagnosed as
+"GPU nondeterminism" and the goldens were reverted **twice** on that basis. The
+diagnosis was wrong: the cause was the decoder, not the GPU. It is recorded here
+because the wrong belief is the actively dangerous artifact — "goldens drift
+between platforms, just revert them" licenses dismissing every image diff as
+noise, which is exactly how a real regression walks in unnoticed.
+
+**What this licenses.** A golden diff is now *signal*. `bun run fixture` followed
+by a clean `git status` means the render path reproduced exactly; a diff means
+something changed, and the first move is to find out what, not to revert.
+
+**What this does NOT license — the bound.** The guarantee is uneven, and the two
+halves have very different strength:
+
+- **Decode determinism is guaranteed by construction.** The `image` crate is pure
+  Rust with no platform-conditional path. This holds on *any* hardware, and is
+  the half that actually changed.
+- **Render determinism is merely observed, on one GPU.** Both sides of the
+  comparison bottom out on the same driver: WSL here runs **Mesa Dozen (`dzn`)**,
+  a Vulkan-on-D3D12 translation layer, so `enumerateAdapters()` reports
+  `Microsoft Direct3D12 (NVIDIA GeForce GTX 1070)` with `backendType: "Vulkan"`.
+  That is the same NVIDIA D3D12 driver and shader compiler Windows uses — same
+  hardware, same codegen, same float results. It is evidence that the *decode*
+  is now deterministic; it is **not** evidence that shading is bit-identical
+  across vendors.
+
+So on genuinely different hardware (AMD, Intel, Apple, or a CI runner), goldens
+may legitimately differ: FMA contraction, transcendental precision, and
+fast-math latitude are all implementation-defined in shader compilation. Before
+calling such a diff a regression, look at its *shape* — a few LSBs scattered
+across the whole image is numeric drift; a structured or localised difference is
+a real change. Do not "fix" a cross-vendor diff by regenerating goldens on the
+new machine, or the baseline stops meaning anything on the old one.
+
+This is also what makes `DOC.md`'s phrase "a byte-exact screenshot baseline"
+literally true rather than aspirational — it could not have been, while the
+decoder varied by platform.
+
 
 ### The headless target is sRGB, and it was silently wrong for a long time
 
