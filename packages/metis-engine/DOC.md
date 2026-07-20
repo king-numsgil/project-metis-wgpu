@@ -431,8 +431,8 @@ passes you'd have to thread `timestampWrites` into the private passes.
 ```ts
 CLUSTER_COUNT_X = 16; CLUSTER_COUNT_Y = 9; CLUSTER_COUNT_Z = 24;
 NUM_CLUSTERS = 3456;              // X*Y*Z
-MAX_LIGHTS_PER_CLUSTER = 64;      // per-cluster capacity cap
-MAX_POINT_LIGHTS = 256;           // per-scene cap (excess is dropped with a console.warn)
+MAX_LIGHTS_PER_CLUSTER = 96;      // per-cluster capacity cap
+MAX_POINT_LIGHTS = 384;           // per-scene cap (excess is dropped with a console.warn)
 COMPUTE_WORKGROUP_SIZE = 64;
 ```
 
@@ -445,9 +445,19 @@ completely independent of the reverse-Z depth convention.
 more than that many lights overlap one cluster, the cull loop `break`s and the
 rest are silently skipped for that cluster. With animated lights this reads as
 tile-shaped popping/flicker. It is *not* an out-of-bounds bug — the shaders are
-correctly bounded — it is capacity. Raising it costs
-`NUM_CLUSTERS × cap × 4 bytes` (64 → ~884 KB). This is the first thing to suspect
-for tile-shaped artifacts at high light counts.
+correctly bounded — it is capacity. This is the first thing to suspect for
+tile-shaped artifacts at high light counts.
+
+**The two caps are coupled** — raising `MAX_POINT_LIGHTS` without also raising
+this one silently drops light. Peak per-cluster occupancy on `bench/lights.ts`
+(a deliberately dense field) runs at roughly a fifth of the scene's light count,
+so the old 256/64 pair was self-consistent but 384 lights would have overflowed
+64. Measure occupancy before raising one alone: render `lightCountInCluster`
+from `forward.wgsl` and read it back.
+
+Cost is allocation only — `NUM_CLUSTERS × cap × 4 bytes`, and it dominates the
+clustering budget. Neither cap affects render time: the cull loops over the
+*actual* light count and the forward pass over the *actual* per-cluster count.
 
 Z-slicing is exponential (Doom 2016): slice `z` spans view depth
 `[zNear·(zFar/zNear)^(z/countZ), …^((z+1)/countZ))`. The fragment-side lookup in
