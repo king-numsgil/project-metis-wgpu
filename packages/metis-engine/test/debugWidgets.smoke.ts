@@ -5,7 +5,7 @@
 // (just empty). So this asserts on the numbers — non-zero per-pass timings that
 // sum sanely — and only then draws the widgets and screenshots them.
 import { GPUTextureUsage } from "bun-webgpu-rs";
-import { takeScreenshot } from "bun-webgpu-rs/tests/helpers/screenshot.ts";
+import { readTexturePixels, savePixelsToFile } from "bun-webgpu-rs";
 import {
     ClusteredForwardRenderer,
     createDefaultPostProcessPipeline,
@@ -173,7 +173,8 @@ async function main() {
         console.log(`\n  per-draw zones: ${zones.length} (${zones.map((z) => z.label).join(", ")})`);
     }
 
-    const pixels = await takeScreenshot(ctx.device, ctx.captureTexture!, W, H, "test/output/debug-widgets.png");
+    const pixels = await readTexturePixels(ctx.device, ctx.captureTexture!);
+    await savePixelsToFile(pixels, W, H, "test/output/debug-widgets.png");
     let lit = 0;
     for (let i = 0; i < pixels.length; i += 4) {
         if (pixels[i]! > 5 || pixels[i + 1]! > 5 || pixels[i + 2]! > 5) {

@@ -13,7 +13,7 @@
 // correct implementation must shade identically at any clusterNear. Any
 // difference means lights were lost.
 import { expect, test } from "bun:test";
-import { readbackTexture } from "bun-webgpu-rs/tests/helpers/screenshot.ts";
+import { readTexturePixels } from "bun-webgpu-rs";
 import {
     ClusteredForwardRenderer,
     createDefaultPostProcessPipeline,
@@ -88,7 +88,7 @@ async function meanLuma(clusterNear: number, wallDepth: number): Promise<number>
     }
     frame.present();
 
-    const pixels = await readbackTexture(ctx.device, ctx.captureTexture!, W, H);
+    const pixels = await readTexturePixels(ctx.device, ctx.captureTexture!);
     // Only the centre 20% box, where the (deliberately small-range) light is.
     // A whole-frame mean would depend on how much of the frame the lit disc
     // covers, which changes with wall distance — making the far cases fail for

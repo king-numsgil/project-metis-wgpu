@@ -6,7 +6,7 @@ import {
     GPUTextureUsage,
     type GpuTextureView,
     ImageColorSpace,
-    sdlImageLoadTexture,
+    loadImageTexture,
 } from "bun-webgpu-rs";
 
 export interface LoadedTexture {
@@ -15,22 +15,22 @@ export interface LoadedTexture {
 }
 
 /**
- * Loads an image file into a GPU texture via bun-webgpu-rs's SDL3_image binding
- * (`sdlImageLoadTexture`), which decodes *and* uploads entirely in Rust — the
- * pixel bytes never cross the FFI boundary. Handles PNG/JPG/WebP/… (whatever
- * SDL_image was built with), replacing the engine's former hand-rolled PNG
- * decoder. Async: the decode + upload run on a native worker thread, so a big
- * texture doesn't stall the frame loop, and `Promise.all` of several loads
- * decodes them in parallel.
+ * Loads an image file into a GPU texture via bun-webgpu-rs's `loadImageTexture`,
+ * which decodes *and* uploads entirely in Rust — the pixel bytes never cross the
+ * FFI boundary. Handles PNG/TGA/JPEG/Radiance HDR. Async: the decode + upload run
+ * on a native worker thread, so a big texture doesn't stall the frame loop, and
+ * `Promise.all` of several loads decodes them in parallel.
  *
  * `srgb` should be `true` for colour data (albedo, emissive) and `false` for
  * data maps (normal, metallic, roughness) — see math/PBR shading formulas.md.
+ * It is **ignored for `.hdr`**, which is linear by definition and loads as
+ * `rgba16float` rather than `rgba8unorm`; read `texture.format` if it matters.
  */
 export async function loadTexture(device: GpuDevice, path: string, options?: {
     srgb?: boolean;
     label?: string
 }): Promise<LoadedTexture> {
-    const texture = await sdlImageLoadTexture(device, path, {
+    const texture = await loadImageTexture(device, path, {
         label: options?.label ?? path,
         colorSpace: options?.srgb ? ImageColorSpace.Srgb : ImageColorSpace.Linear,
         usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,

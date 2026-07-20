@@ -188,9 +188,31 @@ export class RenderContext {
     private readonly surface: GpuSurface | null;
     // undefined = take the binding's default present mode (mailbox); see configure().
     private readonly presentMode: GPUPresentMode | undefined;
-    // takeScreenshot (bun-webgpu-rs/tests/helpers/screenshot.ts) can only read
-    // back tight rgba8unorm, so the offscreen path is pinned to that format.
-    private readonly offscreenFormat: GPUTextureFormat = "rgba8unorm";
+    /**
+     * **sRGB, and that is load-bearing** — it must stay in the same colour space
+     * as a real swapchain, which is `bgra8unorm-srgb` on every backend this runs
+     * on.
+     *
+     * `tonemap.wgsl` ends at `acesFilmic(...)` and writes **linear** values; it
+     * performs no sRGB encoding of its own, relying on the target format's
+     * `-srgb` suffix for the hardware encode-on-write. So the output format is
+     * not a free choice — it is the last step of the colour pipeline.
+     *
+     * This was `rgba8unorm` (no `-srgb`) for as long as readback could only
+     * handle that format, which silently skipped the encode: headless captures
+     * were linear values stored as if they were sRGB, i.e. **markedly darker
+     * than the same scene in a window** (measured on the exterior fixture: mean
+     * R 94.8 vs 147.9, and the two images differ by exactly the sRGB transfer
+     * curve to within 8-bit rounding). Screenshot validation was therefore
+     * validating an image the engine never actually displays. The readback
+     * constraint is gone, so the format now matches the windowed path.
+     *
+     * Corollary: anything building a pipeline that targets this texture must
+     * take `ctx.outputFormat` rather than hardcoding a format — a mismatch is a
+     * *silent* validation error (stderr only) that still writes a plausible
+     * file. `test/fixture.ts`'s `NaiveClampPass` is the cautionary example.
+     */
+    private readonly offscreenFormat: GPUTextureFormat = "rgba8unorm-srgb";
     /**
      * Resolved once, never per frame. `surface.getPreferredFormat()` is a
      * `get_capabilities()` WSI round-trip costing **~6 ms** on this machine's
@@ -241,7 +263,7 @@ export class RenderContext {
         return this.windowedFormat ?? this.offscreenFormat;
     }
 
-    /** The texture backing the offscreen target — `null` in windowed mode. Read this back with `takeScreenshot`. */
+    /** The texture backing the offscreen target — `null` in windowed mode. Read this back with `readTexturePixels` / `saveTextureToFile`. */
     get captureTexture(): GpuTexture | null {
         return this.offscreenTarget;
     }

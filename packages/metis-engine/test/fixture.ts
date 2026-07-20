@@ -1,15 +1,18 @@
-// Headless (no SDL window) render + screenshot validation. Reuses
-// bun-webgpu-rs's own `takeScreenshot` test helper — see
+// Headless (no SDL window) render + screenshot validation, via
+// bun-webgpu-rs's native `readTexturePixels` / `saveTextureToFile` — see
 // bun-webgpu-rs/tests/render.test.ts for the offscreen-rgba8unorm pattern
-// this mirrors (the swapchain's bgra8unorm-srgb can't be read back directly).
+// this mirrors.
 import {
     type GpuBindGroupLayout,
     type GpuCommandEncoder,
     type GpuDevice,
     type GpuRenderPipeline,
+    type GPUTextureFormat,
     GPUShaderStage,
+    readTexturePixels,
+    savePixelsToFile,
+    saveTextureToFile,
 } from "bun-webgpu-rs";
-import { takeScreenshot } from "bun-webgpu-rs/tests/helpers/screenshot.ts";
 import {
     ClusteredForwardRenderer,
     createDefaultPostProcessPipeline,
@@ -76,7 +79,8 @@ async function renderToFile(name: string, hudLabel: string, buildScene: (device:
         frame.present();
     }
 
-    const pixels = await takeScreenshot(ctx.device, ctx.captureTexture!, W, H, `test/output/${name}.png`);
+    const pixels = await readTexturePixels(ctx.device, ctx.captureTexture!);
+    await savePixelsToFile(pixels, W, H, `test/output/${name}.png`);
     console.log(`${name}.png written, ${pixels.length} bytes of pixel data`);
 
     forward.destroy();
@@ -169,7 +173,10 @@ class NaiveClampPass implements PostProcessPass {
     private readonly pipeline: GpuRenderPipeline;
     private readonly bindGroupLayout: GpuBindGroupLayout;
 
-    constructor(private readonly device: GpuDevice) {
+    // Takes the output format rather than hardcoding one: the offscreen target
+    // is sRGB, and a pipeline built against a mismatched format fails validation
+    // silently (stderr only) while still producing a file.
+    constructor(private readonly device: GpuDevice, outputFormat: GPUTextureFormat) {
         const module = device.createShaderModule({
             code: /* wgsl */ `
                 @group(0) @binding(0) var hdrTex: texture_2d<f32>;
@@ -194,7 +201,7 @@ class NaiveClampPass implements PostProcessPass {
         this.pipeline = device.createRenderPipeline({
             layout: device.createPipelineLayout({bindGroupLayouts: [this.bindGroupLayout]}),
             vertex: {module, entryPoint: "vs"},
-            fragment: {module, entryPoint: "fs", targets: [{format: "rgba8unorm"}]},
+            fragment: {module, entryPoint: "fs", targets: [{format: outputFormat}]},
             primitive: {topology: "triangle-list"},
         });
     }
@@ -221,7 +228,7 @@ async function renderHdrClipComparison() {
     for (const variant of ["tonemapped", "naive-clamp"] as const) {
         const ctx = await RenderContext.createOffscreen({width: W, height: H, label: `fixture-hdr-clip-${variant}`});
         const forward = new ClusteredForwardRenderer(ctx.device);
-        const naive = variant === "naive-clamp" ? new NaiveClampPass(ctx.device) : null;
+        const naive = variant === "naive-clamp" ? new NaiveClampPass(ctx.device, ctx.outputFormat) : null;
         const post = variant === "tonemapped" ? createDefaultPostProcessPipeline(ctx.device) : null;
         const hud = new VectorText(ctx.device, ctx.outputFormat);
         hud.loadFont("mono", FONT_PATH);
@@ -258,7 +265,7 @@ async function renderHdrClipComparison() {
         }
 
         const name = `hdr-clip-${variant}`;
-        await takeScreenshot(ctx.device, ctx.captureTexture!, W, H, `test/output/${name}.png`);
+        await saveTextureToFile(ctx.device, ctx.captureTexture!, `test/output/${name}.png`);
         console.log(`${name}.png written`);
 
         forward.destroy();
@@ -330,7 +337,7 @@ async function renderGltfDemo() {
         frame.present();
     }
 
-    await takeScreenshot(ctx.device, ctx.captureTexture!, W, H, "test/output/gltf-box.png");
+    await saveTextureToFile(ctx.device, ctx.captureTexture!, "test/output/gltf-box.png");
     console.log("gltf-box.png written");
 
     forward.destroy();
@@ -405,7 +412,7 @@ async function renderTexturedDemo() {
         frame.present();
     }
 
-    await takeScreenshot(ctx.device, ctx.captureTexture!, W, H, "test/output/textured.png");
+    await saveTextureToFile(ctx.device, ctx.captureTexture!, "test/output/textured.png");
     console.log("textured.png written");
 
     forward.destroy();

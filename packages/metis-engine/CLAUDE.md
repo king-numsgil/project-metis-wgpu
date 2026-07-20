@@ -49,7 +49,7 @@ Run from `packages/metis-engine/` unless noted.
 bun install
 
 # Headless render + screenshot validation — writes PNGs to test/output/,
-# reuses bun-webgpu-rs's takeScreenshot test helper
+# via bun-webgpu-rs's native readTexturePixels/saveTextureToFile
 bun run fixture
 
 # Interactive windowed demos (WASD+QE fly, arrows look, Esc quit)
@@ -134,9 +134,11 @@ src/renderer/   — the entire renderer; import via "metis-engine/renderer"
                 gltf.ts       — a deliberately narrow glTF 2.0 reader (see its doc comment for the
                                  exact supported subset), not a general-purpose importer
                 texture.ts    — loadTexture() (image file -> GpuTexture via bun-webgpu-rs's
-                                 `sdlImageLoadTexture` SDL3_image binding — decode + upload happen
-                                 in Rust, supports PNG/JPG/WebP/…; replaced the former from-scratch
-                                 PNG decoder) + getMaterialDefaults() (the shared 1x1 neutral
+                                 `loadImageTexture` — decode + upload happen in Rust, pure-Rust
+                                 `image` crate; PNG/TGA/JPEG/Radiance HDR. Replaced the former
+                                 from-scratch PNG decoder, then SDL3_image. NB `.hdr` yields an
+                                 rgba16float texture, not rgba8unorm, and ignores `srgb`)
+                                 + getMaterialDefaults() (the shared 1x1 neutral
                                  placeholders every unset material texture slot falls back to)
   frameLimiter.ts — software frame-rate cap ("vsync on" knob); await once per frame after
                   present(). Separate from present mode by design (see "Present mode" below)
@@ -508,6 +510,53 @@ There's no `if (interior)` branch anywhere in the shading code. `Environment.amb
 ### Ambient occlusion is a swappable enum, and only touches the ambient term
 
 `ClusteredForwardRenderer` owns an `AmbientOcclusion` (`src/renderer/ao/`); set `renderer.ao.technique` to `AoTechnique.None`, `.SSAO`, or `.HBAO` (a runtime quality dial — the interior demo cycles it with the `O` key). When active it runs three passes *before* the forward pass — a geometry prepass (view-space normals + depth), the chosen occlusion technique (`ssao.wgsl`/`hbao.wgsl`, fullscreen), and a box blur — and `forward.wgsl` multiplies the result into **only** the flat ambient term. That last part is the load-bearing correctness point: AO approximates occlusion of *indirect/bounce* light, so it must never darken the sun or point lights (their occlusion is the shadow map's job). Multiplying the whole lit image by AO — which some engines do — double-darkens shadowed creases and is wrong. `None` is branchless: the renderer clears the AO buffer to white so the forward multiply is a no-op, mirroring the always-bound-placeholder pattern the material textures already use. Both techniques' math (and the deliberate normal-oriented HBAO tangent simplification) is in `math/Ambient occlusion formulas.md`; `test/ao.test.ts` validates the kernel generators on the CPU and, via GPU readback + a `pushErrorScope`, that each technique darkens a box's contact creases without any swallowed WGSL validation error. The prepass is a *second* geometry pass (a production engine would share a depth prepass); at this engine's scale the duplicate draw is cheap and keeps AO decoupled from the forward path.
+
+### The headless target is sRGB, and it was silently wrong for a long time
+
+`RenderContext`'s offscreen capture texture is **`rgba8unorm-srgb`**. This is a
+colour-correctness requirement, not a preference, and the reason is one line at
+the end of `tonemap.wgsl`:
+
+```wgsl
+return vec4<f32>(acesFilmic(exposed), 1.0);   // linear — no sRGB encode
+```
+
+The tonemap pass emits **linear** values and does no sRGB encoding of its own. It
+relies entirely on the target format's `-srgb` suffix for the hardware
+encode-on-write. The output format is therefore the last stage of the colour
+pipeline, not a free choice.
+
+The windowed path always got this right by accident — `surface.getPreferredFormat()`
+returns `bgra8unorm-srgb` on every backend this runs on. The **headless** path did
+not: it was pinned to `rgba8unorm` (no `-srgb`) purely because the old screenshot
+helper could only read that format back. So every fixture capture stored linear
+values as though they were sRGB — **markedly darker than the same scene in a
+window**. Measured on the exterior fixture: mean red channel **94.8 vs 147.9**,
+with the two images differing by *exactly* the sRGB transfer curve to within
+8-bit rounding (max delta 1.7/255). Screenshot validation was validating an image
+the engine never actually displays.
+
+**Why it survived so long is the interesting part.** Nothing failed. There was no
+validation error, no exception, no visibly broken render — the fixtures looked
+like a plausible dark scene, and the only way to notice was to compare them
+against a windowed frame of the same scene, which nothing did. The bug lived in
+the gap between two code paths that were never diffed against each other. Two
+things follow: **a "screenshot test" whose output does not match the real output
+path is worth much less than it appears**, and a format pinned for a *tooling*
+reason should carry a comment saying so, because the reason outlives the
+constraint (here the readback limitation was lifted and the pin just stayed).
+
+**Corollary, and it bites:** any pipeline targeting the offscreen texture must
+take `ctx.outputFormat` rather than hardcoding a format. `test/fixture.ts`'s
+`NaiveClampPass` hardcoded `rgba8unorm` and, when the target became sRGB, emitted
+**92 validation errors while still exiting 0 and writing a plausible PNG** — the
+exact failure mode "Debugging WebGPU validation errors" above warns about. It now
+takes the format as a constructor argument.
+
+`vectorText.smoke.ts` is unaffected and correctly so: it builds its own
+`rgba8unorm` target and its own `VectorText` against that same format, so it is
+internally consistent and never touches `captureTexture`.
+
 
 ### Why MSAA — and a misdiagnosis worth knowing about
 

@@ -1,6 +1,5 @@
 import { beforeAll, describe, expect, it } from "bun:test";
-import { type GpuDevice, GPUTextureUsage, requestAdapter } from "../index.js";
-import { takeScreenshot } from "./helpers/screenshot.js";
+import { type GpuDevice, GPUTextureUsage, readTexturePixels, requestAdapter, savePixelsToFile } from "../index.js";
 
 let device: GpuDevice | null = null;
 
@@ -67,7 +66,8 @@ describe("render", () => {
         pass.end();
         device.queue.submit([encoder.finish()]);
 
-        const pixels = await takeScreenshot(device, target, W, H, "tests/output/red-triangle.png");
+        const pixels = await readTexturePixels(device, target);
+        await savePixelsToFile(pixels, W, H, "tests/output/red-triangle.png");
         target.destroy();
 
         // Helper: read RGBA at pixel (x, y).

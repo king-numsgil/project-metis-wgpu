@@ -1,17 +1,28 @@
 // 16-bit-per-channel PNGs must decode to the correct 8-bit values.
 //
-// Regression test for a platform-specific corruption: SDL3_image decodes a
-// 16-bit PNG into a 16-bit surface keeping PNG's **big-endian** sample order,
-// while SDL's pixel conversion reads those formats in **host** order. On a
-// little-endian host every sample was therefore down-converted from the wrong
-// byte — a sample of 0x5aec read as 0xec5a, scaling to 235 instead of 90 — so
-// textures came out as plausible-looking noise rather than failing outright.
+// These are regression tests for two bugs that no longer exist in this codebase,
+// and the history is the reason they're still here. Both came from SDL3_image,
+// which used to back image loading and has since been replaced by the pure-Rust
+// `image` crate:
 //
-// It only reproduced where SDL_image has a 16-bit-capable PNG decoder (Linux),
-// which is exactly why it needs a test rather than a manual check: on a machine
-// whose SDL_image hands back 8-bit surfaces this passes without exercising the
-// swap at all, and would silently stop protecting anything if it relied on a
-// downloaded asset that isn't 16-bit.
+//  1. **Byte order.** SDL3_image decoded a 16-bit PNG into a 16-bit surface
+//     keeping PNG's big-endian sample order, while SDL's pixel conversion read
+//     those formats in host order. On a little-endian host every sample was
+//     down-converted from the wrong byte — 0x5aec read as 0xec5a, scaling to 235
+//     instead of 90 — so textures came out as plausible-looking noise rather
+//     than failing outright.
+//
+//  2. **16-bit grayscale corrupted the heap.** SDL3_image picked the surface
+//     format without testing bit depth, so a 16-bit gray PNG got a 1-byte-per-
+//     pixel INDEX8 surface while libpng still wrote 2 bytes per pixel — a 2x
+//     overflow that smashed the allocator. It presented as a segfault seconds
+//     later, nowhere near the load.
+//
+// The `image` crate handles both correctly, so these now pin *behaviour we
+// depend on* rather than guarding a specific workaround: 16-bit sources must
+// down-convert keeping the high byte, grayscale must expand to RGB, and neither
+// may skew rows. If image loading is ever re-backed by another decoder, these
+// are the cases that broke last time.
 import { beforeAll, describe, expect, it } from "bun:test";
 import { deflateSync } from "node:zlib";
 import { unlinkSync, writeFileSync } from "node:fs";
@@ -24,7 +35,7 @@ import {
     GPUTextureUsage,
     ImageColorSpace,
     requestAdapter,
-    sdlImageLoadTexture,
+    loadImageTexture,
 } from "../index.js";
 
 let device: GpuDevice | null = null;
@@ -100,9 +111,8 @@ function write16BitPng(path: string, size: number): {r: number; g: number; b: nu
 }
 
 /**
- * Writes a `size`x`size` **16-bit grayscale** (colour type 0) PNG — the one
- * input SDL_image 3.4.4 corrupts the heap on, so this is the only generator
- * here whose image never reaches `IMG_Load` at all.
+ * Writes a `size`x`size` **16-bit grayscale** (colour type 0) PNG — the exact
+ * input that used to corrupt the heap under SDL3_image.
  *
  * As above, each sample's high byte differs from its low byte so a byte-order
  * or strip mistake cannot accidentally produce the right answer.
@@ -137,7 +147,7 @@ function writeGray16Png(path: string, size: number): number {
 }
 
 async function readBack(path: string, srgb: boolean) {
-    const tex = await sdlImageLoadTexture(device!, path, {
+    const tex = await loadImageTexture(device!, path, {
         colorSpace: srgb ? ImageColorSpace.Srgb : ImageColorSpace.Linear,
         usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC,
     });
@@ -166,9 +176,9 @@ describe("16-bit PNG decoding", () => {
         const hi = write16BitPng(path, 8);
         try {
             const px = await readBack(path, false);
-            // Tolerance of 1: SDL scales (v * 255 / 65535) rather than truncating,
-            // so the high byte can land one off. A byte-order bug is off by ~145,
-            // nowhere near this.
+            // Tolerance of 1: a decoder may scale (v * 255 / 65535) rather than
+            // truncate, so the high byte can land one off. A byte-order bug is
+            // off by ~145, nowhere near this.
             expect(px[0]).toBeGreaterThanOrEqual(hi.r - 1);
             expect(px[0]).toBeLessThanOrEqual(hi.r + 1);
             expect(px[1]).toBeGreaterThanOrEqual(hi.g - 1);
@@ -185,19 +195,12 @@ describe("16-bit PNG decoding", () => {
         }
     }, 60_000);
 
-    // 16-bit *grayscale* is a separate bug from the byte-order one above, and a
-    // far nastier one: SDL_image 3.4.4's IMG_libpng.c picks the surface format
-    // with `color_type == PNG_COLOR_TYPE_GRAY` and no bit-depth test, so a
-    // 16-bit gray image lands in the arm commented `else /* if (bit_depth == 8) */`
-    // and gets an INDEX8 (1 byte/px) surface. Nothing calls png_set_strip_16 on
-    // that path, so libpng still writes 2 bytes/px and png_read_image overruns
-    // the surface by exactly 2x, smashing the palette pointer and the heap.
-    //
-    // That is a process abort (`munmap_chunk(): invalid pointer`), not a
-    // catchable failure, so this test "fails" by killing the runner — which is
-    // precisely why the guard in image/mod.rs sniffs the IHDR and routes this
-    // format to the `png` crate instead of letting IMG_Load see it.
-    it("decodes 16-bit grayscale without corrupting the heap", async () => {
+    // The format that used to abort the process (bug 2 in the header comment).
+    // Worth keeping even though the decoder that broke on it is gone: grayscale
+    // is the least-exercised PNG colour type, 16-bit grayscale less so still, and
+    // it is what Poly Haven ships metallic/roughness maps as — so the engine's
+    // own demos load it on every run.
+    it("decodes 16-bit grayscale correctly", async () => {
         if (!device) {
             return;
         }
@@ -205,8 +208,8 @@ describe("16-bit PNG decoding", () => {
         const hi = writeGray16Png(path, 8);
         try {
             const px = await readBack(path, false);
-            // Grey replicates into R, G and B, alpha opaque — matching what
-            // SDL_image's own grayscale palette produces for the 8-bit case.
+            // Grey replicates into R, G and B, alpha opaque — a single-channel
+            // source must expand, not land in R with G/B zeroed.
             expect(px[0]).toBeGreaterThanOrEqual(hi - 1);
             expect(px[0]).toBeLessThanOrEqual(hi + 1);
             expect(px[1]).toBe(px[0]);

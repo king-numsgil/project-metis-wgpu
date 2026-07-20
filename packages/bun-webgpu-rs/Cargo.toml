@@ -15,13 +15,13 @@ wgpu = { version = "24", features = ["wgsl"] }
 raw-window-handle = "0.6"
 tokio = { version = "1", features = ["sync"] }
 sdl3-sys = { version = "0.6.7", features = ["build-from-source-static"] }
-sdl3-image-sys = { version = "0.6.4", features = ["build-from-source-static"] }
 num_enum = "0.7.6"
 lyon_tessellation = "1"
 lyon_path = "1"
 lyon_geom = "1"
 ttf-parser = "0.21"
-png = "0.18.1"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "tga", "hdr"] }
+half = "2.7.1"
 
 [build-dependencies]
 napi-build = "2"

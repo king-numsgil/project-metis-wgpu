@@ -9,7 +9,7 @@
 //      shader fails loudly instead of silently rendering garbage (see
 //      packages/metis-engine/CLAUDE.md's note on swallowed wgpu errors).
 import { requestAdapter } from "bun-webgpu-rs";
-import { takeScreenshot } from "bun-webgpu-rs/tests/helpers/screenshot.ts";
+import { readTexturePixels, savePixelsToFile } from "bun-webgpu-rs";
 import { describe, expect, it } from "bun:test";
 import {
     AO_NOISE_DIM,
@@ -151,7 +151,8 @@ async function renderAoScene(technique: AoTechnique): Promise<{ mean: number; er
     const err = await ctx.device.popErrorScope();
     frame.present();
 
-    const pixels = await takeScreenshot(ctx.device, ctx.captureTexture!, AO_W, AO_H, `test/output/ao-${technique}.png`);
+    const pixels = await readTexturePixels(ctx.device, ctx.captureTexture!);
+    await savePixelsToFile(pixels, AO_W, AO_H, `test/output/ao-${technique}.png`);
     let sum = 0;
     for (let i = 0; i < pixels.length; i += 4) {
         sum += 0.2126 * pixels[i]! + 0.7152 * pixels[i + 1]! + 0.0722 * pixels[i + 2]!;

@@ -65,12 +65,11 @@ CMake is installed globally — no PATH manipulation needed.
 - **Rust toolchain**: stable
 - **napi-rs**: 3.x — uses `#[napi]`, `#[napi(object)]`, `Reference<T>`, async napi fns
 - **SDL3**: built from source via `sdl3-sys = { version = "0.6.7", features = ["build-from-source-static"] }` (bundles SDL 3.4.12)
-- **SDL3_image**: built from source via `sdl3-image-sys = { version = "0.6.4", features = ["build-from-source-static"] }` (bundles SDL_image 3.4.4); links against the same `sdl3-sys`, no version conflict
+- **Image decoding**: `image = { version = "0.25", default-features = false, features = ["png", "jpeg", "tga", "hdr"] }` — pure Rust, no C decoder. Plus `half` for the f32→f16 conversion HDR needs. (SDL3_image was removed; see "Why SDL3_image is gone" below.)
 - **wgpu**: 24.0.5 with WGSL feature
 
 Cargo cache / sdl3-sys source:
 `C:\Users\DarkF\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sdl3-sys-0.6.7+SDL-3.4.12\src\generated\`
-`…\sdl3-image-sys-0.6.4+SDL-image-3.4.4\src\generated\image.rs`
 
 ---
 
@@ -96,10 +95,13 @@ src/
     gamepad.rs    — SdlGamepadAxis/Button enums, SdlGamepad class, sdlGetGamepads
     debug.rs      — sdlLog, sdlGetPerformanceCounter, sdlGetPerformanceFrequency
   image/
-    mod.rs        — SDL3_image file loaders that decode straight into wgpu
-                    textures (sdlImageLoadTexture, sdlImageLoadAnimation,
-                    ImageColorSpace enum). No pixel bytes cross the napi
-                    boundary; file readers only (no *_IO / SDL_IOStream variants)
+    mod.rs        — pure-Rust image file loading that decodes straight into wgpu
+                    textures (loadImageTexture, ImageColorSpace enum), backed by
+                    the `image` crate. PNG/TGA/JPEG/Radiance HDR. No pixel bytes
+                    cross the napi boundary; file readers only
+    save.rs       — the write half: saveTextureToFile, readTexturePixels,
+                    savePixelsToFile. GPU readback (row-unpadding, BGRA swizzle)
+                    + encoding. Replaced tests/helpers/screenshot.ts
 ```
 
 ---
@@ -381,98 +383,175 @@ cursor.destroy()
 
 ---
 
-## Image loading (SDL3_image → wgpu)
+## Image loading (file → wgpu)
 
 `src/image/mod.rs` decodes an image **file** and uploads it straight into a
 `GpuTexture` — the decoded pixels never cross the napi boundary as a byte array.
-Both loaders are **async** (decode + upload on the libuv threadpool).
+Async (decode + upload on the libuv threadpool).
 
 ```ts
-import { sdlImageLoadTexture, sdlImageLoadAnimation, ImageColorSpace, GPUTextureUsage } from "bun-webgpu-rs";
+import { loadImageTexture, ImageColorSpace, GPUTextureUsage } from "bun-webgpu-rs";
 
-// Colour map (albedo/emissive) — sRGB is the default:
-const albedo = await sdlImageLoadTexture(device, "hull_albedo.png");     // rgba8unorm-srgb
-// Data map (normal/roughness) — must be linear:
-const normal = await sdlImageLoadTexture(device, "hull_normal.png", {
-  colorSpace: ImageColorSpace.Linear,                                   // rgba8unorm
-  usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,    // default
+const albedo = await loadImageTexture(device, "hull_albedo.png");     // rgba8unorm-srgb
+const normal = await loadImageTexture(device, "hull_normal.png", {
+  colorSpace: ImageColorSpace.Linear,                                // rgba8unorm
+  usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST, // default
 });
-// Several loads decode in parallel on the threadpool:
-const [a, b] = await Promise.all([sdlImageLoadTexture(device, "a.png"), sdlImageLoadTexture(device, "b.jpg")]);
-
-// Animated (GIF/WEBP/APNG): every frame is uploaded up front.
-const anim = await sdlImageLoadAnimation(device, "explosion.gif");
-for (let i = 0; i < anim.frameCount; i++) {
-  const frame = anim.frame(i);       // GpuTexture handle (shares the uploaded texture)
-  const ms = anim.delayMs(i);        // frame duration
-}
+const env = await loadImageTexture(device, "sky.hdr");               // rgba16float
 ```
 
 Design rules for this module:
-- **File readers only.** `IMG_Load` / `IMG_LoadAnimation` are wrapped; the
-  `*_IO` (`SDL_IOStream`) and `SDL_Renderer`-based `IMG_LoadTexture*` entry
-  points are intentionally omitted.
-- **Async / off-thread, and it's safe to be.** Decode + upload run on a libuv
-  worker via `AsyncTask` (same pattern as `create_render_pipeline_async`).
-  SDL3_image has no `IMG_Init` (no init-thread coupling), `IMG_Load` has no
-  main-thread requirement (only SDL's own 2D renderer does — which we don't
-  use), SDL3 pixel formats are const (the old cross-thread format-list race is
-  gone), and each call owns its surface. `SDL_GetError` is thread-local, so the
-  error string is captured inside the worker task.
-- **RGBA8, endianness-safe.** The surface is `SDL_ConvertSurface`'d to
-  `SDL_PIXELFORMAT_RGBA32` (R,G,B,A byte order regardless of endianness), which
-  maps 1:1 to wgpu `rgba8unorm(-srgb)`. Verified byte-for-byte in
-  `tests/sdl-image.test.ts` (encode PNG → load → GPU readback → compare).
+- **Pure Rust decoding.** The `image` crate, feature-gated to `png`/`jpeg`/`tga`/
+  `hdr`. No C/C++ decoder in the path — that is the whole point (below).
+- **File readers only.** A path in, a `GpuTexture` out. Byte-slice and stream
+  entry points are deliberately not exposed.
 - **Strong enum, not a bool.** sRGB/linear is `ImageColorSpace`, mirroring the
   crate's `#[napi] enum` convention rather than a magic flag.
-- Loading needs no `SDL_Init` — decode + `SDL_ConvertSurface` are self-contained.
-- **16-bit grayscale PNG never reaches `IMG_Load`** — it is decoded by the `png`
-  crate instead. See below.
+- **The output format is not always RGBA8** — see below.
+- Loading needs no `SDL_Init`.
 
-### The one image format SDL_image cannot be allowed to see
+### Why SDL3_image is gone
 
-`sdlImageLoadTexture` sniffs the PNG IHDR and routes **colour type 0 at bit depth
-16** (grayscale, no alpha) to the pure-Rust `png` crate. Everything else still
-goes through `IMG_Load` unchanged. This is not a preference — SDL_image 3.4.4
-corrupts the heap on that input.
+Image loading used to go through SDL3_image (`IMG_Load` → `SDL_ConvertSurface` →
+upload). It was removed after it was found to **corrupt the heap on a valid
+input**, and the specific bug is worth keeping because it is a good argument
+about where C belongs in this codebase.
 
-In `IMG_libpng.c`, the format-selection branch tests `color_type ==
-PNG_COLOR_TYPE_GRAY` **without also testing the bit depth**, so a 16-bit gray
-image falls into the arm commented `else /* if (bit_depth == 8) */` and gets an
-`SDL_PIXELFORMAT_INDEX8` surface — one byte per pixel. Nothing calls
-`png_set_strip_16()` on that path, so libpng still writes **two** bytes per
-pixel and `png_read_image` overruns the surface by exactly 2x (at 64x64: 8192
-bytes into a 4096-byte buffer). That smashes the surface's own palette pointer
-and glibc's heap metadata.
+In SDL_image 3.4.4's `IMG_libpng.c`, the surface-format branch tests
+`color_type == PNG_COLOR_TYPE_GRAY` **without also testing bit depth**, so a
+16-bit grayscale PNG fell into the arm commented `else /* if (bit_depth == 8) */`
+and got an `INDEX8` (1 byte/px) surface. Nothing called `png_set_strip_16()` on
+that path, so libpng still wrote **two** bytes per pixel and `png_read_image`
+overran the surface by exactly 2x — smashing the surface's own palette pointer
+and glibc's malloc metadata.
 
-**The damage happens inside `IMG_Load`, so there is nothing to validate or repair
-on return** — by the time the call yields, the palette pointer already reads back
-as the image's own pixel bytes and the process is living on borrowed time. The
-call simply must not happen. That's why this is a *pre-flight sniff of the file
-header* rather than a check on the returned surface.
+Three properties made it nasty, and they generalise to any C decoder:
 
-Symptom, if it ever regresses: `munmap_chunk(): invalid pointer` or a bare
-`Segmentation fault at address 0x0` **several seconds after** the load, wherever
-the corrupted chunk is next touched — which is why it presented as "the demos
-crash on startup" rather than pointing anywhere near image loading. Both
-`metis-engine` demos hit it because Poly Haven ships `metal_plate_02`'s metallic
-and roughness maps as 16-bit grayscale.
+1. **The failure was nowhere near the cause.** It surfaced as
+   `munmap_chunk(): invalid pointer` or a bare segfault *seconds later*, wherever
+   the corrupted chunk was next touched — it presented as "the engine demos crash
+   on startup."
+2. **Nothing could be validated after the fact.** The damage happened *inside*
+   `IMG_Load`; by the time it returned, the palette pointer already read back as
+   the image's own pixel bytes. There was no return value to check.
+3. **The trigger was ordinary.** Poly Haven ships metallic/roughness maps as
+   16-bit grayscale, so both engine demos hit it on every run.
 
-Deliberately narrow: a grayscale PNG **with** a `tRNS` chunk is fine, because
-SDL_image ORs in `PNG_COLOR_MASK_ALPHA` and routes it through
-`png_set_gray_to_rgb`. Only bare colour-type-0-depth-16 is affected — verified by
-loading all eight (depth, colour-type) combinations. Don't widen the guard
-without re-checking which ones actually break; every other format is fine on the
-SDL_image path and should stay there.
+The interim fix sniffed the PNG header and routed that one format around
+SDL_image. That worked, but it is a bad shape to be in — a hand-maintained
+denylist of inputs your decoder mishandles, which only ever grows and can only
+ever cover bugs you have already been bitten by. Replacing the decoder outright
+removes the class: a bug in safe Rust is a panic or an `Err`, not a smashed
+allocator, and the guard, the `png` direct dependency and the whole
+`sdl3-image-sys` build all went away with it.
 
-`tests/image-16bit.test.ts` pins it, and is mutation-checked (disabling the guard
-fails the test). Note this test "fails" by *aborting the runner* when the guard is
-gone, not by a clean assertion — a heap smash isn't catchable from JS.
+Removing it also dropped a CMake-built C dependency tree (libpng, libjpeg,
+libwebp, …) from the build. **SDL3 itself is unaffected** — `sdl3-sys` stays;
+this only removed `sdl3-image-sys`.
 
-**Recheck on any `sdl3-image-sys` bump.** 0.6.4+SDL-image-3.4.4 was the newest
-published when this was written, so there was no upstream fix to take. If a later
-release fixes the branch, this guard becomes dead weight and should be deleted
-along with the `png` dependency — but confirm with the test first.
+`tests/image-16bit.test.ts` still pins both SDL_image bugs (byte order and the
+grayscale overflow) as behaviour the replacement must also get right. They are
+regression tests for a decoder that is gone, deliberately: they are the cases
+that broke last time, so they are the cases to check if the decoder is ever
+swapped again.
+
+### The output format depends on the source
+
+The old **"output is always RGBA8"** invariant is gone, because HDR breaks it.
+Read `texture.format` off the returned handle rather than assuming:
+
+| source | format | `colorSpace` |
+|---|---|---|
+| PNG / TGA / JPEG | `rgba8unorm` / `rgba8unorm-srgb` | honoured |
+| Radiance `.hdr` | `rgba16float` | **ignored** |
+
+Radiance carries linear radiance well outside `[0,1]`; quantising it to 8 bits
+would discard exactly the range the format exists to preserve. `colorSpace` is
+ignored there because Radiance is linear by definition — there is no sRGB curve
+to undo, and WebGPU has no `-srgb` float format. f16 over f32 is half the
+footprint at ample range (a 2K env map: 16 MB, not 32) and matches the
+`rgba16float` targets metis-engine's HDR chain already renders into, so a loaded
+env map needs no conversion downstream.
+
+**Format detection is by magic bytes, with the extension as fallback** — so a
+mislabelled PNG/JPEG/HDR still loads. **TGA is the exception and it is not
+fixable**: the format has no signature (the TGA 2.0 `TRUEVISION-XFILE` footer is
+optional and usually absent), so a `.tga` must actually be named `.tga`.
+`tests/image-formats.test.ts` pins both halves, including a test asserting the
+misnamed-TGA case *fails* — so the limitation is documented by the suite rather
+than rediscovered as a bug.
+
+### Saving: `image/save.rs`
+
+The write half — `saveTextureToFile`, `readTexturePixels`, `savePixelsToFile`.
+This replaced a hand-rolled PNG encoder in `tests/helpers/screenshot.ts` that was
+PNG-only, `rgba8unorm`-only, filter-type-0, and — the actual problem — was
+imported across package boundaries by **five `metis-engine` files reaching into
+another package's test folder**. The engine's whole fixture/screenshot validation
+hung off a test helper. It is a real exported API now and that file is gone.
+
+**Three calls rather than one, deliberately.** The old helper both saved *and*
+returned pixels, so every save-only caller paid to copy a framebuffer across the
+napi boundary it never looked at. Splitting them keeps the common case free,
+while a test that wants both still does one GPU readback:
+`readTexturePixels` then `savePixelsToFile`.
+
+Two capabilities the TS encoder never had:
+
+- **BGRA swizzling.** `bgra8unorm(-srgb)` is what a swapchain texture actually is
+  on most backends, and not being able to read it is *why* `RenderContext`
+  allocates a separate `rgba8unorm` capture texture. That constraint is lifted
+  (the engine still uses an rgba8unorm offscreen target, but now by choice, not
+  necessity — see the comment on `offscreenFormat`).
+- **HDR output.** `rgba16float` → Radiance `.hdr`.
+
+**Mismatches are errors, never guesses.** `rgba16float` → `.png` is refused, and
+so is `readTexturePixels` on an f16 texture — reinterpreting float bytes as 8-bit
+colour is silently meaningless, and this repo has already lost a session to a
+byte-vs-value reinterpretation bug (the `new Float32Array(uint8Array)` mistake in
+metis-engine's MSM debugging). 8-bit → `.hdr` is refused too: there is no
+high-dynamic-range data to invent.
+
+**Blocking `poll(Wait)` in the readback is correct** — it runs on a libuv worker
+via `AsyncTask`, not the JS thread.
+
+#### A footgun this surfaced: `write_texture` is staged, not executed
+
+`tests/image-save.test.ts` initially passed while printing
+`[wgpu] uncaptured error: ... Texture has been destroyed`. Cause: `Queue::write_texture`
+only *queues* the copy — it isn't executed until the next `submit`. `load_image_texture`
+uploaded and returned without submitting, so a texture that was loaded and then
+destroyed before any submit left a staged write against freed memory, and the next
+*unrelated* submit failed validation.
+
+`upload_texture` now ends with an empty `queue.submit(std::iter::empty())` to flush
+it. One empty submit per load (not a per-frame call) in exchange for a handle that
+is genuinely self-contained: usable, and safe to destroy, immediately.
+
+Worth noting *how* this was caught, given the binding never throws on validation
+errors: the suite was green. Only grepping stderr for `wgpu` found it, then
+per-test bisection localised it. That is the failure mode "Debugging WebGPU
+validation errors" warns about, hitting a brand-new test file.
+
+### Formats deliberately not supported (yet)
+
+- **Animated images** (GIF/WebP/APNG). `sdlImageLoadAnimation` and
+  `SdlImageAnimation` were removed with SDL3_image rather than ported — nothing
+  in the monorepo called them. `image` can decode GIF/WebP animation if this
+  comes back.
+- **Compressed / transcoded GPU textures** (Basis Universal, KTX2, DDS).
+  Evaluated and deferred, and the reasoning should be re-checked rather than
+  re-derived: the mature `basis-universal` crate is **C++ bindings**, which
+  reintroduces exactly the risk this module was rewritten to remove, and it has
+  not shipped since 2023-11. The pure-Rust `basisu` crate exists and claims
+  bit-exactness, but as of 2026-07 it is v0.1.0 with ~10 downloads — not
+  something to put in the path of every texture load. The recommended entry
+  point when this is wanted is the mature pure-Rust `ktx2` container crate,
+  uploading **pre-compressed** BC7/BC5/ASTC blocks with `device.features`
+  gating — no transcoder involved. Note that path needs block-aligned uploads
+  and `bytes_per_row` in blocks, which the current RGBA8/RGBA16F code does not do.
+
+---
 
 ## GPU debug primitives
 

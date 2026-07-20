@@ -74,6 +74,9 @@ pub use gpu::{GpuBufferUsage, GpuTextureUsage, GpuShaderStage, GpuMapMode, GpuCo
 
 pub use vector::{VectorContext, FontMetrics, DrawCall};
 
-// ── SDL_image (file -> wgpu texture) ────────────────────────────────────────────
+// ── Image loading (file -> wgpu texture), pure Rust via the `image` crate ───────
 
-pub use image::{ImageColorSpace, SdlImageAnimation, SdlImageLoadOptions, sdl_image_load_texture, sdl_image_load_animation};
+pub use image::{
+    ImageColorSpace, ImageLoadOptions, load_image_texture, read_texture_pixels, save_pixels_to_file,
+    save_texture_to_file,
+};

@@ -409,36 +409,90 @@ Raw joysticks: `sdlOpenJoystick(sdlGetJoysticks()[0])`, `.getAxis(i)` (normalize
 
 ---
 
-## 8. Image loading (SDL3_image → wgpu)
+## 8. Image loading (file → wgpu)
 
-Decodes **and uploads** in Rust; pixel bytes never cross the FFI boundary. Both
-loaders are async (libuv threadpool), so concurrent loads decode in parallel.
-Needs no `sdlInit`.
+Decodes **and uploads** in Rust; pixel bytes never cross the FFI boundary.
+Decoding is pure Rust (the `image` crate — SDL3_image was removed, see this
+package's `CLAUDE.md`). Async on the libuv threadpool, so concurrent loads
+decode in parallel. Needs no `sdlInit`.
 
 ```ts
-import { sdlImageLoadTexture, sdlImageLoadAnimation, ImageColorSpace, GPUTextureUsage } from "bun-webgpu-rs";
+import { loadImageTexture, ImageColorSpace, GPUTextureUsage } from "bun-webgpu-rs";
 
 // Colour data — sRGB is the default
-const albedo = await sdlImageLoadTexture(device, "albedo.png");                 // rgba8unorm-srgb
+const albedo = await loadImageTexture(device, "albedo.png");                    // rgba8unorm-srgb
 // Data maps (normal/roughness) MUST be linear
-const normal = await sdlImageLoadTexture(device, "normal.png", {
+const normal = await loadImageTexture(device, "normal.png", {
     colorSpace: ImageColorSpace.Linear,                                          // rgba8unorm
     usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,           // default
 });
 const [a, b] = await Promise.all([...]);   // decode in parallel
 
-const anim = await sdlImageLoadAnimation(device, "explosion.gif");
-anim.frameCount; anim.frame(i); anim.delayMs(i);
+// HDR loads as rgba16float; colorSpace is ignored (see below)
+const env = await loadImageTexture(device, "sky.hdr");                          // rgba16float
 ```
 
-File readers only — no `SDL_IOStream` (`*_IO`) variants. Formats: whatever
-SDL_image was built with (PNG/JPG/WebP/…). Output is always RGBA8, byte-order
-safe. 16-bit-per-channel PNGs down-convert to 8 bits, keeping the high byte.
+**Formats: PNG, TGA, JPEG, Radiance HDR.** File readers only — no byte-slice or
+stream entry points.
 
-16-bit **grayscale** PNGs are decoded by the `png` crate rather than SDL_image,
-which corrupts the heap on that one format; this is transparent at the call site
-(same signature, same RGBA8 output, grey replicated into R/G/B with opaque
-alpha). See this package's `CLAUDE.md` for the mechanism and when to drop it.
+**The output format depends on the source — don't assume RGBA8.** Read
+`texture.format` off the returned handle:
+
+| source | texture format | `colorSpace` |
+|---|---|---|
+| PNG / TGA / JPEG | `rgba8unorm` or `rgba8unorm-srgb` | honoured |
+| Radiance `.hdr` | `rgba16float` | **ignored** |
+
+HDR ignores `colorSpace` because Radiance is linear radiance by definition —
+there is no sRGB curve to undo, and WebGPU has no `-srgb` float format. f16 is
+used over f32 for half the footprint at ample HDR range, and it matches the
+`rgba16float` targets metis-engine's HDR chain already renders into.
+
+16-bit-per-channel sources down-convert to 8 bits keeping the high byte;
+single-channel (grayscale) sources expand into R/G/B with opaque alpha.
+
+Format is detected from **magic bytes**, falling back to the file extension — so
+a mislabelled PNG/JPEG/HDR still loads. **TGA is the exception**: it has no
+signature, so a `.tga` file must actually be named `.tga`.
+
+> Animated images (`sdlImageLoadAnimation`, GIF/WebP/APNG) were **removed** along
+> with SDL3_image — the API had no consumers.
+
+### Saving: texture → file
+
+Three orthogonal calls, so nothing pays for work it doesn't need. All async
+(worker thread), all create missing parent directories, and the encoding comes
+from the **path extension** (`.png`, `.jpg`/`.jpeg`, `.tga`, `.hdr`).
+
+```ts
+import { saveTextureToFile, readTexturePixels, savePixelsToFile } from "bun-webgpu-rs";
+
+// Just want a file:
+await saveTextureToFile(device, texture, "out/shot.png");
+
+// Just want pixels (assertions):
+const px = await readTexturePixels(device, texture);   // tight RGBA8, no row padding
+
+// Want both — one GPU readback, not two:
+const px = await readTexturePixels(device, texture);
+await savePixelsToFile(px, width, height, "out/shot.png");
+```
+
+The source texture must have **`GPUTextureUsage.COPY_SRC`**.
+
+| texture format | readTexturePixels | saveTextureToFile |
+|---|---|---|
+| `rgba8unorm(-srgb)` | ✅ | `.png` / `.jpg` / `.tga` |
+| `bgra8unorm(-srgb)` | ✅ (swizzled to RGBA) | `.png` / `.jpg` / `.tga` |
+| `rgba16float` | ❌ rejected | `.hdr` only |
+
+`rgba16float` is refused by `readTexturePixels` on purpose: reinterpreting f16
+bytes as 8-bit colour is silently meaningless, so save it as `.hdr` instead.
+Equally, an 8-bit texture cannot be written to `.hdr` — there is no
+high-dynamic-range data to write. Both are errors, not guesses.
+
+BGRA support means a **swapchain-format texture can be saved directly**; you no
+longer need to render into a separate `rgba8unorm` target just to capture.
 
 ---
 

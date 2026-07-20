@@ -2,7 +2,9 @@ import { describe, expect, it } from "bun:test";
 import {
     createSurface,
     GPUTextureUsage,
+    readTexturePixels,
     requestAdapterForWindow,
+    savePixelsToFile,
     sdlCreateWindow,
     SdlEventType,
     sdlInit,
@@ -11,7 +13,6 @@ import {
     sdlQuit,
     SdlWindowFlag,
 } from "../index.js";
-import { takeScreenshot } from "./helpers/screenshot.js";
 
 const W = 800;
 const H = 600;
@@ -123,7 +124,8 @@ describe("render-window", () => {
         capturePass.end();
         device.queue.submit([captureEncoder.finish()]);
 
-        const pixels = await takeScreenshot(device, offscreen, W, H, "tests/output/window-triangle.png");
+        const pixels = await readTexturePixels(device, offscreen);
+        await savePixelsToFile(pixels, W, H, "tests/output/window-triangle.png");
 
         // ── Cleanup ───────────────────────────────────────────────────────────────
         offscreen.destroy();

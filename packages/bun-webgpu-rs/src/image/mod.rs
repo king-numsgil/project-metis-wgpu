@@ -1,33 +1,30 @@
-//! SDL3_image file loaders that decode straight into wgpu textures.
+//! Image file loaders that decode straight into wgpu textures.
 //!
 //! Design goals (per the binding's brief):
-//! - **File readers only.** SDL_image's `*_IO` / `SDL_IOStream` and
-//!   `SDL_Renderer`-based (`IMG_LoadTexture*`) entry points are deliberately
-//!   *not* exposed — only `IMG_Load` / `IMG_LoadAnimation`, which read a path.
-//! - **No pixel bytes across the napi boundary.** The decoded surface is
-//!   converted to RGBA8 and uploaded directly into a `GpuTexture`; JS only ever
-//!   sees the ready-to-bind handle, never a `Uint8Array` of pixels.
+//! - **Pure Rust decoding.** Backed by the `image` crate — no C/C++ decoder in
+//!   the path. This replaced SDL3_image, which was dropped after it was found to
+//!   overflow its own surface on 16-bit grayscale PNG and corrupt the heap (see
+//!   this package's `CLAUDE.md`). A decoder bug in safe Rust is a panic or an
+//!   `Err`, not a smashed allocator.
+//! - **File readers only.** A filesystem path in, a `GpuTexture` out. Byte-slice
+//!   and stream entry points are deliberately not exposed.
+//! - **No pixel bytes across the napi boundary.** The decoded image is uploaded
+//!   directly into a `GpuTexture`; JS only ever sees the ready-to-bind handle,
+//!   never a `Uint8Array` of pixels.
 //! - **Strong enums, not magic numbers** — the sRGB/linear choice is an
 //!   `ImageColorSpace` enum, matching the SDL binding's `#[napi] enum` style.
 //! - **Async (libuv threadpool).** Decode + upload run off the JS thread via
-//!   `AsyncTask`, so a large image doesn't block the frame loop. This is safe:
-//!   SDL3_image has no init (no `IMG_Init` in 3.x, so no init-thread coupling),
-//!   `IMG_Load` carries no main-thread requirement (unlike SDL video/renderer),
-//!   SDL3's pixel formats are const (the old cross-thread format-list race is
-//!   gone), and each call owns its own surface — never shared across threads.
-//!   `SDL_GetError` is thread-local, so errors are read inside the worker task.
-//!   wgpu's `Device`/`Queue` are `Send + Sync` (already used off-thread for
-//!   async pipeline creation).
+//!   `AsyncTask`, so a large image doesn't block the frame loop. wgpu's
+//!   `Device`/`Queue` are `Send + Sync` (already used off-thread for async
+//!   pipeline creation), and each task owns its own decode buffers.
+
+mod save;
+pub use save::{read_texture_pixels, save_pixels_to_file, save_texture_to_file};
 
 use crate::gpu::{GpuDevice, GpuTexture};
 use napi::bindgen_prelude::AsyncTask;
 use napi::{Env, Task};
 use napi_derive::napi;
-use sdl3_image_sys::image::{IMG_FreeAnimation, IMG_Load, IMG_LoadAnimation};
-use sdl3_sys::error::SDL_GetError;
-use sdl3_sys::pixels::SDL_PIXELFORMAT_RGBA32;
-use sdl3_sys::surface::{SDL_ConvertSurface, SDL_DestroySurface, SDL_DuplicateSurface, SDL_Surface};
-use std::ffi::{CStr, CString};
 use std::sync::Arc;
 
 /// `GpuTextureUsage.TEXTURE_BINDING | GpuTextureUsage.COPY_DST` — a sampleable
@@ -37,6 +34,10 @@ const DEFAULT_TEXTURE_USAGE: u32 = 4 | 2;
 /// How the decoded pixels are interpreted when the GPU samples them — the
 /// sRGB/linear split every PBR pipeline needs (colour maps are sRGB, data maps
 /// like normal/roughness are linear; see metis-engine's `texture.ts`).
+///
+/// **Ignored for floating-point source formats** (Radiance HDR): those carry
+/// linear radiance by definition, so there is no sRGB transfer curve to undo and
+/// no `-srgb` float texture format to request. See [`decode_image`].
 #[napi]
 pub enum ImageColorSpace {
     /// sRGB-encoded colour (albedo, emissive) — creates an `rgba8unorm-srgb`
@@ -48,17 +49,13 @@ pub enum ImageColorSpace {
 }
 
 #[napi(object)]
-pub struct SdlImageLoadOptions {
-    /// Debug label applied to the created GPU texture(s).
+pub struct ImageLoadOptions {
+    /// Debug label applied to the created GPU texture.
     pub label: Option<String>,
-    /// Colour space of the source pixels. Defaults to `Srgb`.
+    /// Colour space of the source pixels. Defaults to `Srgb`. Ignored for HDR.
     pub color_space: Option<ImageColorSpace>,
     /// `GpuTextureUsage` bitmask. Defaults to `TEXTURE_BINDING | COPY_DST`.
     pub usage: Option<u32>,
-}
-
-fn sdl_error() -> String {
-    unsafe { CStr::from_ptr(SDL_GetError()).to_string_lossy().into_owned() }
 }
 
 fn generic_err(msg: String) -> napi::Error {
@@ -67,20 +64,16 @@ fn generic_err(msg: String) -> napi::Error {
 
 struct ResolvedOptions {
     label: Option<String>,
-    format: wgpu::TextureFormat,
+    srgb: bool,
     usage: u32,
 }
 
-fn resolve_options(options: Option<SdlImageLoadOptions>) -> ResolvedOptions {
+fn resolve_options(options: Option<ImageLoadOptions>) -> ResolvedOptions {
     let (label, color_space, usage) = match options {
         Some(o) => (o.label, o.color_space.unwrap_or(ImageColorSpace::Srgb), o.usage.unwrap_or(DEFAULT_TEXTURE_USAGE)),
         None => (None, ImageColorSpace::Srgb, DEFAULT_TEXTURE_USAGE),
     };
-    let format = match color_space {
-        ImageColorSpace::Srgb => wgpu::TextureFormat::Rgba8UnormSrgb,
-        ImageColorSpace::Linear => wgpu::TextureFormat::Rgba8Unorm,
-    };
-    ResolvedOptions { label, format, usage }
+    ResolvedOptions { label, srgb: matches!(color_space, ImageColorSpace::Srgb), usage }
 }
 
 /// Build the napi `GpuTexture` handle from an already-uploaded wgpu texture.
@@ -100,250 +93,87 @@ fn make_gpu_texture(inner: Arc<wgpu::Texture>, width: u32, height: u32, format: 
     }
 }
 
-/// True for SDL formats storing 16 **integer** bits per channel.
-///
-/// The `_FLOAT` variants are deliberately excluded: those are half-floats, and
-/// while they are also 16 bits wide, SDL_image never produces them from the
-/// formats this module loads.
-fn is_16bit_integer_format(f: sdl3_sys::pixels::SDL_PixelFormat) -> bool {
-    use sdl3_sys::pixels::{
-        SDL_PIXELFORMAT_ABGR64, SDL_PIXELFORMAT_ARGB64, SDL_PIXELFORMAT_BGR48,
-        SDL_PIXELFORMAT_BGRA64, SDL_PIXELFORMAT_RGB48, SDL_PIXELFORMAT_RGBA64,
-    };
-    f == SDL_PIXELFORMAT_RGB48
-        || f == SDL_PIXELFORMAT_BGR48
-        || f == SDL_PIXELFORMAT_RGBA64
-        || f == SDL_PIXELFORMAT_ARGB64
-        || f == SDL_PIXELFORMAT_BGRA64
-        || f == SDL_PIXELFORMAT_ABGR64
-}
-
-/// True if `path` is a PNG whose IHDR says colour type 0 (grayscale, no alpha)
-/// at bit depth 16 — the one input that makes SDL_image 3.4.4 corrupt the heap.
-///
-/// **Why this has to be sniffed before `IMG_Load` rather than repaired after.**
-/// In `IMG_libpng.c`, the format-selection branch tests
-/// `color_type == PNG_COLOR_TYPE_GRAY` *without* also testing the bit depth, so a
-/// 16-bit gray image falls into the arm commented `else /* if (bit_depth == 8) */`
-/// and the surface is created as `SDL_PIXELFORMAT_INDEX8` — one byte per pixel.
-/// Nothing ever calls `png_set_strip_16()` on that path, so libpng still writes
-/// **two** bytes per pixel, and `png_read_image` overruns the surface by exactly
-/// 2x (at 64x64: 8192 bytes into a 4096-byte buffer). That smashes the surface's
-/// own palette pointer and glibc's heap metadata, which surfaces here as a
-/// `munmap_chunk(): invalid pointer` abort or a segfault somewhere later. The
-/// damage is done *inside* `IMG_Load`, so there is nothing left to validate or
-/// fix up on return — the call simply must not happen for this format.
-///
-/// A grayscale PNG *with* a `tRNS` chunk is fine: SDL_image ORs in
-/// `PNG_COLOR_MASK_ALPHA`, which routes it through `png_set_gray_to_rgb` instead.
-/// So the check is deliberately narrow — colour type exactly 0, depth exactly 16.
-///
-/// Only the 26-byte header is read. A file that isn't a PNG, or is too short,
-/// returns `false` and takes the normal SDL_image path.
-fn is_gray16_png(path: &str) -> bool {
-    use std::io::Read;
-    const PNG_SIG: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
-    let mut header = [0u8; 26];
-    let Ok(mut file) = std::fs::File::open(path) else {
-        return false;
-    };
-    if file.read_exact(&mut header).is_err() {
-        return false;
-    }
-    // Bytes 12..16 must be the IHDR chunk type; 24 is bit depth, 25 is colour type.
-    header[..8] == PNG_SIG && &header[12..16] == b"IHDR" && header[24] == 16 && header[25] == 0
-}
-
-/// Decodes a 16-bit grayscale PNG to RGBA8 with the pure-Rust `png` crate,
-/// bypassing the SDL_image overflow documented on [`is_gray16_png`].
-///
-/// The `png` crate is asked to strip 16-bit samples down to 8
-/// (`Transformations::STRIP_16`), which is lossless for our purposes because the
-/// destination texture is `rgba8unorm(-srgb)` either way — SDL_image's own
-/// working paths down-convert to 8 bits too. Grey is expanded to RGB by
-/// replicating the luminance into all three channels with an opaque alpha, which
-/// is what SDL_image's grayscale palette (`colors[i].r/g/b = i * 255 / ncolors`)
-/// produces for the 8-bit case, so both paths agree.
-///
-/// Returns the RGBA8 bytes plus the image dimensions.
-fn decode_gray16_png(path: &str) -> napi::Result<(Vec<u8>, u32, u32)> {
-    let file = std::fs::File::open(path)
-        .map_err(|e| generic_err(format!("failed to open '{}': {}", path, e)))?;
-    let mut decoder = png::Decoder::new(std::io::BufReader::new(file));
-    decoder.set_transformations(png::Transformations::STRIP_16);
-    let mut reader = decoder
-        .read_info()
-        .map_err(|e| generic_err(format!("failed to decode '{}': {}", path, e)))?;
-    let mut gray = vec![0u8; reader.output_buffer_size().unwrap_or(0)];
-    let info = reader
-        .next_frame(&mut gray)
-        .map_err(|e| generic_err(format!("failed to decode '{}': {}", path, e)))?;
-
-    let (width, height) = (info.width, info.height);
-    let pixels = (width as usize) * (height as usize);
-    if info.buffer_size() < pixels {
-        return Err(generic_err(format!(
-            "decoded '{}' is smaller than its own {}x{} header claims",
-            path, width, height
-        )));
-    }
-    let mut rgba = vec![0u8; pixels * 4];
-    for (i, &l) in gray[..pixels].iter().enumerate() {
-        rgba[i * 4] = l;
-        rgba[i * 4 + 1] = l;
-        rgba[i * 4 + 2] = l;
-        rgba[i * 4 + 3] = 255;
-    }
-    Ok((rgba, width, height))
-}
-
-/// Uploads already-decoded RGBA8 bytes into a fresh texture — the tail of
-/// [`surface_to_texture`], shared with the `png`-crate fallback path.
-fn rgba8_to_texture(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    data: &[u8],
+/// Decoded pixels plus the wgpu format they must be uploaded as.
+struct DecodedImage {
+    data: Vec<u8>,
     width: u32,
     height: u32,
     format: wgpu::TextureFormat,
+    /// Bytes per pixel in `data` — 4 for RGBA8, 8 for RGBA16F.
+    bytes_per_pixel: u32,
+}
+
+/// Decodes an image file into a GPU-uploadable buffer.
+///
+/// **The old "output is always RGBA8" invariant is gone**, because HDR breaks it:
+/// Radiance `.hdr` carries linear radiance well outside `[0,1]`, and quantising
+/// that to 8 bits would discard exactly the range the format exists to preserve.
+/// The destination format is therefore chosen from the *source*:
+///
+/// - 8-bit sources (PNG/TGA/JPEG) -> `rgba8unorm` or `rgba8unorm-srgb`, honouring
+///   `srgb`. 16-bit PNGs are down-converted to 8 bits keeping the high byte,
+///   which is what the previous SDL_image path did too.
+/// - Float sources (HDR) -> `rgba16float`, and `srgb` is **ignored**. Radiance is
+///   linear by definition, there is no `-srgb` float format in WebGPU, and f16
+///   holds HDR range at half the footprint of f32 (a 2K env map: 16 MB, not 32).
+///   It also matches the `rgba16float` targets metis-engine's HDR chain already
+///   renders into, so a loaded env map needs no conversion downstream.
+///
+/// The source format is **sniffed from the file's magic bytes**, with the
+/// extension as fallback — so a mislabelled PNG, JPEG or HDR still loads.
+/// **TGA is the exception**: it has no signature (the TGA 2.0
+/// `TRUEVISION-XFILE` footer is optional and usually absent), so nothing can
+/// identify it from content and a `.tga` file must actually be named `.tga`.
+/// `tests/image-formats.test.ts` pins both halves of that.
+fn decode_image(path: &str, srgb: bool) -> napi::Result<DecodedImage> {
+    let reader = image::ImageReader::open(path)
+        .map_err(|e| generic_err(format!("failed to open '{}': {}", path, e)))?
+        .with_guessed_format()
+        .map_err(|e| generic_err(format!("failed to read '{}': {}", path, e)))?;
+    let source_format = reader.format();
+    let decoded = reader
+        .decode()
+        .map_err(|e| generic_err(format!("failed to decode '{}': {}", path, e)))?;
+
+    let (width, height) = (decoded.width(), decoded.height());
+    if width == 0 || height == 0 {
+        return Err(generic_err(format!("'{}' decoded to a zero-sized image", path)));
+    }
+
+    // Radiance HDR is the only float source enabled; everything else is 8-bit.
+    if matches!(source_format, Some(image::ImageFormat::Hdr)) {
+        let rgba = decoded.to_rgba32f();
+        let mut data = Vec::with_capacity(rgba.as_raw().len() * 2);
+        for &c in rgba.as_raw() {
+            data.extend_from_slice(&half::f16::from_f32(c).to_le_bytes());
+        }
+        return Ok(DecodedImage { data, width, height, format: wgpu::TextureFormat::Rgba16Float, bytes_per_pixel: 8 });
+    }
+
+    let format = if srgb { wgpu::TextureFormat::Rgba8UnormSrgb } else { wgpu::TextureFormat::Rgba8Unorm };
+    Ok(DecodedImage { data: decoded.to_rgba8().into_raw(), width, height, format, bytes_per_pixel: 4 })
+}
+
+/// Uploads decoded pixels into a fresh texture.
+fn upload_texture(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    img: &DecodedImage,
     usage: u32,
     label: Option<&str>,
-) -> (Arc<wgpu::Texture>, u32, u32) {
+) -> Arc<wgpu::Texture> {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label,
-        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        size: wgpu::Extent3d { width: img.width, height: img.height, depth_or_array_layers: 1 },
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format,
+        format: img.format,
         usage: crate::gpu::convert::texture_usage(usage),
         view_formats: &[],
     });
-    queue.write_texture(
-        wgpu::TexelCopyTextureInfo {
-            texture: &texture,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        data,
-        wgpu::TexelCopyBufferLayout {
-            offset: 0,
-            bytes_per_row: Some(width * 4),
-            rows_per_image: Some(height),
-        },
-        wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-    );
-    (Arc::new(texture), width, height)
-}
-
-/// Byte-swaps every 16-bit sample of a surface, in place.
-///
-/// # Safety
-/// `s` must be a valid, non-null surface in a 16-bit-per-channel format whose
-/// pixel buffer this call is allowed to mutate.
-unsafe fn byteswap_16bit_samples(s: *mut SDL_Surface) {
-    let surf = &*s;
-    if surf.pixels.is_null() {
-        return;
-    }
-    let pitch = surf.pitch as usize;
-    let base = surf.pixels as *mut u8;
-    for row in 0..surf.h as usize {
-        // Swap whole 16-bit units across the row. `pitch` may include padding;
-        // swapping it too is harmless because nothing reads past the last pixel.
-        let mut off = 0usize;
-        while off + 1 < pitch {
-            let p = base.add(row * pitch + off);
-            let (lo, hi) = (*p, *p.add(1));
-            *p = hi;
-            *p.add(1) = lo;
-            off += 2;
-        }
-    }
-}
-
-/// Convert an SDL surface to RGBA8, create a wgpu texture, and upload the pixels.
-/// Runs on the async worker thread. Does **not** free `surf` — the caller owns
-/// it (a single load frees the raw surface afterward; an animation frees the
-/// whole `IMG_Animation`).
-fn surface_to_texture(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    surf: *mut SDL_Surface,
-    format: wgpu::TextureFormat,
-    usage: u32,
-    label: Option<&str>,
-) -> napi::Result<(Arc<wgpu::Texture>, u32, u32)> {
-    // Normalise to RGBA-in-memory byte order (endianness-independent), which is
-    // exactly what wgpu's rgba8unorm(-srgb) expects. Always converts (even if
-    // already RGBA32) so the layout is guaranteed.
-    // SDL3_image decodes a 16-bit-per-channel PNG into a 16-bit surface keeping
-    // PNG's **big-endian** sample order, but SDL's pixel conversion reads those
-    // formats in **host** order. On a little-endian host every sample is
-    // therefore read byte-swapped and down-converted from the wrong half: a
-    // sample of 0x5aec is read as 0xec5a and scales to 235 instead of 90. The
-    // output is plausible-looking noise rather than an obvious failure, and it
-    // only reproduces where SDL_image has a 16-bit-capable PNG decoder — hence
-    // "works on Windows, garbage on Linux".
-    //
-    // Verified by hand-decoding the PNG: the surface SDL_image hands us matches
-    // the file byte for byte, so the decode is fine and only the conversion is
-    // wrong. Swap into a private copy and let SDL convert from that, which keeps
-    // SDL's knowledge of the channel layout (RGB48 vs BGR48 vs RGBA64 …) rather
-    // than hardcoding it here. `tests/image-16bit.test.ts` pins the result.
-    let mut swapped: *mut SDL_Surface = std::ptr::null_mut();
-    let convert_src = if cfg!(target_endian = "little")
-        && is_16bit_integer_format(unsafe { (*surf).format })
-    {
-        let dup = unsafe { SDL_DuplicateSurface(surf) };
-        if dup.is_null() {
-            // Duplication failed; converting the original is still better than
-            // failing outright, it just reproduces the upstream bug.
-            surf
-        } else {
-            unsafe { byteswap_16bit_samples(dup) };
-            swapped = dup;
-            dup
-        }
-    } else {
-        surf
-    };
-
-    let converted = unsafe { SDL_ConvertSurface(convert_src, SDL_PIXELFORMAT_RGBA32) };
-    if !swapped.is_null() {
-        unsafe { SDL_DestroySurface(swapped) };
-    }
-    if converted.is_null() {
-        return Err(generic_err(format!("SDL_ConvertSurface failed: {}", sdl_error())));
-    }
-
-    // A converted surface is plain CPU memory (no SDL_LockSurface needed). Copy
-    // the rows out into an owned Vec, then free the surface immediately.
-    let s = unsafe { &*converted };
-    let width = s.w as u32;
-    let height = s.h as u32;
-    let pitch = s.pitch as usize;
-    if width == 0 || height == 0 || s.pixels.is_null() {
-        unsafe { SDL_DestroySurface(converted) };
-        return Err(generic_err("decoded image has no pixel data".to_string()));
-    }
-    let data = unsafe { std::slice::from_raw_parts(s.pixels as *const u8, pitch * height as usize) }.to_vec();
-    unsafe { SDL_DestroySurface(converted) };
-
-    let desc = wgpu::TextureDescriptor {
-        label,
-        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format,
-        usage: crate::gpu::convert::texture_usage(usage),
-        view_formats: &[],
-    };
-    let texture = device.create_texture(&desc);
-    // Queue::write_texture stages a synchronous copy, so `data` (owned) only has
-    // to live across this call — it does, and no 256-byte row alignment is
+    // Queue::write_texture stages a synchronous copy, so the decode buffer only
+    // has to live across this call — it does, and no 256-byte row alignment is
     // required here (that constraint is only for buffer<->texture GPU copies).
     queue.write_texture(
         wgpu::TexelCopyTextureInfo {
@@ -352,24 +182,32 @@ fn surface_to_texture(
             origin: wgpu::Origin3d::ZERO,
             aspect: wgpu::TextureAspect::All,
         },
-        &data,
+        &img.data,
         wgpu::TexelCopyBufferLayout {
             offset: 0,
-            bytes_per_row: Some(pitch as u32),
-            rows_per_image: Some(height),
+            bytes_per_row: Some(img.width * img.bytes_per_pixel),
+            rows_per_image: Some(img.height),
         },
-        wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        wgpu::Extent3d { width: img.width, height: img.height, depth_or_array_layers: 1 },
     );
-    Ok((Arc::new(texture), width, height))
+    // Flush the staged write. `write_texture` only *queues* the copy — it is
+    // otherwise not executed until the caller's next submit, so a texture that
+    // was loaded and then destroyed before any submit leaves a staged write
+    // against freed memory, and the next unrelated submit fails validation with
+    // "Texture has been destroyed". Submitting nothing here costs one empty
+    // submit per load (these are not per-frame calls) and makes the returned
+    // handle genuinely self-contained: usable, and safe to destroy, immediately.
+    queue.submit(std::iter::empty());
+    Arc::new(texture)
 }
 
-// ── sdlImageLoadTexture (async) ─────────────────────────────────────────────
+// ── loadImageTexture (async) ────────────────────────────────────────────────
 
 pub(crate) struct LoadTextureTask {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
     path: String,
-    format: wgpu::TextureFormat,
+    srgb: bool,
     usage: u32,
     label: Option<String>,
 }
@@ -379,30 +217,9 @@ impl Task for LoadTextureTask {
     type JsValue = GpuTexture;
 
     fn compute(&mut self) -> napi::Result<GpuTexture> {
-        // 16-bit grayscale PNG must never reach IMG_Load — see `is_gray16_png`.
-        if is_gray16_png(&self.path) {
-            let (rgba, width, height) = decode_gray16_png(&self.path)?;
-            let (inner, width, height) = rgba8_to_texture(
-                &self.device,
-                &self.queue,
-                &rgba,
-                width,
-                height,
-                self.format,
-                self.usage,
-                self.label.as_deref(),
-            );
-            return Ok(make_gpu_texture(inner, width, height, self.format, self.usage));
-        }
-        let c_path = CString::new(self.path.as_str()).map_err(|_| napi::Error::new(napi::Status::InvalidArg, "path contains a NUL byte".to_string()))?;
-        let raw = unsafe { IMG_Load(c_path.as_ptr()) };
-        if raw.is_null() {
-            return Err(generic_err(format!("IMG_Load failed for '{}': {}", self.path, sdl_error())));
-        }
-        let result = surface_to_texture(&self.device, &self.queue, raw, self.format, self.usage, self.label.as_deref());
-        unsafe { SDL_DestroySurface(raw) };
-        let (inner, width, height) = result?;
-        Ok(make_gpu_texture(inner, width, height, self.format, self.usage))
+        let img = decode_image(&self.path, self.srgb)?;
+        let inner = upload_texture(&self.device, &self.queue, &img, self.usage, self.label.as_deref());
+        Ok(make_gpu_texture(inner, img.width, img.height, img.format, self.usage))
     }
 
     fn resolve(&mut self, _env: Env, output: GpuTexture) -> napi::Result<GpuTexture> {
@@ -410,156 +227,25 @@ impl Task for LoadTextureTask {
     }
 }
 
-/// Decode an image file (PNG, JPG, WebP, … — whatever SDL_image was built with)
-/// straight into a `GpuTexture` ready to bind, off the JS thread. The pixels
-/// never cross into JS.
+/// Decode an image file (PNG, TGA, JPEG, Radiance HDR) straight into a
+/// `GpuTexture` ready to bind, off the JS thread. The pixels never cross into JS.
 ///
-/// `path` is a filesystem path; the `_IO`/stream variants are intentionally not
-/// exposed. The returned promise rejects with the SDL error string on failure.
+/// Decoding is pure Rust (the `image` crate) — see the module docs for why
+/// SDL3_image was dropped.
+///
+/// `path` is a filesystem path. The returned promise rejects with a decode error
+/// string on failure. The resulting texture's `format` is `rgba8unorm(-srgb)`
+/// for 8-bit sources and `rgba16float` for HDR — read it off the returned handle
+/// rather than assuming.
 #[allow(private_interfaces)]
 #[napi(ts_return_type = "Promise<GpuTexture>")]
-pub fn sdl_image_load_texture(device: &GpuDevice, path: String, options: Option<SdlImageLoadOptions>) -> napi::Result<AsyncTask<LoadTextureTask>> {
+pub fn load_image_texture(device: &GpuDevice, path: String, options: Option<ImageLoadOptions>) -> napi::Result<AsyncTask<LoadTextureTask>> {
     let opts = resolve_options(options);
     Ok(AsyncTask::new(LoadTextureTask {
         device: Arc::clone(&device.inner),
         queue: Arc::clone(&device.queue_inner),
         path,
-        format: opts.format,
-        usage: opts.usage,
-        label: opts.label,
-    }))
-}
-
-// ── sdlImageLoadAnimation (async) ───────────────────────────────────────────
-
-/// An animated image (GIF/WEBP/APNG/…) loaded from a file: every frame is
-/// uploaded to its own GPU texture up front, and `frame(i)` hands them out
-/// ready to bind. Frame delays are exposed in milliseconds.
-#[napi]
-pub struct SdlImageAnimation {
-    width: u32,
-    height: u32,
-    frames: Vec<Arc<wgpu::Texture>>,
-    delays_ms: Vec<u32>,
-    format: wgpu::TextureFormat,
-    usage: u32,
-}
-
-#[napi]
-impl SdlImageAnimation {
-    /// Number of frames.
-    #[napi(getter)]
-    pub fn frame_count(&self) -> u32 {
-        self.frames.len() as u32
-    }
-
-    /// Frame width in pixels (shared by every frame).
-    #[napi(getter)]
-    pub fn width(&self) -> u32 {
-        self.width
-    }
-
-    /// Frame height in pixels (shared by every frame).
-    #[napi(getter)]
-    pub fn height(&self) -> u32 {
-        self.height
-    }
-
-    /// This frame's display duration, in milliseconds.
-    #[napi]
-    pub fn delay_ms(&self, index: u32) -> napi::Result<u32> {
-        self.delays_ms
-            .get(index as usize)
-            .copied()
-            .ok_or_else(|| generic_err(format!("frame index {index} out of range (frameCount {})", self.frames.len())))
-    }
-
-    /// A `GpuTexture` handle for frame `index`, ready to bind. Cheap: shares the
-    /// already-uploaded GPU texture (no re-upload, no copy).
-    #[napi]
-    pub fn frame(&self, index: u32) -> napi::Result<GpuTexture> {
-        let inner = self
-            .frames
-            .get(index as usize)
-            .ok_or_else(|| generic_err(format!("frame index {index} out of range (frameCount {})", self.frames.len())))?;
-        Ok(make_gpu_texture(Arc::clone(inner), self.width, self.height, self.format, self.usage))
-    }
-}
-
-pub(crate) struct LoadAnimationTask {
-    device: Arc<wgpu::Device>,
-    queue: Arc<wgpu::Queue>,
-    path: String,
-    format: wgpu::TextureFormat,
-    usage: u32,
-    label: Option<String>,
-}
-
-impl Task for LoadAnimationTask {
-    type Output = SdlImageAnimation;
-    type JsValue = SdlImageAnimation;
-
-    fn compute(&mut self) -> napi::Result<SdlImageAnimation> {
-        let c_path = CString::new(self.path.as_str()).map_err(|_| napi::Error::new(napi::Status::InvalidArg, "path contains a NUL byte".to_string()))?;
-        let anim = unsafe { IMG_LoadAnimation(c_path.as_ptr()) };
-        if anim.is_null() {
-            return Err(generic_err(format!("IMG_LoadAnimation failed for '{}': {}", self.path, sdl_error())));
-        }
-
-        let a = unsafe { &*anim };
-        let width = a.w.max(0) as u32;
-        let height = a.h.max(0) as u32;
-        let count = a.count.max(0) as usize;
-
-        let mut frames: Vec<Arc<wgpu::Texture>> = Vec::with_capacity(count);
-        let mut delays_ms: Vec<u32> = Vec::with_capacity(count);
-        let mut load_err: Option<napi::Error> = None;
-
-        for i in 0..count {
-            // SAFETY: `frames`/`delays` are `count`-long arrays owned by `anim`.
-            let surf = unsafe { *a.frames.add(i) };
-            let delay = unsafe { *a.delays.add(i) };
-            delays_ms.push(delay.max(0) as u32);
-            if surf.is_null() {
-                load_err = Some(generic_err(format!("animation '{}' frame {i} is null", self.path)));
-                break;
-            }
-            match surface_to_texture(&self.device, &self.queue, surf, self.format, self.usage, self.label.as_deref()) {
-                Ok((tex, _, _)) => frames.push(tex),
-                Err(e) => {
-                    load_err = Some(e);
-                    break;
-                }
-            }
-        }
-
-        // Frees the IMG_Animation and all its frame surfaces; our textures
-        // already own their pixels on the GPU.
-        unsafe { IMG_FreeAnimation(anim) };
-
-        if let Some(e) = load_err {
-            return Err(e);
-        }
-        Ok(SdlImageAnimation { width, height, frames, delays_ms, format: self.format, usage: self.usage })
-    }
-
-    fn resolve(&mut self, _env: Env, output: SdlImageAnimation) -> napi::Result<SdlImageAnimation> {
-        Ok(output)
-    }
-}
-
-/// Decode an animated image file into per-frame `GpuTexture`s, off the JS
-/// thread. Resolves to an `SdlImageAnimation` whose `frame(i)`/`delayMs(i)`
-/// expose ready-to-bind handles + timing. File reader only (no `_IO` variant).
-#[allow(private_interfaces)]
-#[napi(ts_return_type = "Promise<SdlImageAnimation>")]
-pub fn sdl_image_load_animation(device: &GpuDevice, path: String, options: Option<SdlImageLoadOptions>) -> napi::Result<AsyncTask<LoadAnimationTask>> {
-    let opts = resolve_options(options);
-    Ok(AsyncTask::new(LoadAnimationTask {
-        device: Arc::clone(&device.inner),
-        queue: Arc::clone(&device.queue_inner),
-        path,
-        format: opts.format,
+        srgb: opts.srgb,
         usage: opts.usage,
         label: opts.label,
     }))

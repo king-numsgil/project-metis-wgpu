@@ -85,7 +85,16 @@ ctx.destroy();
 
 Identical, except `RenderContext.createOffscreen({...})`. `beginFrame()` returns
 the same offscreen view every frame and `present()` is a no-op, so there is no
-vsync. Read the result back from `ctx.captureTexture` (pinned to `rgba8unorm`).
+vsync. Read the result back from `ctx.captureTexture` with `readTexturePixels`
+or `saveTextureToFile`.
+
+The offscreen target is **`rgba8unorm-srgb`**, matching a real swapchain's colour
+space. That is not incidental: `tonemap.wgsl` writes *linear* values and relies on
+the target format's `-srgb` suffix for the hardware encode, so a non-sRGB target
+silently skips it and captures come out markedly darker than the same scene in a
+window. Any pipeline you build that targets this texture must take
+`ctx.outputFormat` — hardcoding a format is a *silent* validation error that
+still writes a plausible-looking file.
 
 **Auto-exposure adapts over frames** — render ~30 warmup frames before capturing
 or the image reflects the first frame's transient.
@@ -199,8 +208,8 @@ width: number; height: number;
 
 get sdlWindow(): SdlWindow | null;
 get isWindowed(): boolean;
-get outputFormat(): GPUTextureFormat;   // swapchain preferred format (cached), or "rgba8unorm" offscreen
-get captureTexture(): GpuTexture | null; // offscreen only; read back with takeScreenshot
+get outputFormat(): GPUTextureFormat;   // swapchain preferred format (cached), or "rgba8unorm-srgb" offscreen
+get captureTexture(): GpuTexture | null; // offscreen only; read back with readTexturePixels/saveTextureToFile
 
 beginFrame(): FrameTarget;  // { view, format, present() } — call present() AFTER queue.submit()
 resize(width: number, height: number): void;
@@ -569,6 +578,10 @@ loadGltf(device, gltfPath): Promise<SceneInstance[]>
 `srgb: true` for colour data (albedo, emissive), `false`/omitted for data maps
 (normal, metallic, roughness). Decode + upload happen in Rust; pixels never cross
 the FFI boundary, and concurrent loads decode in parallel.
+
+Formats: **PNG, TGA, JPEG, Radiance HDR**. `srgb` is **ignored for `.hdr`**,
+which loads as an `rgba16float` texture rather than `rgba8unorm` — check
+`texture.format` if downstream code assumes 8-bit.
 
 `loadGltf` is a **deliberately narrow** reader: separate `.gltf` + `.bin` only
 (no `.glb`, no embedded base64), `f32` POSITION/NORMAL/optional TEXCOORD_0,

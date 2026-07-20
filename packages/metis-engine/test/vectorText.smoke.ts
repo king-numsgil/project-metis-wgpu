@@ -3,7 +3,7 @@
 // before src/text/vectorText.ts, so this renders one string to an offscreen
 // target and screenshots it before the HUD overlay leans on it.
 import { type GpuTexture, GPUTextureUsage } from "bun-webgpu-rs";
-import { takeScreenshot } from "bun-webgpu-rs/tests/helpers/screenshot.ts";
+import { readTexturePixels, savePixelsToFile } from "bun-webgpu-rs";
 import { RenderContext, type Rgba, VectorText } from "metis-engine/renderer";
 
 const W = 480;
@@ -27,7 +27,8 @@ async function main() {
     text.render(encoder, target.createView(), W, H, [0.1, 1.0, 0.6, 1.0], "clear");
     ctx.device.queue.submit([encoder.finish()]);
 
-    const pixels = await takeScreenshot(ctx.device, target, W, H, "test/output/vector-text-smoke.png");
+    const pixels = await readTexturePixels(ctx.device, target);
+    await savePixelsToFile(pixels, W, H, "test/output/vector-text-smoke.png");
     const litPixels = countNonBackground(pixels);
     console.log(`vector-text-smoke.png written; ${litPixels} non-background pixels`);
     if (litPixels === 0) {
@@ -61,7 +62,8 @@ async function paletteCheck(ctx: RenderContext, target: GpuTexture) {
     text.render(encoder, target.createView(), W, H, [RED, BLUE], "clear");
     ctx.device.queue.submit([encoder.finish()]);
 
-    const pixels = await takeScreenshot(ctx.device, target, W, H, "test/output/vector-text-palette.png");
+    const pixels = await readTexturePixels(ctx.device, target);
+    await savePixelsToFile(pixels, W, H, "test/output/vector-text-palette.png");
     let reds = 0;
     let blues = 0;
     for (let i = 0; i < pixels.length; i += 4) {

@@ -492,27 +492,6 @@ export declare class SdlGamepad {
   close(): void
 }
 
-/**
- * An animated image (GIF/WEBP/APNG/…) loaded from a file: every frame is
- * uploaded to its own GPU texture up front, and `frame(i)` hands them out
- * ready to bind. Frame delays are exposed in milliseconds.
- */
-export declare class SdlImageAnimation {
-  /** Number of frames. */
-  get frameCount(): number
-  /** Frame width in pixels (shared by every frame). */
-  get width(): number
-  /** Frame height in pixels (shared by every frame). */
-  get height(): number
-  /** This frame's display duration, in milliseconds. */
-  delayMs(index: number): number
-  /**
-   * A `GpuTexture` handle for frame `index`, ready to bind. Cheap: shares the
-   * already-uploaded GPU texture (no re-upload, no copy).
-   */
-  frame(index: number): GpuTexture
-}
-
 /** An open joystick handle. Call `.close()` when done. */
 export declare class SdlJoystick {
   instanceId(): number
@@ -1254,6 +1233,10 @@ export interface GpuVertexState {
  * How the decoded pixels are interpreted when the GPU samples them — the
  * sRGB/linear split every PBR pipeline needs (colour maps are sRGB, data maps
  * like normal/roughness are linear; see metis-engine's `texture.ts`).
+ *
+ * **Ignored for floating-point source formats** (Radiance HDR): those carry
+ * linear radiance by definition, so there is no sRGB transfer curve to undo and
+ * no `-srgb` float texture format to request. See [`decode_image`].
  */
 export declare enum ImageColorSpace {
   /**
@@ -1267,6 +1250,29 @@ export declare enum ImageColorSpace {
    */
   Linear = 1
 }
+
+export interface ImageLoadOptions {
+  /** Debug label applied to the created GPU texture. */
+  label?: string
+  /** Colour space of the source pixels. Defaults to `Srgb`. Ignored for HDR. */
+  colorSpace?: ImageColorSpace
+  /** `GpuTextureUsage` bitmask. Defaults to `TEXTURE_BINDING | COPY_DST`. */
+  usage?: number
+}
+
+/**
+ * Decode an image file (PNG, TGA, JPEG, Radiance HDR) straight into a
+ * `GpuTexture` ready to bind, off the JS thread. The pixels never cross into JS.
+ *
+ * Decoding is pure Rust (the `image` crate) — see the module docs for why
+ * SDL3_image was dropped.
+ *
+ * `path` is a filesystem path. The returned promise rejects with a decode error
+ * string on failure. The resulting texture's `format` is `rgba8unorm(-srgb)`
+ * for 8-bit sources and `rgba16float` for HDR — read it off the returned handle
+ * rather than assuming.
+ */
+export declare function loadImageTexture(device: GpuDevice, path: string, options?: ImageLoadOptions | undefined | null): Promise<GpuTexture>
 
 export interface MouseRect {
   x: number
@@ -1285,6 +1291,16 @@ export interface MouseState {
 }
 
 /**
+ * Read a texture back as **tight RGBA8 bytes** (GPU row padding stripped),
+ * off the JS thread — for asserting on pixels without writing a file.
+ *
+ * The texture must have `GPUTextureUsage.COPY_SRC`. BGRA sources are swizzled
+ * to RGBA. `rgba16float` is rejected: reinterpreting f16 bytes as 8-bit colour
+ * is silently meaningless, so save it as `.hdr` instead.
+ */
+export declare function readTexturePixels(device: GpuDevice, texture: GpuTexture): Promise<Buffer>
+
+/**
  * Top-level entry point. In a browser this would be `navigator.gpu.requestAdapter()`;
  * here we export it directly from the module.
  */
@@ -1299,6 +1315,28 @@ export declare function requestAdapter(options?: GpuRequestAdapterOptions | unde
  * the window at all.
  */
 export declare function requestAdapterForWindow(window: SdlWindow, options?: GpuRequestAdapterOptions | undefined | null): Promise<GpuAdapter | null>
+
+/**
+ * Encode tight **RGBA8** bytes and write them to `path`, off the JS thread.
+ * Encoding is chosen from the extension (`.hdr` is rejected — 8-bit input
+ * carries no high-dynamic-range data). Parent directories are created as needed.
+ *
+ * Pair with [`read_texture_pixels`] when a caller wants both the pixels and a
+ * file from a single GPU readback.
+ */
+export declare function savePixelsToFile(pixels: Buffer, width: number, height: number, path: string): Promise<void>
+
+/**
+ * Read a texture back and write it to `path`, off the JS thread. The encoding
+ * is chosen from the extension: `.png`, `.jpg`/`.jpeg`, `.tga`, `.hdr`.
+ * Parent directories are created as needed.
+ *
+ * The texture must have been created with `GPUTextureUsage.COPY_SRC`.
+ * `rgba8unorm(-srgb)` and `bgra8unorm(-srgb)` are both supported (BGRA is
+ * swizzled), so a surface-format texture can be saved directly.
+ * `rgba16float` may only be written as `.hdr`.
+ */
+export declare function saveTextureToFile(device: GpuDevice, texture: GpuTexture, path: string): Promise<void>
 
 /**
  * Enable mouse capture so the window receives mouse events even when the
@@ -1625,32 +1663,6 @@ export declare function sdlHasJoystick(): boolean
 
 /** Hide the mouse cursor. */
 export declare function sdlHideCursor(): void
-
-/**
- * Decode an animated image file into per-frame `GpuTexture`s, off the JS
- * thread. Resolves to an `SdlImageAnimation` whose `frame(i)`/`delayMs(i)`
- * expose ready-to-bind handles + timing. File reader only (no `_IO` variant).
- */
-export declare function sdlImageLoadAnimation(device: GpuDevice, path: string, options?: SdlImageLoadOptions | undefined | null): Promise<SdlImageAnimation>
-
-export interface SdlImageLoadOptions {
-  /** Debug label applied to the created GPU texture(s). */
-  label?: string
-  /** Colour space of the source pixels. Defaults to `Srgb`. */
-  colorSpace?: ImageColorSpace
-  /** `GpuTextureUsage` bitmask. Defaults to `TEXTURE_BINDING | COPY_DST`. */
-  usage?: number
-}
-
-/**
- * Decode an image file (PNG, JPG, WebP, … — whatever SDL_image was built with)
- * straight into a `GpuTexture` ready to bind, off the JS thread. The pixels
- * never cross into JS.
- *
- * `path` is a filesystem path; the `_IO`/stream variants are intentionally not
- * exposed. The returned promise rejects with the SDL error string on failure.
- */
-export declare function sdlImageLoadTexture(device: GpuDevice, path: string, options?: SdlImageLoadOptions | undefined | null): Promise<GpuTexture>
 
 /** Initialize SDL subsystems. `flags` is a bitmask of `SdlInitFlag` values. */
 export declare function sdlInit(flags: number): void

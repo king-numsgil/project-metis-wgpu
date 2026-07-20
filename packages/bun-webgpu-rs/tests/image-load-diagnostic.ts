@@ -1,7 +1,10 @@
-// Standalone diagnostic for the Linux texture-corruption + buffer-overflow
-// report. Deliberately isolated: no window, no renderer, no engine — just the
-// SDL3_image -> wgpu upload path, so a failure here pins the bug to that path
+// Standalone diagnostic for texture-corruption / buffer-overflow reports.
+// Deliberately isolated: no window, no renderer, no engine — just the
+// decode -> wgpu upload path, so a failure here pins the bug to that path
 // rather than to anything downstream.
+//
+// Written against SDL3_image, which is no longer used (see this package's
+// CLAUDE.md); it applies unchanged to the `image`-crate path that replaced it.
 //
 //   bun run tests/image-load-diagnostic.ts <image.png> [more.png ...]
 //
@@ -19,7 +22,7 @@
 //
 // Every load also prints dimensions + a content fingerprint, so a corrupt
 // result is visible even without a known-good reference to compare against.
-import { GPUBufferUsage, GPUMapMode, GPUTextureUsage, ImageColorSpace, requestAdapter, sdlImageLoadTexture } from "../index.js";
+import { GPUBufferUsage, GPUMapMode, GPUTextureUsage, ImageColorSpace, requestAdapter, loadImageTexture } from "../index.js";
 
 const files = process.argv.slice(2);
 if (files.length === 0) {
@@ -41,7 +44,7 @@ const device = await adapter.requestDevice({label: "image-diagnostic"});
 
 /** Loads one image and reads its pixels back. */
 async function load(path: string, srgb: boolean) {
-    const tex = await sdlImageLoadTexture(device, path, {
+    const tex = await loadImageTexture(device, path, {
         label: `diag:${path}`,
         colorSpace: srgb ? ImageColorSpace.Srgb : ImageColorSpace.Linear,
         // COPY_SRC so we can read it back; loadTexture() in the engine doesn't
