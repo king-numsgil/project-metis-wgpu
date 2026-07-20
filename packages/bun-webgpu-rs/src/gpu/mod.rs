@@ -22,7 +22,7 @@ pub use buffer::GpuBuffer;
 pub use command_encoder::{GpuCommandBuffer, GpuCommandEncoder, GpuComputePassEncoder, GpuRenderPassEncoder};
 pub use constants::{GpuBufferUsage, GpuColorWrite, GpuMapMode, GpuShaderStage, GpuTextureUsage};
 pub use device::{GpuDevice, GpuDeviceLostInfo, GpuError, GpuUncapturedErrorEvent};
-pub use instance::{request_adapter, request_adapter_for_window};
+pub use instance::{enumerate_adapters,request_adapter, request_adapter_for_window};
 pub use pipeline::{GpuComputePipeline, GpuRenderPipeline};
 pub use query_set::GpuQuerySet;
 pub use queue::GpuQueue;

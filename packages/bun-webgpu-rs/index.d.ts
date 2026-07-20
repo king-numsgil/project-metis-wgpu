@@ -735,6 +735,23 @@ export interface DrawCall {
   id: number
 }
 
+/**
+ * Lists **every** adapter the given backends expose, instead of letting wgpu
+ * pick one. `requestAdapter` returns a single adapter chosen by
+ * `powerPreference`, which is a hint — this is how you find out what it
+ * actually had to choose between, and what each one reports.
+ *
+ * Worth reaching for when a machine has several GPUs, when performance is
+ * inexplicably bad (a software rasterizer looks like a normal adapter until
+ * you read `info.deviceType`), or when `requestDevice` fails on limits and you
+ * need to know whether another adapter would do better.
+ *
+ * The returned adapters are usable, but for **windowed** rendering prefer
+ * `requestAdapterForWindow` — an adapter picked from this list is not
+ * guaranteed to be compatible with a given window's surface.
+ */
+export declare function enumerateAdapters(options?: GpuRequestAdapterOptions | undefined | null): Array<GpuAdapter>
+
 /** Font metrics in pixels at a given size. */
 export interface FontMetrics {
   ascender: number

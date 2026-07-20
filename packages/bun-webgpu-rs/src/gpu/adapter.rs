@@ -221,6 +221,7 @@ impl GpuAdapter {
 
         let mut required_features = wgpu::Features::empty();
         let mut required_limits = wgpu::Limits::default();
+        let mut explicit_limits = false;
         let mut label = None::<String>;
         let mut queue_label = None::<String>;
 
@@ -233,9 +234,49 @@ impl GpuAdapter {
             }
             if let Some(ref lim) = desc.required_limits {
                 required_limits = required_limits_to_wgpu(lim);
+                explicit_limits = true;
             }
             if let Some(ref qd) = desc.default_queue {
                 queue_label = qd.label.clone();
+            }
+        }
+
+        // Pre-flight the limits ourselves. wgpu reports only the *first*
+        // violation, and phrases it as "value X is better than allowed Y", which
+        // reads backwards and names neither the adapter nor the other failures.
+        // A non-conformant driver (Mesa's `dzn` D3D12 layer, say) can report 0
+        // for limits it doesn't implement, and the raw message gives no hint
+        // that the adapter itself is the problem.
+        {
+            let allowed = adapter.limits();
+            let mut violations: Vec<String> = Vec::new();
+            required_limits.check_limits_with_fail_fn(&allowed, true, |name, wanted, have| {
+                violations.push(format!("  {name}: need {wanted}, adapter offers {have}"));
+            });
+            if !violations.is_empty() {
+                let info = adapter.get_info();
+                let hint = if explicit_limits {
+                    "Lower the offending values in `requiredLimits`, or omit it to take the WebGPU defaults."
+                } else {
+                    concat!(
+                        "These are the WebGPU defaults, which every conformant adapter supports. ",
+                        "An adapter offering 0 (or an absurdly low value) is almost certainly a ",
+                        "non-conformant or misconfigured driver — check which Vulkan ICD is being ",
+                        "selected. You can also pass `requiredLimits` to ask for less.",
+                    )
+                };
+                return Err(napi::Error::new(
+                    napi::Status::GenericFailure,
+                    format!(
+                        "requestDevice: adapter '{}' ({:?}, {:?}) cannot meet {} required limit(s):\n{}\n{}",
+                        info.name,
+                        info.backend,
+                        info.device_type,
+                        violations.len(),
+                        violations.join("\n"),
+                        hint,
+                    ),
+                ));
             }
         }
 

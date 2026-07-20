@@ -60,7 +60,7 @@ pub use gpu::{GpuBindGroup, GpuBindGroupLayout, GpuPipelineLayout};
 pub use gpu::GpuBuffer;
 pub use gpu::{GpuCommandBuffer, GpuCommandEncoder, GpuComputePassEncoder, GpuRenderPassEncoder};
 pub use gpu::{GpuDevice, GpuDeviceLostInfo, GpuError, GpuUncapturedErrorEvent};
-pub use gpu::{request_adapter, request_adapter_for_window};
+pub use gpu::{enumerate_adapters, request_adapter, request_adapter_for_window};
 pub use gpu::{GpuComputePipeline, GpuRenderPipeline};
 pub use gpu::GpuQuerySet;
 pub use gpu::GpuQueue;

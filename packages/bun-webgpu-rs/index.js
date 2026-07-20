@@ -616,6 +616,7 @@ module.exports.SdlKeyboardState = nativeBinding.SdlKeyboardState
 module.exports.SdlWindow = nativeBinding.SdlWindow
 module.exports.VectorContext = nativeBinding.VectorContext
 module.exports.createSurface = nativeBinding.createSurface
+module.exports.enumerateAdapters = nativeBinding.enumerateAdapters
 module.exports.GPUBufferUsage = nativeBinding.GPUBufferUsage
 module.exports.GpuBufferUsage = nativeBinding.GpuBufferUsage
 module.exports.GPUColorWrite = nativeBinding.GPUColorWrite
