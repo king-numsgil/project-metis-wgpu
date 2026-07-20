@@ -118,6 +118,125 @@ fn is_16bit_integer_format(f: sdl3_sys::pixels::SDL_PixelFormat) -> bool {
         || f == SDL_PIXELFORMAT_ABGR64
 }
 
+/// True if `path` is a PNG whose IHDR says colour type 0 (grayscale, no alpha)
+/// at bit depth 16 — the one input that makes SDL_image 3.4.4 corrupt the heap.
+///
+/// **Why this has to be sniffed before `IMG_Load` rather than repaired after.**
+/// In `IMG_libpng.c`, the format-selection branch tests
+/// `color_type == PNG_COLOR_TYPE_GRAY` *without* also testing the bit depth, so a
+/// 16-bit gray image falls into the arm commented `else /* if (bit_depth == 8) */`
+/// and the surface is created as `SDL_PIXELFORMAT_INDEX8` — one byte per pixel.
+/// Nothing ever calls `png_set_strip_16()` on that path, so libpng still writes
+/// **two** bytes per pixel, and `png_read_image` overruns the surface by exactly
+/// 2x (at 64x64: 8192 bytes into a 4096-byte buffer). That smashes the surface's
+/// own palette pointer and glibc's heap metadata, which surfaces here as a
+/// `munmap_chunk(): invalid pointer` abort or a segfault somewhere later. The
+/// damage is done *inside* `IMG_Load`, so there is nothing left to validate or
+/// fix up on return — the call simply must not happen for this format.
+///
+/// A grayscale PNG *with* a `tRNS` chunk is fine: SDL_image ORs in
+/// `PNG_COLOR_MASK_ALPHA`, which routes it through `png_set_gray_to_rgb` instead.
+/// So the check is deliberately narrow — colour type exactly 0, depth exactly 16.
+///
+/// Only the 26-byte header is read. A file that isn't a PNG, or is too short,
+/// returns `false` and takes the normal SDL_image path.
+fn is_gray16_png(path: &str) -> bool {
+    use std::io::Read;
+    const PNG_SIG: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    let mut header = [0u8; 26];
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    if file.read_exact(&mut header).is_err() {
+        return false;
+    }
+    // Bytes 12..16 must be the IHDR chunk type; 24 is bit depth, 25 is colour type.
+    header[..8] == PNG_SIG && &header[12..16] == b"IHDR" && header[24] == 16 && header[25] == 0
+}
+
+/// Decodes a 16-bit grayscale PNG to RGBA8 with the pure-Rust `png` crate,
+/// bypassing the SDL_image overflow documented on [`is_gray16_png`].
+///
+/// The `png` crate is asked to strip 16-bit samples down to 8
+/// (`Transformations::STRIP_16`), which is lossless for our purposes because the
+/// destination texture is `rgba8unorm(-srgb)` either way — SDL_image's own
+/// working paths down-convert to 8 bits too. Grey is expanded to RGB by
+/// replicating the luminance into all three channels with an opaque alpha, which
+/// is what SDL_image's grayscale palette (`colors[i].r/g/b = i * 255 / ncolors`)
+/// produces for the 8-bit case, so both paths agree.
+///
+/// Returns the RGBA8 bytes plus the image dimensions.
+fn decode_gray16_png(path: &str) -> napi::Result<(Vec<u8>, u32, u32)> {
+    let file = std::fs::File::open(path)
+        .map_err(|e| generic_err(format!("failed to open '{}': {}", path, e)))?;
+    let mut decoder = png::Decoder::new(std::io::BufReader::new(file));
+    decoder.set_transformations(png::Transformations::STRIP_16);
+    let mut reader = decoder
+        .read_info()
+        .map_err(|e| generic_err(format!("failed to decode '{}': {}", path, e)))?;
+    let mut gray = vec![0u8; reader.output_buffer_size().unwrap_or(0)];
+    let info = reader
+        .next_frame(&mut gray)
+        .map_err(|e| generic_err(format!("failed to decode '{}': {}", path, e)))?;
+
+    let (width, height) = (info.width, info.height);
+    let pixels = (width as usize) * (height as usize);
+    if info.buffer_size() < pixels {
+        return Err(generic_err(format!(
+            "decoded '{}' is smaller than its own {}x{} header claims",
+            path, width, height
+        )));
+    }
+    let mut rgba = vec![0u8; pixels * 4];
+    for (i, &l) in gray[..pixels].iter().enumerate() {
+        rgba[i * 4] = l;
+        rgba[i * 4 + 1] = l;
+        rgba[i * 4 + 2] = l;
+        rgba[i * 4 + 3] = 255;
+    }
+    Ok((rgba, width, height))
+}
+
+/// Uploads already-decoded RGBA8 bytes into a fresh texture — the tail of
+/// [`surface_to_texture`], shared with the `png`-crate fallback path.
+fn rgba8_to_texture(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    data: &[u8],
+    width: u32,
+    height: u32,
+    format: wgpu::TextureFormat,
+    usage: u32,
+    label: Option<&str>,
+) -> (Arc<wgpu::Texture>, u32, u32) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label,
+        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: crate::gpu::convert::texture_usage(usage),
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        data,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(width * 4),
+            rows_per_image: Some(height),
+        },
+        wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+    );
+    (Arc::new(texture), width, height)
+}
+
 /// Byte-swaps every 16-bit sample of a surface, in place.
 ///
 /// # Safety
@@ -260,6 +379,21 @@ impl Task for LoadTextureTask {
     type JsValue = GpuTexture;
 
     fn compute(&mut self) -> napi::Result<GpuTexture> {
+        // 16-bit grayscale PNG must never reach IMG_Load — see `is_gray16_png`.
+        if is_gray16_png(&self.path) {
+            let (rgba, width, height) = decode_gray16_png(&self.path)?;
+            let (inner, width, height) = rgba8_to_texture(
+                &self.device,
+                &self.queue,
+                &rgba,
+                width,
+                height,
+                self.format,
+                self.usage,
+                self.label.as_deref(),
+            );
+            return Ok(make_gpu_texture(inner, width, height, self.format, self.usage));
+        }
         let c_path = CString::new(self.path.as_str()).map_err(|_| napi::Error::new(napi::Status::InvalidArg, "path contains a NUL byte".to_string()))?;
         let raw = unsafe { IMG_Load(c_path.as_ptr()) };
         if raw.is_null() {

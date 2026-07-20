@@ -426,6 +426,53 @@ Design rules for this module:
 - **Strong enum, not a bool.** sRGB/linear is `ImageColorSpace`, mirroring the
   crate's `#[napi] enum` convention rather than a magic flag.
 - Loading needs no `SDL_Init` — decode + `SDL_ConvertSurface` are self-contained.
+- **16-bit grayscale PNG never reaches `IMG_Load`** — it is decoded by the `png`
+  crate instead. See below.
+
+### The one image format SDL_image cannot be allowed to see
+
+`sdlImageLoadTexture` sniffs the PNG IHDR and routes **colour type 0 at bit depth
+16** (grayscale, no alpha) to the pure-Rust `png` crate. Everything else still
+goes through `IMG_Load` unchanged. This is not a preference — SDL_image 3.4.4
+corrupts the heap on that input.
+
+In `IMG_libpng.c`, the format-selection branch tests `color_type ==
+PNG_COLOR_TYPE_GRAY` **without also testing the bit depth**, so a 16-bit gray
+image falls into the arm commented `else /* if (bit_depth == 8) */` and gets an
+`SDL_PIXELFORMAT_INDEX8` surface — one byte per pixel. Nothing calls
+`png_set_strip_16()` on that path, so libpng still writes **two** bytes per
+pixel and `png_read_image` overruns the surface by exactly 2x (at 64x64: 8192
+bytes into a 4096-byte buffer). That smashes the surface's own palette pointer
+and glibc's heap metadata.
+
+**The damage happens inside `IMG_Load`, so there is nothing to validate or repair
+on return** — by the time the call yields, the palette pointer already reads back
+as the image's own pixel bytes and the process is living on borrowed time. The
+call simply must not happen. That's why this is a *pre-flight sniff of the file
+header* rather than a check on the returned surface.
+
+Symptom, if it ever regresses: `munmap_chunk(): invalid pointer` or a bare
+`Segmentation fault at address 0x0` **several seconds after** the load, wherever
+the corrupted chunk is next touched — which is why it presented as "the demos
+crash on startup" rather than pointing anywhere near image loading. Both
+`metis-engine` demos hit it because Poly Haven ships `metal_plate_02`'s metallic
+and roughness maps as 16-bit grayscale.
+
+Deliberately narrow: a grayscale PNG **with** a `tRNS` chunk is fine, because
+SDL_image ORs in `PNG_COLOR_MASK_ALPHA` and routes it through
+`png_set_gray_to_rgb`. Only bare colour-type-0-depth-16 is affected — verified by
+loading all eight (depth, colour-type) combinations. Don't widen the guard
+without re-checking which ones actually break; every other format is fine on the
+SDL_image path and should stay there.
+
+`tests/image-16bit.test.ts` pins it, and is mutation-checked (disabling the guard
+fails the test). Note this test "fails" by *aborting the runner* when the guard is
+gone, not by a clean assertion — a heap smash isn't catchable from JS.
+
+**Recheck on any `sdl3-image-sys` bump.** 0.6.4+SDL-image-3.4.4 was the newest
+published when this was written, so there was no upstream fix to take. If a later
+release fixes the branch, this guard becomes dead weight and should be deleted
+along with the `png` dependency — but confirm with the test first.
 
 ## GPU debug primitives
 

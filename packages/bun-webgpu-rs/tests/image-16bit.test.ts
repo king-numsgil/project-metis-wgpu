@@ -99,6 +99,43 @@ function write16BitPng(path: string, size: number): {r: number; g: number; b: nu
     return hi;
 }
 
+/**
+ * Writes a `size`x`size` **16-bit grayscale** (colour type 0) PNG — the one
+ * input SDL_image 3.4.4 corrupts the heap on, so this is the only generator
+ * here whose image never reaches `IMG_Load` at all.
+ *
+ * As above, each sample's high byte differs from its low byte so a byte-order
+ * or strip mistake cannot accidentally produce the right answer.
+ */
+function writeGray16Png(path: string, size: number): number {
+    const hi = 0x5a;
+    const lo = 0xec;
+    const stride = size * 2;
+    const raw = new Uint8Array((stride + 1) * size);
+    for (let y = 0; y < size; y++) {
+        const row = y * (stride + 1);
+        raw[row] = 0; // filter: none
+        for (let x = 0; x < size; x++) {
+            raw[row + 1 + x * 2] = hi;
+            raw[row + 2 + x * 2] = lo;
+        }
+    }
+    const ihdr = new Uint8Array(13);
+    const dv = new DataView(ihdr.buffer);
+    dv.setUint32(0, size);
+    dv.setUint32(4, size);
+    ihdr[8] = 16; // bit depth
+    ihdr[9] = 0; // colour type: grayscale, no alpha
+    const png = new Uint8Array([
+        ...[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a],
+        ...chunk("IHDR", ihdr),
+        ...chunk("IDAT", new Uint8Array(deflateSync(raw))),
+        ...chunk("IEND", new Uint8Array(0)),
+    ]);
+    writeFileSync(path, png);
+    return hi;
+}
+
 async function readBack(path: string, srgb: boolean) {
     const tex = await sdlImageLoadTexture(device!, path, {
         colorSpace: srgb ? ImageColorSpace.Srgb : ImageColorSpace.Linear,
@@ -139,6 +176,44 @@ describe("16-bit PNG decoding", () => {
             expect(px[2]).toBeGreaterThanOrEqual(hi.b - 1);
             expect(px[2]).toBeLessThanOrEqual(hi.b + 1);
             expect(px[3]).toBe(255); // opaque
+        } finally {
+            try {
+                unlinkSync(path);
+            } catch {
+                /* best effort */
+            }
+        }
+    }, 60_000);
+
+    // 16-bit *grayscale* is a separate bug from the byte-order one above, and a
+    // far nastier one: SDL_image 3.4.4's IMG_libpng.c picks the surface format
+    // with `color_type == PNG_COLOR_TYPE_GRAY` and no bit-depth test, so a
+    // 16-bit gray image lands in the arm commented `else /* if (bit_depth == 8) */`
+    // and gets an INDEX8 (1 byte/px) surface. Nothing calls png_set_strip_16 on
+    // that path, so libpng still writes 2 bytes/px and png_read_image overruns
+    // the surface by exactly 2x, smashing the palette pointer and the heap.
+    //
+    // That is a process abort (`munmap_chunk(): invalid pointer`), not a
+    // catchable failure, so this test "fails" by killing the runner — which is
+    // precisely why the guard in image/mod.rs sniffs the IHDR and routes this
+    // format to the `png` crate instead of letting IMG_Load see it.
+    it("decodes 16-bit grayscale without corrupting the heap", async () => {
+        if (!device) {
+            return;
+        }
+        const path = join(tmpdir(), `metis-gray16-${process.pid}.png`);
+        const hi = writeGray16Png(path, 8);
+        try {
+            const px = await readBack(path, false);
+            // Grey replicates into R, G and B, alpha opaque — matching what
+            // SDL_image's own grayscale palette produces for the 8-bit case.
+            expect(px[0]).toBeGreaterThanOrEqual(hi - 1);
+            expect(px[0]).toBeLessThanOrEqual(hi + 1);
+            expect(px[1]).toBe(px[0]);
+            expect(px[2]).toBe(px[0]);
+            expect(px[3]).toBe(255);
+            // No row skew — a wrong stride in the fallback shows up here.
+            expect(px.slice(4, 8)).toEqual(px.slice(0, 4));
         } finally {
             try {
                 unlinkSync(path);

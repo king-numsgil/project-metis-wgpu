@@ -433,7 +433,12 @@ anim.frameCount; anim.frame(i); anim.delayMs(i);
 
 File readers only — no `SDL_IOStream` (`*_IO`) variants. Formats: whatever
 SDL_image was built with (PNG/JPG/WebP/…). Output is always RGBA8, byte-order
-safe.
+safe. 16-bit-per-channel PNGs down-convert to 8 bits, keeping the high byte.
+
+16-bit **grayscale** PNGs are decoded by the `png` crate rather than SDL_image,
+which corrupts the heap on that one format; this is transparent at the call site
+(same signature, same RGBA8 output, grey replicated into R/G/B with opaque
+alpha). See this package's `CLAUDE.md` for the mechanism and when to drop it.
 
 ---
 
