@@ -156,6 +156,14 @@ frame.present();                                // AFTER submit
 low-latency but does *not* cap the frame rate — pair it with a software frame
 limiter (see `metis-engine`'s `FrameLimiter`) if you want a cap.
 
+**An unsupported present mode falls back rather than failing.** Some surfaces
+offer only `fifo` — notably software rasterizers and translation layers. Asking
+for something they lack logs a warning to stderr naming what *is* available and
+configures the nearest supported mode. It has to: an unsupported mode makes
+`configure()` raise a validation error, which this binding only prints (§1), so
+the surface would stay unconfigured and the next `getCurrentTexture()` would
+**panic and abort the process**.
+
 ### Timing / vsync
 
 **`"fifo"`/`"auto-vsync"` can stall.** On some Vulkan drivers, when the app

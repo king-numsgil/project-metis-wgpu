@@ -193,7 +193,17 @@ impl GpuSurface {
             })?
         };
 
-        let present_mode = match config.present_mode.as_deref() {
+        // Resolve the request, then check it against what the surface actually
+        // offers. Skipping that check is not a small bug: `configure()` reports
+        // an unsupported mode as a *validation error*, which this binding only
+        // prints to stderr (see CLAUDE.md) — so the surface silently stays
+        // unconfigured and the next `getCurrentTexture()` panics with
+        // "Surface is not configured for presentation", aborting the process.
+        // One unavailable present mode should degrade, not kill the app.
+        //
+        // AutoVsync/AutoNoVsync are wgpu meta-modes resolved internally and
+        // never appear in `present_modes`, so they're exempt from the check.
+        let requested = match config.present_mode.as_deref() {
             Some("fifo") => wgpu::PresentMode::Fifo,
             Some("mailbox") => wgpu::PresentMode::Mailbox,
             Some("immediate") => wgpu::PresentMode::Immediate,
@@ -211,6 +221,26 @@ impl GpuSurface {
                     wgpu::PresentMode::Fifo
                 }
             }
+        };
+
+        let is_meta = matches!(
+            requested,
+            wgpu::PresentMode::AutoVsync | wgpu::PresentMode::AutoNoVsync
+        );
+        let present_mode = if is_meta || caps.present_modes.contains(&requested) {
+            requested
+        } else {
+            // Fifo is required of every surface, so this always terminates.
+            let fallback = if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
+                wgpu::PresentMode::Mailbox
+            } else {
+                wgpu::PresentMode::Fifo
+            };
+            eprintln!(
+                "[bun-webgpu-rs] present mode {requested:?} is not supported by this surface                  (available: {:?}); falling back to {fallback:?}. Frame pacing will differ from                  what you asked for — under Fifo the vsync wait lands inside getCurrentTexture().",
+                caps.present_modes,
+            );
+            fallback
         };
 
         let alpha_mode = match config.alpha_mode.as_deref() {
