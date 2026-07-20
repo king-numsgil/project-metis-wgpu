@@ -57,6 +57,27 @@ export interface FrameTarget {
 }
 
 /**
+ * Warns once when the selected adapter is a software rasterizer.
+ *
+ * On Linux/WSL a failed GPU passthrough falls back to llvmpipe *silently* —
+ * wgpu reports a perfectly valid Vulkan adapter and everything renders
+ * correctly, just two orders of magnitude slower. Without this the only clue is
+ * a stray `MESA: error: ZINK: failed to choose pdev` line scrolled off the top
+ * of the log, and the natural conclusion is "the engine got slow".
+ */
+function warnIfSoftwareAdapter(adapter: GpuAdapter) {
+    const info = adapter.info;
+    if (info.deviceType !== "Cpu") {
+        return;
+    }
+    console.warn(
+        `[metis-engine] adapter is a SOFTWARE rasterizer (${info.description || "unknown"}, ` +
+            `${info.backendType}) — expect ~100x slower frames. GPU acceleration is ` +
+            "unavailable or failed to initialise; any performance number measured now is meaningless.",
+    );
+}
+
+/**
  * Owns the GPU device and whatever the final output surface is — a real SDL
  * window for interactive demos, or a plain offscreen texture for headless
  * fixtures — so the rest of the engine can target "whatever `beginFrame()`
@@ -137,6 +158,7 @@ export class RenderContext {
         if (!adapter) {
             throw new Error("metis-engine: no GPU adapter available");
         }
+        warnIfSoftwareAdapter(adapter);
         const device = await adapter.requestDevice({
             label: options.label ?? "metis-engine-offscreen",
             requiredFeatures: options.profiling ? gpuProfilerFeatures(adapter) : undefined,
@@ -162,6 +184,7 @@ export class RenderContext {
             sdlQuit();
             throw new Error("metis-engine: no GPU adapter compatible with this window");
         }
+        warnIfSoftwareAdapter(adapter);
         const device = await adapter.requestDevice({
             label: options.label ?? "metis-engine-windowed",
             requiredFeatures: options.profiling ? gpuProfilerFeatures(adapter) : undefined,
