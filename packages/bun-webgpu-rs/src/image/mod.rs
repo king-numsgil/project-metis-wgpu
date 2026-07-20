@@ -26,7 +26,7 @@ use napi_derive::napi;
 use sdl3_image_sys::image::{IMG_FreeAnimation, IMG_Load, IMG_LoadAnimation};
 use sdl3_sys::error::SDL_GetError;
 use sdl3_sys::pixels::SDL_PIXELFORMAT_RGBA32;
-use sdl3_sys::surface::{SDL_ConvertSurface, SDL_DestroySurface, SDL_Surface};
+use sdl3_sys::surface::{SDL_ConvertSurface, SDL_DestroySurface, SDL_DuplicateSurface, SDL_Surface};
 use std::ffi::{CStr, CString};
 use std::sync::Arc;
 
@@ -100,6 +100,50 @@ fn make_gpu_texture(inner: Arc<wgpu::Texture>, width: u32, height: u32, format: 
     }
 }
 
+/// True for SDL formats storing 16 **integer** bits per channel.
+///
+/// The `_FLOAT` variants are deliberately excluded: those are half-floats, and
+/// while they are also 16 bits wide, SDL_image never produces them from the
+/// formats this module loads.
+fn is_16bit_integer_format(f: sdl3_sys::pixels::SDL_PixelFormat) -> bool {
+    use sdl3_sys::pixels::{
+        SDL_PIXELFORMAT_ABGR64, SDL_PIXELFORMAT_ARGB64, SDL_PIXELFORMAT_BGR48,
+        SDL_PIXELFORMAT_BGRA64, SDL_PIXELFORMAT_RGB48, SDL_PIXELFORMAT_RGBA64,
+    };
+    f == SDL_PIXELFORMAT_RGB48
+        || f == SDL_PIXELFORMAT_BGR48
+        || f == SDL_PIXELFORMAT_RGBA64
+        || f == SDL_PIXELFORMAT_ARGB64
+        || f == SDL_PIXELFORMAT_BGRA64
+        || f == SDL_PIXELFORMAT_ABGR64
+}
+
+/// Byte-swaps every 16-bit sample of a surface, in place.
+///
+/// # Safety
+/// `s` must be a valid, non-null surface in a 16-bit-per-channel format whose
+/// pixel buffer this call is allowed to mutate.
+unsafe fn byteswap_16bit_samples(s: *mut SDL_Surface) {
+    let surf = &*s;
+    if surf.pixels.is_null() {
+        return;
+    }
+    let pitch = surf.pitch as usize;
+    let base = surf.pixels as *mut u8;
+    for row in 0..surf.h as usize {
+        // Swap whole 16-bit units across the row. `pitch` may include padding;
+        // swapping it too is harmless because nothing reads past the last pixel.
+        let mut off = 0usize;
+        while off + 1 < pitch {
+            let p = base.add(row * pitch + off);
+            let (lo, hi) = (*p, *p.add(1));
+            *p = hi;
+            *p.add(1) = lo;
+            off += 2;
+        }
+    }
+}
+
 /// Convert an SDL surface to RGBA8, create a wgpu texture, and upload the pixels.
 /// Runs on the async worker thread. Does **not** free `surf` — the caller owns
 /// it (a single load frees the raw surface afterward; an animation frees the
@@ -115,7 +159,42 @@ fn surface_to_texture(
     // Normalise to RGBA-in-memory byte order (endianness-independent), which is
     // exactly what wgpu's rgba8unorm(-srgb) expects. Always converts (even if
     // already RGBA32) so the layout is guaranteed.
-    let converted = unsafe { SDL_ConvertSurface(surf, SDL_PIXELFORMAT_RGBA32) };
+    // SDL3_image decodes a 16-bit-per-channel PNG into a 16-bit surface keeping
+    // PNG's **big-endian** sample order, but SDL's pixel conversion reads those
+    // formats in **host** order. On a little-endian host every sample is
+    // therefore read byte-swapped and down-converted from the wrong half: a
+    // sample of 0x5aec is read as 0xec5a and scales to 235 instead of 90. The
+    // output is plausible-looking noise rather than an obvious failure, and it
+    // only reproduces where SDL_image has a 16-bit-capable PNG decoder — hence
+    // "works on Windows, garbage on Linux".
+    //
+    // Verified by hand-decoding the PNG: the surface SDL_image hands us matches
+    // the file byte for byte, so the decode is fine and only the conversion is
+    // wrong. Swap into a private copy and let SDL convert from that, which keeps
+    // SDL's knowledge of the channel layout (RGB48 vs BGR48 vs RGBA64 …) rather
+    // than hardcoding it here. `tests/image-16bit.test.ts` pins the result.
+    let mut swapped: *mut SDL_Surface = std::ptr::null_mut();
+    let convert_src = if cfg!(target_endian = "little")
+        && is_16bit_integer_format(unsafe { (*surf).format })
+    {
+        let dup = unsafe { SDL_DuplicateSurface(surf) };
+        if dup.is_null() {
+            // Duplication failed; converting the original is still better than
+            // failing outright, it just reproduces the upstream bug.
+            surf
+        } else {
+            unsafe { byteswap_16bit_samples(dup) };
+            swapped = dup;
+            dup
+        }
+    } else {
+        surf
+    };
+
+    let converted = unsafe { SDL_ConvertSurface(convert_src, SDL_PIXELFORMAT_RGBA32) };
+    if !swapped.is_null() {
+        unsafe { SDL_DestroySurface(swapped) };
+    }
     if converted.is_null() {
         return Err(generic_err(format!("SDL_ConvertSurface failed: {}", sdl_error())));
     }
