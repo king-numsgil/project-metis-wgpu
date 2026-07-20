@@ -4,13 +4,15 @@
 //   bun run tests/adapter-report.ts
 import { enumerateAdapters, requestAdapter } from "../index.js";
 
-// The limits this engine actually needs. Everything else it uses sits far below
-// the WebGPU defaults, so a failure on one of these is the real blocker.
+// These are what metis-engine actually dispatches/binds — far below the WebGPU
+// defaults. Using the defaults here would flag adapters that can run it fine.
+// Keep in sync with ENGINE_MIN_LIMITS in metis-engine's rhi/context.ts.
 const NEEDED: Array<[string, number, string]> = [
-    ["maxComputeWorkgroupsPerDimension", 65535, "cluster-build / light-cull dispatch"],
-    ["maxComputeInvocationsPerWorkgroup", 256, "COMPUTE_WORKGROUP_SIZE = 64"],
-    ["maxStorageBufferBindingSize", 134217728, "cluster light-index buffer"],
-    ["maxTextureDimension2D", 8192, "shadow atlas at SHADOW_MAP_SIZE"],
+    ["maxComputeWorkgroupsPerDimension", 54, "cluster-build / light-cull dispatch (ceil(3456/64))"],
+    ["maxComputeInvocationsPerWorkgroup", 64, "COMPUTE_WORKGROUP_SIZE"],
+    ["maxComputeWorkgroupSizeX", 64, "COMPUTE_WORKGROUP_SIZE"],
+    ["maxStorageBufferBindingSize", 3456 * 96 * 4, "cluster light-index buffer"],
+    ["maxTextureDimension2D", 2048, "SHADOW_MAP_SIZE"],
 ];
 
 const all = enumerateAdapters();

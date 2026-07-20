@@ -8,6 +8,7 @@ import {
     type GPUTextureFormat,
     GPUTextureUsage,
     type GpuTextureView,
+    enumerateAdapters,
     requestAdapter,
     requestAdapterForWindow,
     sdlCreateWindow,
@@ -17,6 +18,7 @@ import {
     type SdlWindow,
 } from "bun-webgpu-rs";
 import { gpuProfilerFeatures } from "../debug/gpuProfiler.ts";
+import { COMPUTE_WORKGROUP_SIZE, MAX_LIGHTS_PER_CLUSTER, NUM_CLUSTERS } from "../shading/clusterConfig.ts";
 import { RenderTargets } from "./targets.ts";
 
 export type PowerPreference = "low-power" | "high-performance";
@@ -54,6 +56,98 @@ export interface FrameTarget {
     format: GPUTextureFormat;
 
     present(): void;
+}
+
+/**
+ * What the renderer actually needs from an adapter, derived from the config
+ * rather than assumed.
+ *
+ * These are far *below* the WebGPU defaults (the compute dispatch needs tens of
+ * workgroups, not 65535), which matters in both directions: the engine can run
+ * on much weaker hardware than the spec baseline, and an adapter that fails
+ * *these* genuinely cannot run it rather than merely being unfashionable.
+ *
+ * Only limits that actually discriminate between adapters are listed. Texture
+ * dimensions and the like are met by everything and would just be noise.
+ */
+const ENGINE_MIN_LIMITS: Record<string, number> = {
+    // cluster_build / light_cull dispatch one workgroup per COMPUTE_WORKGROUP_SIZE clusters.
+    maxComputeWorkgroupsPerDimension: Math.ceil(NUM_CLUSTERS / COMPUTE_WORKGROUP_SIZE),
+    maxComputeInvocationsPerWorkgroup: COMPUTE_WORKGROUP_SIZE,
+    maxComputeWorkgroupSizeX: COMPUTE_WORKGROUP_SIZE,
+    // The largest storage buffer the renderer binds.
+    maxStorageBufferBindingSize: NUM_CLUSTERS * MAX_LIGHTS_PER_CLUSTER * 4,
+};
+
+/** Limits an adapter falls short on, empty if it can run the renderer. */
+function adapterShortfalls(adapter: GpuAdapter): string[] {
+    const limits = adapter.limits as unknown as Record<string, number>;
+    return Object.entries(ENGINE_MIN_LIMITS)
+        .filter(([key, need]) => (limits[key] ?? 0) < need)
+        .map(([key, need]) => `${key}: need ${need}, adapter offers ${limits[key] ?? 0}`);
+}
+
+/** Rough desirability ordering when we have to choose for ourselves. */
+function adapterRank(adapter: GpuAdapter): number {
+    switch (adapter.info.deviceType) {
+        case "DiscreteGpu":
+            return 3;
+        case "IntegratedGpu":
+            return 2;
+        case "Cpu":
+            return 0;
+        default:
+            return 1;
+    }
+}
+
+/**
+ * Returns `preferred` if it can actually run the renderer; otherwise the best
+ * adapter that can.
+ *
+ * `powerPreference` is only a hint about *desirability*, and wgpu honours it
+ * without knowing what the app needs — so on a machine where the
+ * highest-ranked adapter is a broken or feature-poor driver, it is selected and
+ * everything fails afterwards with an unrelated-looking error. Seen in the
+ * wild: a WSL box where the only Vulkan drivers were Mesa translation layers,
+ * `requestAdapter` picked an "IntegratedGpu" that reported **zero** compute
+ * workgroups, and the software rasterizer sitting right next to it — which
+ * works fine, just slowly — was never considered.
+ *
+ * Falling back is loud on purpose: a silent downgrade to a CPU rasterizer would
+ * look exactly like the engine having got 100x slower.
+ */
+function selectUsableAdapter(preferred: GpuAdapter, candidates: GpuAdapter[]): GpuAdapter {
+    const shortfalls = adapterShortfalls(preferred);
+    if (shortfalls.length === 0) {
+        return preferred;
+    }
+
+    const usable = candidates
+        .filter((a) => adapterShortfalls(a).length === 0)
+        .sort((a, b) => adapterRank(b) - adapterRank(a));
+
+    if (usable.length === 0) {
+        throw new Error(
+            `metis-engine: no usable GPU adapter. '${preferred.info.description || "?"}' ` +
+                `(${preferred.info.backendType}, ${preferred.info.deviceType}) falls short on:\n` +
+                shortfalls.map((s) => `  ${s}`).join("\n") +
+                `\nand no other adapter qualifies either. An adapter reporting 0 for a compute ` +
+                `limit is a non-conformant or misconfigured driver — check which Vulkan ICD is ` +
+                `being selected (\`vulkaninfo --summary\`; a driverID of MESA_DOZEN is a D3D12 ` +
+                `translation layer, not a real driver).`,
+        );
+    }
+
+    const chosen = usable[0]!;
+    console.warn(
+        `[metis-engine] preferred adapter '${preferred.info.description || "?"}' ` +
+            `(${preferred.info.backendType}, ${preferred.info.deviceType}) cannot run this renderer:\n` +
+            shortfalls.map((s) => `    ${s}`).join("\n") +
+            `\n  Falling back to '${chosen.info.description || "?"}' ` +
+            `(${chosen.info.backendType}, ${chosen.info.deviceType}).`,
+    );
+    return chosen;
 }
 
 /**
@@ -154,10 +248,11 @@ export class RenderContext {
 
     /** Headless target for the fixture / any automated screenshot check — no SDL window. */
     static async createOffscreen(options: RenderContextOptions): Promise<RenderContext> {
-        const adapter = await requestAdapter({powerPreference: options.powerPreference});
-        if (!adapter) {
+        const preferred = await requestAdapter({powerPreference: options.powerPreference});
+        if (!preferred) {
             throw new Error("metis-engine: no GPU adapter available");
         }
+        const adapter = selectUsableAdapter(preferred, enumerateAdapters());
         warnIfSoftwareAdapter(adapter);
         const device = await adapter.requestDevice({
             label: options.label ?? "metis-engine-offscreen",
@@ -175,15 +270,21 @@ export class RenderContext {
     static async createWindowed(title: string, options: RenderContextOptions): Promise<RenderContext> {
         sdlInit(SdlInitFlag.Video);
         const window = sdlCreateWindow(title, options.width, options.height);
-        const adapter = await requestAdapterForWindow(window, {
+        const preferred = await requestAdapterForWindow(window, {
             powerPreference: options.powerPreference ?? "high-performance",
             backend: options.backend,
         });
-        if (!adapter) {
+        if (!preferred) {
             window.destroy();
             sdlQuit();
             throw new Error("metis-engine: no GPU adapter compatible with this window");
         }
+        // Note the asymmetry: `requestAdapterForWindow` guarantees surface
+        // compatibility, an enumerated fallback does not. We only reach for one
+        // when the compatible adapter genuinely cannot run the renderer, i.e.
+        // when the alternative is failing outright — `configure()` will say so
+        // if the fallback can't present either.
+        const adapter = selectUsableAdapter(preferred, enumerateAdapters());
         warnIfSoftwareAdapter(adapter);
         const device = await adapter.requestDevice({
             label: options.label ?? "metis-engine-windowed",
