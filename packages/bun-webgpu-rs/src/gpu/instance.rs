@@ -22,14 +22,14 @@ fn parse_options(options: &Option<GpuRequestAdapterOptions>) -> napi::Result<(wg
         .and_then(|o| o.backend.as_deref())
         .map(convert::backend)
         .transpose()?
-        .unwrap_or(wgpu::Backends::all());
+        .unwrap_or(wgpu::Backends::VULKAN);
 
     let power_preference = options
         .as_ref()
         .and_then(|o| o.power_preference.as_deref())
         .map(convert::power_preference)
         .transpose()?
-        .unwrap_or(wgpu::PowerPreference::None);
+        .unwrap_or(wgpu::PowerPreference::HighPerformance);
 
     let force_fallback = options
         .as_ref()
