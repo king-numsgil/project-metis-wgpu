@@ -47,7 +47,7 @@ pub async fn request_adapter(options: Option<GpuRequestAdapterOptions>) -> napi:
 
     let instance = Arc::new(wgpu::Instance::new(&wgpu::InstanceDescriptor {
         backends,
-        flags: wgpu::InstanceFlags::default(),
+        flags: wgpu::InstanceFlags::default() | wgpu::InstanceFlags::ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER,
         ..Default::default()
     }));
 

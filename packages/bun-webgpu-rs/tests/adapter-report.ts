@@ -46,10 +46,4 @@ for (const pref of ["high-performance", "low-power"] as const) {
     );
 }
 
-console.log(
-    "\n  Note: a `deviceType` of DiscreteGpu says nothing about driver quality.\n" +
-        "  Check the Vulkan driverID too (`vulkaninfo --summary`): a translation layer\n" +
-        "  such as Mesa Dozen reports as a discrete GPU while being a D3D12 shim with\n" +
-        "  conformanceVersion 0.0.0.0.",
-);
 process.exit(0);
