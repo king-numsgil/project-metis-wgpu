@@ -160,7 +160,7 @@ async function main() {
 
     // The pass names the renderer hands the profiler must actually show up;
     // a silent rename would otherwise leave the tree quietly incomplete.
-    for (const want of ["forward", "cluster-build", "light-cull", "tonemap", "debug-overlay"]) {
+    for (const want of ["forward", "cluster-build", "light-cull", "tonemap", "debug-overlay", "depth-prepass"]) {
         if (!flat.some((s) => s.label === want)) {
             throw new Error(`expected a "${want}" span in the profile tree, got: ${flat.map((s) => s.label).join(", ")}`);
         }

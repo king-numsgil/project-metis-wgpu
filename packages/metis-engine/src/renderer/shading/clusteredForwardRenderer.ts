@@ -1,4 +1,5 @@
 import {
+    type GpuBindGroup,
     type GpuBindGroupLayout,
     type GpuBuffer,
     GPUBufferUsage,
@@ -17,6 +18,7 @@ import { LightCuller } from "./lightCuller.ts";
 import { CASCADE_SPLIT_LAMBDA_DEFAULT, SHADOW_DISTANCE_DEFAULT, ShadowCascades } from "./shadowCascades.ts";
 import { Std140Writer } from "./std140.ts";
 import commonWgsl from "./wgsl/common.wgsl" with { type: "text" };
+import depthPrepassWgsl from "./wgsl/depth_prepass.wgsl" with { type: "text" };
 import forwardWgsl from "./wgsl/forward.wgsl" with { type: "text" };
 
 /**
@@ -66,9 +68,40 @@ export class ClusteredForwardRenderer {
      * the renderer only owns the passes, not the frame.
      */
     profiler?: GpuProfiler;
+    /**
+     * Render a depth-only pass before the forward pass, so occluded fragments
+     * never run the clustered light loop or shadow sampling.
+     *
+     * On by default, because it measured a win in both directions: strongly so
+     * with overdraw (a room full of objects roughly halved the forward pass and
+     * cut the whole GPU frame by over a third), and *still* slightly positive
+     * with none. The zero-overdraw case surprises people — the saving there
+     * isn't early-Z, it's that the forward pass stops writing 4x-MSAA depth,
+     * which is real bandwidth. The prepass writes it once, with no fragment
+     * stage at all.
+     *
+     * Turn it off for geometry-heavy, overdraw-light scenes: the prepass reruns
+     * every vertex shader, so a scene that is vertex-bound rather than
+     * fragment-bound pays for it twice. Compare the `depth-prepass` and
+     * `forward` spans with `bun run bench:lights --profile --prepass`.
+     *
+     * Two correctness requirements, both currently satisfied engine-wide:
+     * - **Opaque geometry only.** An alpha-tested or blended material would have
+     *   to be excluded from the prepass; nothing in the engine is either today.
+     * - **The vertex transform must be bit-identical** between forward.wgsl and
+     *   depth_prepass.wgsl, since the forward pass then tests `depthCompare:
+     *   "equal"`. That's what the `@invariant` on both `@builtin(position)`
+     *   outputs guarantees. If geometry ever vanishes wholesale after editing
+     *   either vertex shader, this is the first thing to check.
+     */
+    depthPrepass = true;
 
     private readonly device: GpuDevice;
     private readonly pipeline: GpuRenderPipeline;
+    private readonly depthPrepassPipeline: GpuRenderPipeline;
+    private readonly depthPrepassBindGroup: GpuBindGroup;
+    /** Forward variant used when `depthPrepass` is on: tests `equal`, writes no depth. */
+    private readonly pipelineDepthEqual: GpuRenderPipeline;
     private readonly cameraBuffer: GpuBuffer;
     private readonly environmentBuffer: GpuBuffer;
     private readonly culler: LightCuller;
@@ -135,15 +168,48 @@ export class ClusteredForwardRenderer {
             label: "metis-engine/forward-shader",
             code: `${commonWgsl}\n${forwardWgsl}`,
         });
-        this.pipeline = device.createRenderPipeline({
-            label: "metis-engine/forward-pipeline",
-            layout: pipelineLayout,
-            vertex: {module, entryPoint: "vs", buffers: [MESH_VERTEX_LAYOUT]},
-            fragment: {module, entryPoint: "fs", targets: [{format: HDR_COLOR_FORMAT}]},
+        const forwardPipelineFor = (depthWriteEnabled: boolean, depthCompare: "greater" | "equal") =>
+            device.createRenderPipeline({
+                label: `metis-engine/forward-pipeline-${depthCompare}`,
+                layout: pipelineLayout,
+                vertex: {module, entryPoint: "vs", buffers: [MESH_VERTEX_LAYOUT]},
+                fragment: {module, entryPoint: "fs", targets: [{format: HDR_COLOR_FORMAT}]},
+                primitive: {topology: "triangle-list", cullMode: "back"},
+                // "greater", not "less": Camera uses a reverse-Z projection (near -> 1,
+                // infinity -> 0), which is what makes depth32float's precision land
+                // where the perspective divide needs it. Paired with depthClearValue 0.
+                depthStencil: {format: DEPTH_FORMAT, depthWriteEnabled, depthCompare},
+                multisample: {count: MSAA_SAMPLE_COUNT},
+            });
+        this.pipeline = forwardPipelineFor(true, "greater");
+        // Prepass variant: depth is already final, so test for an exact match and
+        // write nothing. Built up front rather than lazily so toggling
+        // `depthPrepass` at runtime never stalls on pipeline creation.
+        this.pipelineDepthEqual = forwardPipelineFor(false, "equal");
+
+        // ── Depth prepass ────────────────────────────────────────────────────
+        // Its own minimal layout: a depth-only pass needs the camera and the
+        // model matrix, nothing else. Reusing the 8-entry frame layout would
+        // force the shadow/AO resources to be bound for a pass that can't read
+        // them.
+        const prepassCameraLayout = device.createBindGroupLayout({
+            label: "metis-engine/depth-prepass-camera-bgl",
+            entries: [{binding: 0, visibility: GPUShaderStage.VERTEX, buffer: {bindingType: "uniform"}}],
+        });
+        const prepassModule = device.createShaderModule({
+            label: "metis-engine/depth-prepass-shader",
+            code: `${commonWgsl}
+${depthPrepassWgsl}`,
+        });
+        this.depthPrepassPipeline = device.createRenderPipeline({
+            label: "metis-engine/depth-prepass-pipeline",
+            layout: device.createPipelineLayout({
+                bindGroupLayouts: [prepassCameraLayout, this.modelBindGroupLayout],
+            }),
+            vertex: {module: prepassModule, entryPoint: "vs", buffers: [MESH_VERTEX_LAYOUT]},
+            // No fragment stage at all — depth-only. That's the point: this pass
+            // must be far cheaper than the shading it lets the forward pass skip.
             primitive: {topology: "triangle-list", cullMode: "back"},
-            // "greater", not "less": Camera uses a reverse-Z projection (near -> 1,
-            // infinity -> 0), which is what makes depth32float's precision land
-            // where the perspective divide needs it. Paired with depthClearValue 0.
             depthStencil: {format: DEPTH_FORMAT, depthWriteEnabled: true, depthCompare: "greater"},
             multisample: {count: MSAA_SAMPLE_COUNT},
         });
@@ -157,6 +223,11 @@ export class ClusteredForwardRenderer {
             label: "metis-engine/environment",
             size: 48, // vec3 (padded) + vec4 + vec4
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+        this.depthPrepassBindGroup = device.createBindGroup({
+            label: "metis-engine/depth-prepass-bind-group",
+            layout: prepassCameraLayout,
+            entries: [{binding: 0, buffer: {buffer: this.cameraBuffer}}],
         });
     }
 
@@ -190,6 +261,28 @@ export class ClusteredForwardRenderer {
             ],
         });
 
+        if (this.depthPrepass) {
+            const pre = encoder.beginRenderPass({
+                label: "metis-engine/depth-prepass",
+                timestampWrites: this.profiler?.pass("depth-prepass"),
+                colorAttachments: [],
+                depthStencilAttachment: {
+                    view: targets.depthView,
+                    depthLoadOp: "clear",
+                    depthStoreOp: "store", // the forward pass reads it back
+                    depthClearValue: 0.0, // reverse-Z: 0 = infinitely far
+                },
+            });
+            pre.setPipeline(this.depthPrepassPipeline);
+            pre.setBindGroup(0, this.depthPrepassBindGroup);
+            for (const instance of scene.instances) {
+                pre.setBindGroup(1, instance.getModelBindGroup(this.device, this.modelBindGroupLayout));
+                instance.mesh.bind(pre);
+                instance.mesh.draw(pre);
+            }
+            pre.end();
+        }
+
         const pass = encoder.beginRenderPass({
             label: "metis-engine/forward-pass",
             timestampWrites: this.profiler?.pass("forward"),
@@ -204,13 +297,15 @@ export class ClusteredForwardRenderer {
             ],
             depthStencilAttachment: {
                 view: targets.depthView,
-                depthLoadOp: "clear",
+                // With a prepass the depth buffer is already final — load it and
+                // test `equal`. Without one, clear and write as usual.
+                depthLoadOp: this.depthPrepass ? "load" : "clear",
                 depthStoreOp: "store",
                 depthClearValue: 0.0, // reverse-Z: 0 = infinitely far = "nothing drawn"
             },
         });
 
-        pass.setPipeline(this.pipeline);
+        pass.setPipeline(this.depthPrepass ? this.pipelineDepthEqual : this.pipeline);
         pass.setBindGroup(0, frameBindGroup);
         pass.setBindGroup(3, this.culler.bindGroup);
 

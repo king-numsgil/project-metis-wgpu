@@ -426,6 +426,24 @@ single camera-clamped map). See CLAUDE.md "Cascaded shadow maps" for the design.
 Everything is internal; there are **no per-pass GPU timestamp hooks**. To time
 passes you'd have to thread `timestampWrites` into the private passes.
 
+**`renderer.depthPrepass`** (default **on**) renders a depth-only pass before
+the forward pass, so occluded fragments never run the clustered light loop.
+Measured on an overdraw-heavy interior: forward pass roughly halved, whole GPU
+frame down by over a third. Still slightly positive with *no* overdraw — there
+the saving isn't early-Z, it's that the forward pass stops writing 4x-MSAA depth.
+
+Turn it off for vertex-bound, overdraw-light scenes (the prepass reruns every
+vertex shader). Compare the `depth-prepass` and `forward` profiler spans, or use
+`bun run bench:lights --profile --prepass`.
+
+It requires **opaque geometry** and a bit-identical vertex transform between
+`forward.wgsl` and `depth_prepass.wgsl` (both mark `@builtin(position)`
+`@invariant`) — the forward pass tests `depthCompare: "equal"` when it's on. It
+also changes how *exactly coplanar* surfaces tie-break: without the prepass the
+first-drawn wins, with it the last-drawn does. That is a handful of pixels on
+genuinely coincident geometry, not a correctness issue, but it is why enabling
+it perturbs a byte-exact screenshot baseline.
+
 ### Cluster configuration (`clusterConfig.ts`)
 
 ```ts

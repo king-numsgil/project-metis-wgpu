@@ -11,6 +11,7 @@
 //   bun run bench/lights.ts --width 1920 --height 1080
 //   bun run bench/lights.ts --fps 60           # cap at 60 fps ("what it looks like live")
 //   bun run bench/lights.ts --profile            # per-pass GPU timings via timestamp queries
+//   bun run bench/lights.ts --no-prepass         # disable the depth prepass (on by default)
 //
 // Uses `immediate` present mode — tearing is irrelevant to a benchmark, and it
 // removes the present back-pressure that otherwise parks inside
@@ -93,6 +94,11 @@ const CAP_FPS = num("fps", flag("vsync") ? 60 : 0);
 // the queries are cheap but not free, and the point of the bench is the
 // unprofiled cost.
 const PROFILE = flag("profile");
+// Depth prepass — ON by default, matching the engine. This scene is a single
+// plane (zero overdraw), so it's the *weakest* case for a prepass; the win here
+// is the forward pass no longer writing 4x-MSAA depth, not early-Z. Pass
+// --no-prepass to A/B it.
+const PREPASS = !flag("no-prepass");
 
 // The plane the lights hover over, and the volume the lights animate within.
 const PLANE_SIZE = 60;
@@ -202,6 +208,7 @@ const profiler = PROFILE ? GpuProfiler.create(ctx.device) : null;
 if (PROFILE && !profiler) {
     console.warn("[bench] --profile requested but this adapter has no timestamp-query support; continuing without it");
 }
+forward.depthPrepass = PREPASS;  // engine default is on; --no-prepass turns it off
 if (profiler) {
     forward.profiler = profiler;
     // The HUD draws into the same frame, so it belongs in the same tree.
@@ -313,12 +320,15 @@ console.log("  metis-engine — clustered-forward light benchmark (windowed)");
 console.log("═".repeat(72));
 console.log(`    Resolution ............ ${ctx.width} x ${ctx.height}  (4x MSAA, immediate, ${CAP_FPS ? `${CAP_FPS} fps cap` : "uncapped"})`);
 console.log(`    GPU profiler .......... ${profiler ? `on (draw zones: ${profiler.canProfileDraws})` : "off  (--profile to enable)"}`);
+console.log(`    Depth prepass ......... ${PREPASS ? "on" : "off  (--no-prepass given)"}`);
 console.log(`    Point lights .......... ${LIGHT_COUNT}`);
 console.log(`    Cluster grid .......... ${CLUSTER_COUNT_X} x ${CLUSTER_COUNT_Y} x ${CLUSTER_COUNT_Z} = ${NUM_CLUSTERS} clusters`);
 console.log(`    Max lights / cluster .. ${MAX_LIGHTS_PER_CLUSTER}   (capacity cap)`);
 console.log(`    Max lights / scene .... ${MAX_POINT_LIGHTS}`);
 console.log(`    Forward draw calls .... 1   (${triangles} triangles — a single plane)`);
-console.log(`    Per frame ............. shadow + cluster-build + light-cull + forward + HDR post`);
+console.log(
+    `    Per frame ............. shadow + cluster-build + light-cull + ${PREPASS ? "depth-prepass + " : ""}forward + HDR post`,
+);
 console.log(`    Adapter ............... ${ctx.adapter.info.description || "?"} (${ctx.adapter.info.backendType || "?"}, ${ctx.adapter.info.deviceType || "?"})`);
 console.log(`    Duration .............. ${DURATION_S}s  (${WARMUP_S}s warmup, then collecting) — Esc/close to quit early`);
 console.log("─".repeat(72));

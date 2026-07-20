@@ -33,7 +33,13 @@ struct VertexInput {
 };
 
 struct VertexOutput {
-    @builtin(position) clipPosition: vec4<f32>,
+    // `@invariant` pairs with depth_prepass.wgsl: when the prepass is enabled
+    // this pipeline runs `depthCompare: "equal"`, which only shades a fragment
+    // whose depth matches the prepass's bit-for-bit. Without the guarantee, two
+    // pipelines compiling the same expression may differ by an ULP and surfaces
+    // silently vanish. Keep the vertex transform below identical to the
+    // prepass's, expression for expression.
+    @invariant @builtin(position) clipPosition: vec4<f32>,
     @location(0) worldPosition: vec3<f32>,
     @location(1) worldNormal: vec3<f32>,
     @location(2) uv: vec2<f32>,
