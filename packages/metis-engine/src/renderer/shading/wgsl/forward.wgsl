@@ -3,11 +3,12 @@
 
 @group(0) @binding(0) var<uniform> camera: Camera;
 @group(0) @binding(1) var<uniform> environment: Environment;
-@group(0) @binding(2) var cascade0Moments: texture_2d<f32>; // cascade 0 MSM: E[z]..E[z^4]
-@group(0) @binding(3) var momentsSampler: sampler; // non-filtering — rgba32float has no linear-filter support
+// Bindings 2 and 3 are unused (they held cascade 0's MSM moments texture +
+// sampler). The numbering is left as-is so this diff stays confined to the
+// shadow path.
 @group(0) @binding(4) var<uniform> cascades: CascadeUniforms;
 @group(0) @binding(5) var aoTex: texture_2d<f32>; // screen-space ambient occlusion (r8, 1 = fully open)
-@group(0) @binding(6) var cascadeDepth: texture_depth_2d_array; // cascades 1..N (PCF), one layer each
+@group(0) @binding(6) var cascadeDepth: texture_depth_2d_array; // all cascades (PCF), one layer each
 @group(0) @binding(7) var cascadeCompareSampler: sampler_comparison; // hardware PCF (compare less-equal)
 
 @group(1) @binding(0) var<uniform> material: Material;
@@ -48,102 +49,6 @@ struct VertexOutput {
 };
 
 
-// Hausdorff 4-moment shadow mapping (Peters & Klein 2015, Algorithm 4 /
-// supplementary Listing 4): reconstructs an occlusion estimate from the first
-// four power moments of the light-space occluder depth distribution
-// (E[z]..E[z^4], written by shadow.wgsl's fragment shader) via a Cholesky
-// factorization of their Hankel matrix, then evaluates the sharpest lower
-// bound on the CDF at the query depth — *constrained to distributions
-// supported on [0,1]*.
-//
-// That constraint is the entire reason this is the Hausdorff variant and not
-// the paper's default Hamburger variant (support on all of R, previously used
-// here): for the single-occluder texels this renderer's unfiltered shadow map
-// always produces, the Hamburger bound "explains" the moments with phantom
-// mass at *negative* depth, which yields the infamous VSM-style light-bleeding
-// tail — reconstructed visibility falls off only as ~var/gap^2, so a sun
-// bright enough to blow out through a window (as in the interior scene) makes
-// even 0.1% residual visibility glow, producing meters-long bleed gradients
-// hugging every concave corner. Depths outside [0,1] cannot exist in a shadow
-// map, and forbidding them makes the bound collapse to an exact step for a
-// delta-distribution texel: working Algorithm 4's four-support-point branch
-// through by hand for moments b = (z0, z0², z0³, z0⁴), the free root lands
-// exactly at zFree = z0 and the intensity term reduces to exactly 1 for
-// query > z0 and exactly 0 for query < z0, independent of the gap size —
-// verified in fp32 emulation against real GPU-readback corner data (gaps down
-// to 3.4e-4 reconstruct occlusion 1.00000, lit surfaces 0.00002). Genuinely
-// mixed-surface moments (e.g. from PCF-footprint averaging) still take the
-// smooth three-support-point path, identical to Hamburger.
-fn computeMsmOcclusion(rawMoments: vec4<f32>, queryDepth: f32) -> f32 {
-    // Moment bias: blend a hair toward (0.5,0.5,0.5,0.5) so the Hankel matrix
-    // below is never exactly singular (a texel with ~zero variance — which is
-    // every texel here, since nothing is prefiltered before this point —
-    // would otherwise divide by ~0). The (0.5,...) target is verbatim from
-    // the reference listings — an earlier version used the *true* moments of
-    // a uniform [0,1] distribution ((0.5, 1/3, 0.5, 0.2)) instead, which was
-    // a real, user-visible regression: the asymmetric target skews the
-    // reconstruction wherever the true depth sits far from 0.5 (most of this
-    // scene). 1e-5 rather than the paper's 3e-5 (theirs compensates 16-bit
-    // quantization this rgba32float map doesn't have): the smaller bias
-    // halves the width of the residual not-yet-shadowed band at a concave
-    // corner, and fp32 emulation puts the numerical cliff (Cholesky NaN) two
-    // orders of magnitude lower, at ~3e-7.
-    let momentBias = 1e-5;
-    let b = mix(rawMoments, vec4<f32>(0.5, 0.5, 0.5, 0.5), momentBias);
-    let zx = queryDepth;
-
-    // Cholesky factorization of the Hankel matrix built from the moments,
-    // producing the coefficients of a quadratic whose roots (zy, zz) are the
-    // other support points of the canonical distribution through (zx, b).
-    let l32d22 = b.x * -b.y + b.z;
-    let d22 = -b.x * b.x + b.y;
-    let squaredDepthVariance = -b.y * b.y + b.w;
-    let d33d22 = dot(vec2<f32>(squaredDepthVariance, -l32d22), vec2<f32>(d22, l32d22));
-    let invD22 = 1.0 / d22;
-    let l32 = l32d22 * invD22;
-
-    var c: vec3<f32> = vec3<f32>(1.0, zx, zx * zx);
-    c.y = c.y - b.x;
-    c.z = c.z - b.y - l32 * c.y;
-    c.y = c.y * invD22;
-    c.z = c.z * (d22 / d33d22);
-    c.y = c.y - l32 * c.z;
-    c.x = c.x - dot(c.yz, b.xy);
-
-    let invC2 = 1.0 / c.z;
-    let p = c.y * invC2;
-    let q = c.x * invC2;
-    let discriminant = max((p * p * 0.25) - q, 0.0);
-    let r = sqrt(discriminant);
-    let zy = -p * 0.5 - r;
-    let zz = -p * 0.5 + r;
-
-    var shadowIntensity: f32;
-    if (zy < 0.0 || zz > 1.0) {
-        // The three-support solution needs mass outside [0,1] — impossible
-        // for shadow-map depths. Use the four-support solution with points
-        // {0, zFree, zx, 1} instead (paper Proposition 11 / Algorithm 4 step
-        // 6). This is the branch every hard single-occluder texel takes, and
-        // the one that eliminates the light-bleeding tail.
-        let zFree = ((b.z - b.y) * zx + b.z - b.w) / ((b.y - b.x) * zx + b.y - b.z);
-        let w1Factor = select(0.0, 1.0, zx > zFree);
-        shadowIntensity = (b.y - b.x + (b.z - b.x - (zFree + 1.0) * (b.y - b.x)) * (zFree - w1Factor - zx) / (zx * (zx - zFree))) / (zFree - w1Factor) + 1.0 - b.x;
-    } else {
-        // Well-posed three-support solution — the smooth path genuinely
-        // mixed-depth moments take.
-        var switchVal: vec4<f32>;
-        if (zz < zx) {
-            switchVal = vec4<f32>(zy, zx, 1.0, 1.0);
-        } else if (zy < zx) {
-            switchVal = vec4<f32>(zx, zy, 0.0, 1.0);
-        } else {
-            switchVal = vec4<f32>(0.0, 0.0, 0.0, 0.0);
-        }
-        let quotient = (switchVal.x * zz - b.x * (switchVal.x + zz) + b.y) / ((zz - switchVal.y) * (zx - zy));
-        shadowIntensity = switchVal.z + switchVal.w * quotient;
-    }
-    return clamp(shadowIntensity, 0.0, 1.0);
-}
 
 // The normal offset (per cascade, texel-scaled) clears self-shadowing on
 // sloped receivers: the 3x3 taps reach ~1.4 texels away but compare against
@@ -158,31 +63,14 @@ fn shadowClipUV(cascade: i32, worldPosition: vec3<f32>, N: vec3<f32>) -> vec3<f3
     return vec3<f32>(uv, lightClip.z);
 }
 
-// Cascade 0: Hausdorff 4-moment shadow mapping (no bias -> no peter-panning,
-// corner-leak-proof). 3x3 PCF over the reconstructed occlusion.
-fn sampleCascade0(worldPosition: vec3<f32>, N: vec3<f32>) -> f32 {
-    let cu = shadowClipUV(0, worldPosition, N);
-    if (cu.x < 0.0 || cu.x > 1.0 || cu.y < 0.0 || cu.y > 1.0 || cu.z < 0.0 || cu.z > 1.0) {
-        return 1.0;
-    }
-    let texel = 1.0 / cascades.params.y;
-    var sum = 0.0;
-    for (var dy = -1; dy <= 1; dy++) {
-        for (var dx = -1; dx <= 1; dx++) {
-            let m = textureSampleLevel(cascade0Moments, momentsSampler, cu.xy + vec2<f32>(f32(dx), f32(dy)) * texel, 0.0);
-            sum += 1.0 - computeMsmOcclusion(m, cu.z);
-        }
-    }
-    return sum / 9.0;
-}
 
-// Cascades 1..N: plain depth + hardware comparison PCF (3x3 taps, each a 2x2
+// Every cascade: plain depth + hardware comparison PCF (3x3 taps, each a 2x2
 // bilinear compare via the linear comparison sampler -> effectively 4x4). The
 // shadow depth is standard-Z (near=0 = closest to light), and the sampler's
 // "less-equal" compare returns the fraction of texels the receiver is in front
 // of — i.e. the lit fraction.
-fn samplePcfCascade(cascade: i32, worldPosition: vec3<f32>, N: vec3<f32>) -> f32 {
-    let layer = cascade - 1;
+fn sampleCascadeVis(cascade: i32, worldPosition: vec3<f32>, N: vec3<f32>) -> f32 {
+    let layer = cascade;
     let cu = shadowClipUV(cascade, worldPosition, N);
     if (cu.x < 0.0 || cu.x > 1.0 || cu.y < 0.0 || cu.y > 1.0 || cu.z < 0.0 || cu.z > 1.0) {
         return 1.0;
@@ -196,13 +84,6 @@ fn samplePcfCascade(cascade: i32, worldPosition: vec3<f32>, N: vec3<f32>) -> f32
         }
     }
     return sum / 9.0;
-}
-
-fn sampleCascadeVis(cascade: i32, worldPosition: vec3<f32>, N: vec3<f32>) -> f32 {
-    if (cascade == 0) {
-        return sampleCascade0(worldPosition, N);
-    }
-    return samplePcfCascade(cascade, worldPosition, N);
 }
 
 // Cascaded directional shadow: pick the cascade whose slice contains this

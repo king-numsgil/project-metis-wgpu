@@ -119,11 +119,12 @@ export class ClusteredForwardRenderer {
                     buffer: {bindingType: "uniform"},
                 },
                 {binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: {bindingType: "uniform"}},
-                {binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: {sampleType: "unfilterable-float"}}, // cascade0 moments
-                {binding: 3, visibility: GPUShaderStage.FRAGMENT, sampler: {samplerType: "non-filtering"}}, // moments sampler
+                // Bindings 2 and 3 (cascade-0 MSM moments + sampler) are gone; the
+                // numbering is left as-is so this change stays confined to the
+                // shadow path. See forward.wgsl.
                 {binding: 4, visibility: GPUShaderStage.FRAGMENT, buffer: {bindingType: "uniform"}}, // cascade uniforms
                 {binding: 5, visibility: GPUShaderStage.FRAGMENT, texture: {sampleType: "unfilterable-float"}}, // AO
-                // Cascades 1..N: depth array + comparison sampler (hardware PCF).
+                // All cascades: depth array + comparison sampler (hardware PCF).
                 {
                     binding: 6,
                     visibility: GPUShaderStage.FRAGMENT,
@@ -252,8 +253,6 @@ ${depthPrepassWgsl}`,
             entries: [
                 {binding: 0, buffer: {buffer: this.cameraBuffer}},
                 {binding: 1, buffer: {buffer: this.environmentBuffer}},
-                {binding: 2, textureView: this.shadows.momentsView},
-                {binding: 3, sampler: this.shadows.momentsSampler},
                 {binding: 4, buffer: {buffer: this.shadows.uniformBuffer}},
                 {binding: 5, textureView: this.ao.resultView},
                 {binding: 6, textureView: this.shadows.depthArrayView},

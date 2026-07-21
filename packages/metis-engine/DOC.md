@@ -170,7 +170,7 @@ Getting any of these wrong produces a plausible-looking but wrong image.
 | Post-process reads `targets.hdrColorResolvedView`, never `hdrColorMultisampledView`. | Validation error or garbage. |
 | **Depth is reverse-Z.** Any pipeline writing the main depth buffer uses `depthCompare: "greater"` + `depthClearValue: 0.0`. | Depth sorts backwards — far geometry paints over near. |
 | Anything *reading* the main depth buffer tests background as `depth <= 0.0` (not `>= 1.0`). | Background/foreground inverted (e.g. auto-exposure meters the empty sky and blows out). |
-| The **shadow** pass is orthographic and stays standard-Z (`"less"`, clear `1.0`). Do not "fix" it for consistency. | Shadows invert; the MSM reconstruction assumes `[0,1]` support. |
+| The **shadow** pass is orthographic and stays standard-Z (`"less"`, clear `1.0`). Do not "fix" it for consistency. | Shadows invert; the `compare: "less-equal"` sampler reads the comparison backwards. |
 | `Environment.sunDirection` is the direction light **travels** (sun → scene), normalized. | Sun lights the wrong side. |
 | Point lights contribute nothing past `range`; the shader's falloff window matches the cull sphere. | Lights pop at cluster edges. |
 | **`bun-webgpu-rs` never throws on WebGPU validation errors** — they print to stderr as `[wgpu] uncaptured error:` and execution continues with garbage. | A script "succeeds" having rendered nothing. Grep output for `wgpu`, or wrap a frame in `pushErrorScope("validation")` / `await popErrorScope()`. |
@@ -401,10 +401,9 @@ class ClusteredForwardRenderer {
 }
 ```
 
-**Directional shadows are a 4-cascade CSM** (hybrid: cascade 0 = Moment Shadow
-Mapping, cascades 1–3 = depth + hardware PCF). You get correct shadows across a
-wide depth range without tuning — crisp near, coarser-but-attached far, no bleed.
-Two knobs:
+**Directional shadows are a 4-cascade CSM**, every cascade plain depth + hardware
+comparison PCF. You get correct shadows across a wide depth range without tuning
+— crisp near, coarser-but-attached far, no bleed. Two knobs:
 
 - **`shadowDistance`** (default 400) — how far shadows reach, in world units. The
   4 cascades subdivide `[camera.near, shadowDistance]`, so set it to the distance
@@ -416,17 +415,18 @@ Two knobs:
   `1` = fully logarithmic (tightest near cascade), `0` = uniform. Raise it if near
   shadows aren't crisp enough; lower it if the far cascade is starved.
 
-Fixed internals: `SHADOW_MAP_SIZE = 2048` per cascade; VRAM ≈ 184 MB (cascade 0's
-MSM moments + MSAA depth dominate). The per-cascade bias is texel-scaled
-automatically. Cascade boundaries cross-fade, so there's no visible seam.
-`shadowDistance` is the replacement for the old `shadowRadius` (CSM supersedes the
-single camera-clamped map). See CLAUDE.md "Cascaded shadow maps" for the design.
+Fixed internals: `SHADOW_MAP_SIZE = 2048` per cascade, one `depth32float`
+`2d-array` with a layer per cascade; VRAM ≈ 67 MB. The per-cascade normal-offset
+bias is texel-scaled automatically. Cascade boundaries cross-fade, so there's no
+visible seam. `shadowDistance` is the replacement for the old `shadowRadius` (CSM
+supersedes the single camera-clamped map). See CLAUDE.md "Cascaded shadow maps"
+for the design.
 
 `render()` records, in order, every frame:
 
 1. Write camera + environment uniforms.
 2. Write cluster params + pack the point-light array.
-3. **Cascaded shadow passes** (`cullMode: "none"`): cascade 0 = 4x-MSAA depth → moment resolve (→ `rgba32float` E[z]..E[z⁴]); cascades 1–3 = single-sample depth into a `depth_2d_array` layer each.
+3. **Cascaded shadow passes** (`cullMode: "none"`): one single-sample depth-only pass per cascade, each into its own `depth_2d_array` layer.
 4. **Cluster build** (compute) — per-cluster view-space AABBs.
 5. **Light cull** (compute) — sphere-vs-AABB, writes per-cluster light index lists.
 6. **AO** — `clearToWhite` if `technique === None`, else prepass + SSAO/HBAO + blur.

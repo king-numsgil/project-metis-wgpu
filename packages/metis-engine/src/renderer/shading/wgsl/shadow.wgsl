@@ -1,14 +1,10 @@
-// Depth-only, multisampled pass from the sun's point of view — a single
-// orthographic shadow map (no cascades) framed each frame around the scene's
-// bounding sphere. See math/Clustered forward formulas.md's shadow section
-// for the frustum-fitting formula and its "single fixed frustum"
-// simplification.
+// Depth-only pass from the sun's point of view, run once per cascade into that
+// cascade's layer of the shadow depth array. See math/Clustered forward
+// formulas.md's shadow section for the frustum-fitting formula, and
+// shadowCascades.ts for the per-cascade fit.
 //
-// This pass writes no color: the multisampled depth it produces is resolved
-// into per-texel depth *moments* (E[z]..E[z^4]) by shadow_resolve.wgsl — see
-// that file for why the moments are computed from MSAA samples instead of in
-// a fragment shader here. forward.wgsl's sampleSunShadow() reconstructs
-// occlusion from those moments (Hausdorff 4MSM, Peters & Klein 2015).
+// This pass writes no color — just standard-Z ortho depth, which forward.wgsl's
+// sampleSunShadow() tests with a hardware comparison sampler (PCF).
 
 @group(0) @binding(0) var<uniform> shadowUniforms: ShadowUniforms;
 @group(1) @binding(0) var<uniform> modelUniform: Model;

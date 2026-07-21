@@ -19,31 +19,12 @@ import type { Scene } from "../scene/scene.ts";
 import { Std140Writer } from "./std140.ts";
 import commonWgsl from "./wgsl/common.wgsl" with { type: "text" };
 import shadowWgsl from "./wgsl/shadow.wgsl" with { type: "text" };
-import shadowResolveWgsl from "./wgsl/shadow_resolve.wgsl" with { type: "text" };
 
 // Per-cascade resolution. 2048 (down from a former 4096 single map) is enough
-// because roomBox's solid-slab walls give corner depth gaps ~wall-thickness
-// (100x the moment reconstruction's threshold), and the 4x-MSAA moment resolve
-// keeps cascade-0 edges smooth at sub-texel precision.
+// because roomBox's solid-slab walls give corner depth gaps ~wall-thickness, far
+// wider than any shadow test here needs to resolve.
 export const SHADOW_MAP_SIZE = 2048;
-// Cascade 0 moments texture (E[z]..E[z^4], see forward.wgsl's computeMsmOcclusion).
-// rgba32float, not rgba16float: this renderer's worst-case corner geometry needs
-// to resolve occluder-depth gaps as small as ~0.0003 (in [0,1] shadow-space
-// depth) — smaller than rgba16float's own rounding error at that magnitude
-// (~0.0002), directly verified (via real shadow-map texel readback) to corrupt
-// exactly the gaps that matter, regardless of the reconstruction math or
-// filtering. Hardware bilinear filtering was tried and did NOT help either —
-// filtering blends real, different depths from both sides of a corner into an
-// ambiguous intermediate value, measurably widening the leak. See
-// math/Clustered forward formulas.md's Formula 6.
-const SHADOW_MOMENTS_FORMAT = "rgba32float" as const;
 const SHADOW_DEPTH_FORMAT = "depth32float" as const;
-// Cascade 0 rasterizes depth-only at 4x MSAA; shadow_resolve.wgsl averages the
-// sub-texel samples' moments into the rgba32float map, anti-aliasing shadow
-// boundaries at sub-texel precision — without it, every texel is a pure
-// single-depth delta and a shadow feature's edge quantizes to whole texels
-// (a blocky staircase under close zoom). Keep in sync with shadow_resolve.wgsl.
-const SHADOW_MSAA_SAMPLES = 4;
 
 // Normal-offset sizing, applied per cascade. The offset must clear the depth
 // spread of the 3x3 PCF footprint on a light-slanted receiver, which scales with
@@ -51,27 +32,27 @@ const SHADOW_MSAA_SAMPLES = 4;
 // world-space constant. A fixed world value silently collapses to sub-texel on
 // the coarse far cascades and stripes the ground with acne (directly observed
 // before this was texel-scaled); here each cascade gets its own offset from its
-// own texel size. The `MIN` floor keeps small/fine cascades from over-offsetting
-// (which would peter-pan). See CLAUDE.md "Cascaded shadow maps".
+// own texel size. The `MIN` floor guarantees a minimum world-space displacement
+// so a very fine cascade can't offset by a sub-millimetre amount that fp32
+// rounding swallows.
+//
+// NB the floor is *binding on cascade 0* at the default `shadowDistance` (it
+// only stops applying once a cascade's bounding radius exceeds
+// SHADOW_MAP_SIZE·MIN/(2·TEXELS)), so cascade 0 is over-offset for its own texel
+// size. Harmless today, but it is the first thing to lower if near contact
+// shadows ever look detached (peter-panning) — cascade 0 used to be MSM, which
+// needed no depth bias at all. See CLAUDE.md "Cascaded shadow maps".
 const SHADOW_NORMAL_OFFSET_TEXELS = 2.0;
 const SHADOW_NORMAL_OFFSET_MIN = 0.04;
 
 // ── Cascaded shadow maps ────────────────────────────────────────────────────
-// Four cascades fit to the camera frustum. Cascade 0 (nearest) keeps the full
-// Moment Shadow Mapping path (rgba32float moments + 4x-MSAA resolve): zero bias,
-// so no peter-panning, and the closed-form Hausdorff reconstruction that closes
-// the concave-corner leak. Cascades 1-3 are plain depth32float sampled with a
-// hardware comparison sampler (PCF) — 4 bytes/texel vs MSM's 32, and at their
-// coarse (decimetre) texels the sub-millimetre gaps MSM exists to resolve are
-// moot, while PCF is bleed-free and its small bias is invisible at range. See
-// CLAUDE.md "Cascaded shadow maps".
+// Four cascades fit to the camera frustum, all four plain depth32float sampled
+// with a hardware comparison sampler (PCF): one depth array, one layer each.
+// PCF is inherently bleed-free, and its small texel-scaled normal-offset bias
+// is the only bias needed. See CLAUDE.md "Cascaded shadow maps".
 //
-// VRAM at 2048²: cascade0 (67 MB moments + 67 MB MSAA depth) + 3× depth32float
-// (3 × 17 MB) ≈ 185 MB. The MSAA depth is transient (consumed by the resolve in
-// the same frame) but stays allocated.
+// VRAM at 2048²: 4 × depth32float (4 × 17 MB) ≈ 67 MB.
 export const CASCADE_COUNT = 4;
-// Number of PCF cascades (all but cascade 0), stored as layers of one depth array.
-const PCF_CASCADE_COUNT = CASCADE_COUNT - 1;
 // Default practical-split blend and shadowed reach — the renderer surfaces these
 // as tunable fields and passes the live values into `render`.
 export const CASCADE_SPLIT_LAMBDA_DEFAULT = 0.85;
@@ -100,21 +81,14 @@ interface Cascade {
 }
 
 /**
- * The directional shadow: a 4-cascade CSM with a hybrid representation —
- * cascade 0 is Moment Shadow Mapping (no bias → no peter-panning, corner-leak
- * proof), cascades 1-3 are plain depth + hardware PCF (cheap, bleed-free).
- * `render` records all the shadow passes; the forward pass samples the result
- * via the four exposed resources (`momentsView`/`momentsSampler` for cascade 0,
- * `depthArrayView`/`compareSampler` for the rest) plus `uniformBuffer` (the
+ * The directional shadow: a 4-cascade CSM, every cascade plain depth + hardware
+ * PCF. `render` records all the shadow passes; the forward pass samples the
+ * result via `depthArrayView`/`compareSampler` plus `uniformBuffer` (the
  * per-frame cascade matrices/splits/offsets). See CLAUDE.md "Cascaded shadow
  * maps".
  */
 export class ShadowCascades {
-    /** Cascade 0 moments (rgba32float), frame bind group binding 2. */
-    readonly momentsView: GpuTextureView;
-    /** Non-filtering sampler for the moments, binding 3. */
-    readonly momentsSampler: GpuSampler;
-    /** Cascades 1..N depth array (2d-array), binding 6. */
+    /** All cascades' depth array (2d-array), binding 6. */
     readonly depthArrayView: GpuTextureView;
     /** Comparison sampler for hardware PCF, binding 7. */
     readonly compareSampler: GpuSampler;
@@ -123,62 +97,28 @@ export class ShadowCascades {
 
     private readonly device: GpuDevice;
     private readonly modelBindGroupLayout: GpuBindGroupLayout;
-    // Cascade 0 (MSM): 4x-MSAA depth -> resolved moments.
-    private readonly cascade0DepthMsaa: GpuTexture;
-    private readonly cascade0DepthMsaaView: GpuTextureView;
-    private readonly cascade0Moments: GpuTexture;
-    // Cascades 1..N (PCF): one depth32float array, one layer each.
+    // All cascades: one depth32float array, one layer each.
     private readonly pcfDepthArray: GpuTexture;
     private readonly pcfDepthLayerViews: GpuTextureView[]; // per-layer, for rendering
     // Per-cascade light matrix for the render passes (offset-addressed slices).
     private readonly cascadeRenderBuffer: GpuBuffer;
     private readonly cascadeRenderBindGroups: GpuBindGroup[];
-    private readonly cascade0DepthPipeline: GpuRenderPipeline; // MSAA depth
     private readonly pcfDepthPipeline: GpuRenderPipeline; // single-sample depth
-    private readonly resolvePipeline: GpuRenderPipeline;
-    private readonly resolveBindGroup: GpuBindGroup;
 
     constructor(device: GpuDevice, modelBindGroupLayout: GpuBindGroupLayout) {
         this.device = device;
         this.modelBindGroupLayout = modelBindGroupLayout;
 
-        // ── Cascade 0: MSM (4x-MSAA depth -> rgba32float moments) ───────────
-        this.cascade0DepthMsaa = device.createTexture({
-            label: "metis-engine/cascade0-depth-msaa",
-            size: {width: SHADOW_MAP_SIZE, height: SHADOW_MAP_SIZE},
-            format: SHADOW_DEPTH_FORMAT,
-            sampleCount: SHADOW_MSAA_SAMPLES,
-            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
-        });
-        this.cascade0DepthMsaaView = this.cascade0DepthMsaa.createView();
-        this.cascade0Moments = device.createTexture({
-            label: "metis-engine/cascade0-moments",
-            size: {width: SHADOW_MAP_SIZE, height: SHADOW_MAP_SIZE},
-            format: SHADOW_MOMENTS_FORMAT,
-            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
-        });
-        this.momentsView = this.cascade0Moments.createView();
-        // Non-filtering: rgba32float isn't linearly filterable without the
-        // optional float32-filterable feature (and filtering wasn't a net win
-        // for the moments anyway — see SHADOW_MOMENTS_FORMAT).
-        this.momentsSampler = device.createSampler({
-            label: "metis-engine/moments-sampler",
-            magFilter: "nearest",
-            minFilter: "nearest",
-            addressModeU: "clamp-to-edge",
-            addressModeV: "clamp-to-edge",
-        });
-
-        // ── Cascades 1..N: PCF depth array (one layer each) ─────────────────
+        // ── All cascades: PCF depth array (one layer each) ──────────────────
         this.pcfDepthArray = device.createTexture({
             label: "metis-engine/pcf-depth-array",
-            size: {width: SHADOW_MAP_SIZE, height: SHADOW_MAP_SIZE, depthOrArrayLayers: PCF_CASCADE_COUNT},
+            size: {width: SHADOW_MAP_SIZE, height: SHADOW_MAP_SIZE, depthOrArrayLayers: CASCADE_COUNT},
             format: SHADOW_DEPTH_FORMAT,
             usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
         });
         this.depthArrayView = this.pcfDepthArray.createView({dimension: "2d-array"});
         this.pcfDepthLayerViews = [];
-        for (let i = 0; i < PCF_CASCADE_COUNT; i++) {
+        for (let i = 0; i < CASCADE_COUNT; i++) {
             this.pcfDepthLayerViews.push(this.pcfDepthArray.createView({
                 dimension: "2d",
                 baseArrayLayer: i,
@@ -235,46 +175,12 @@ export class ShadowCascades {
         // room shell viewed from inside) would wrongly drop triangles that are
         // front-facing to the camera but back-facing to the light — exactly the
         // geometry a shadow pass most needs.
-        this.cascade0DepthPipeline = device.createRenderPipeline({
-            label: "metis-engine/cascade0-depth-pipeline",
-            layout: shadowPipelineLayout,
-            vertex: {module: shadowModule, entryPoint: "vs", buffers: [MESH_VERTEX_LAYOUT]},
-            primitive: {topology: "triangle-list", cullMode: "none"},
-            depthStencil: {format: SHADOW_DEPTH_FORMAT, depthWriteEnabled: true, depthCompare: "less"},
-            multisample: {count: SHADOW_MSAA_SAMPLES},
-        });
-        // Single-sample twin for the PCF cascades (no moment resolve).
         this.pcfDepthPipeline = device.createRenderPipeline({
             label: "metis-engine/pcf-depth-pipeline",
             layout: shadowPipelineLayout,
             vertex: {module: shadowModule, entryPoint: "vs", buffers: [MESH_VERTEX_LAYOUT]},
             primitive: {topology: "triangle-list", cullMode: "none"},
             depthStencil: {format: SHADOW_DEPTH_FORMAT, depthWriteEnabled: true, depthCompare: "less"},
-        });
-
-        // Moment-resolve: cascade 0's multisampled depth -> per-texel averaged
-        // power moments (see shadow_resolve.wgsl).
-        const resolveBGL = device.createBindGroupLayout({
-            label: "metis-engine/shadow-resolve-bgl",
-            entries: [
-                {binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: {sampleType: "depth", multisampled: true}},
-            ],
-        });
-        this.resolveBindGroup = device.createBindGroup({
-            label: "metis-engine/shadow-resolve-bind-group",
-            layout: resolveBGL,
-            entries: [{binding: 0, textureView: this.cascade0DepthMsaaView}],
-        });
-        const resolveModule = device.createShaderModule({
-            label: "metis-engine/shadow-resolve-shader",
-            code: shadowResolveWgsl,
-        });
-        this.resolvePipeline = device.createRenderPipeline({
-            label: "metis-engine/shadow-resolve-pipeline",
-            layout: device.createPipelineLayout({bindGroupLayouts: [resolveBGL]}),
-            vertex: {module: resolveModule, entryPoint: "vs"},
-            fragment: {module: resolveModule, entryPoint: "fs", targets: [{format: SHADOW_MOMENTS_FORMAT}]},
-            primitive: {topology: "triangle-list"},
         });
     }
 
@@ -317,45 +223,17 @@ export class ShadowCascades {
             }
         };
 
-        // Cascade 0 (MSM): multisampled depth -> per-texel moment resolve.
-        const depth0 = encoder.beginRenderPass({
-            label: "metis-engine/cascade0-depth-pass",
-            timestampWrites: profiler?.pass("cascade0-depth"),
-            colorAttachments: [],
-            depthStencilAttachment: {
-                view: this.cascade0DepthMsaaView,
-                depthLoadOp: "clear",
-                depthStoreOp: "store", // read by the moment-resolve pass below
-                depthClearValue: 1.0, // z=1 (farthest) = "no occluder here"
-            },
-        });
-        depth0.setPipeline(this.cascade0DepthPipeline);
-        drawScene(depth0, 0);
-        depth0.end();
-
-        const resolvePass = encoder.beginRenderPass({
-            label: "metis-engine/cascade0-moment-resolve-pass",
-            timestampWrites: profiler?.pass("cascade0-moment-resolve"),
-            colorAttachments: [
-                {view: this.momentsView, loadOp: "clear", storeOp: "store", clearValue: {r: 1, g: 1, b: 1, a: 1}},
-            ],
-        });
-        resolvePass.setPipeline(this.resolvePipeline);
-        resolvePass.setBindGroup(0, this.resolveBindGroup);
-        resolvePass.draw(3);
-        resolvePass.end();
-
-        // Cascades 1..N (PCF): single-sample depth into each array layer.
-        for (let c = 1; c < CASCADE_COUNT; c++) {
+        // Every cascade (PCF): single-sample depth into its array layer.
+        for (let c = 0; c < CASCADE_COUNT; c++) {
             const pass = encoder.beginRenderPass({
                 label: `metis-engine/pcf-cascade-${c}-depth-pass`,
                 timestampWrites: profiler?.pass(`pcf-cascade-${c}-depth`),
                 colorAttachments: [],
                 depthStencilAttachment: {
-                    view: this.pcfDepthLayerViews[c - 1]!,
+                    view: this.pcfDepthLayerViews[c]!,
                     depthLoadOp: "clear",
                     depthStoreOp: "store",
-                    depthClearValue: 1.0,
+                    depthClearValue: 1.0, // z=1 (farthest) = "no occluder here"
                 },
             });
             pass.setPipeline(this.pcfDepthPipeline);
@@ -365,8 +243,6 @@ export class ShadowCascades {
     }
 
     destroy() {
-        this.cascade0DepthMsaa.destroy();
-        this.cascade0Moments.destroy();
         this.pcfDepthArray.destroy();
         this.cascadeRenderBuffer.destroy();
         this.uniformBuffer.destroy();

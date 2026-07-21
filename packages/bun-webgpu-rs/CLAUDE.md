@@ -524,8 +524,9 @@ Two capabilities the TS encoder never had:
 **Mismatches are errors, never guesses.** `rgba16float` → `.png` is refused, and
 so is `readTexturePixels` on an f16 texture — reinterpreting float bytes as 8-bit
 colour is silently meaningless, and this repo has already lost a session to a
-byte-vs-value reinterpretation bug (the `new Float32Array(uint8Array)` mistake in
-metis-engine's MSM debugging). 8-bit → `.hdr` is refused too: there is no
+byte-vs-value reinterpretation bug (`new Float32Array(uint8Array)` converts
+*values*, not bits — use `new Float32Array(u8.buffer, u8.byteOffset, n)`).
+8-bit → `.hdr` is refused too: there is no
 high-dynamic-range data to invent.
 
 **Blocking `poll(Wait)` in the readback is correct** — it runs on a libuv worker
