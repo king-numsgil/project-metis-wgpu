@@ -104,9 +104,85 @@ async function renderExterior() {
         const padMaterial = new Material({baseColor: [0.15, 0.15, 0.17, 1], metallic: 0.1, roughness: 0.8});
         scene.add(padMesh, padMaterial, {position: vec3.create(0, -1.05, 0)});
 
-        scene.pointLights.push(
-            {position: vec3.create(-1.6, 0.3, 0.8), color: [1, 0.15, 0.1], intensity: 6, range: 4},
-            {position: vec3.create(1.6, 0.3, 0.8), color: [0.1, 1, 0.2], intensity: 6, range: 4},
+        scene.lights.push(
+            {kind: "point", position: vec3.create(-1.6, 0.3, 0.8), color: [1, 0.15, 0.1], intensity: 6, range: 4},
+            {kind: "point", position: vec3.create(1.6, 0.3, 0.8), color: [0.1, 1, 0.2], intensity: 6, range: 4},
+        );
+
+        return scene;
+    });
+}
+
+/**
+ * Spot lights: three cones on a flat deck, chosen so the render pins the parts
+ * of the encoding that can silently go wrong.
+ *
+ * - **Narrow vs wide** (15°/45° outer) proves `outerAngle` actually sizes the
+ *   pool, rather than the cone collapsing to the range sphere.
+ * - **A soft cone** (5° inner inside a 45° outer) shows the inner→outer
+ *   gradient; a hard-edged one (inner == outer) exercises the degenerate branch
+ *   that would divide by zero without the `1e-4` clamp in `LightCuller.write`.
+ * - **A point light** sits among them as the control: if the branchless
+ *   `cosOuter = -2` encoding ever regresses, it is the one that goes dark.
+ *
+ * The sun is dimmed to near-nothing so the cones are the only real light.
+ */
+async function renderSpotlights() {
+    await renderToFile("spotlights", "METIS-ENGINE // SPOTLIGHTS", (device) => {
+        const scene = new Scene();
+        scene.environment = createInteriorEnvironment();
+        scene.environment.sunIntensity = 0.02;
+        scene.environment.ambientIntensity = 0.015;
+        scene.camera.position = vec3.create(0, 5.5, 7.5);
+        scene.camera.target = vec3.create(0, 0, -0.5);
+
+        const deck = new Mesh(device, plane(20, 20), "deck");
+        const deckMaterial = new Material({baseColor: [0.5, 0.5, 0.54, 1], metallic: 0.0, roughness: 0.7});
+        scene.add(deck, deckMaterial, {position: vec3.create(0, -1, 0)});
+
+        // A sphere under the middle cone, so the cones fall on curved geometry
+        // too rather than only a flat plane.
+        const ball = new Mesh(device, uvSphere(0.7, 32, 48), "ball");
+        const ballMaterial = new Material({baseColor: [0.8, 0.8, 0.82, 1], metallic: 0.1, roughness: 0.45});
+        scene.add(ball, ballMaterial, {position: vec3.create(0, -0.3, 0)});
+
+        const down = vec3.create(0, -1, 0);
+        scene.lights.push(
+            // Narrow + soft edge (wide inner→outer gradient).
+            {
+                kind: "spot",
+                position: vec3.create(-4, 3.5, 0),
+                direction: down,
+                color: [1, 0.3, 0.25],
+                intensity: 60,
+                range: 12,
+                innerAngle: (5 * Math.PI) / 180,
+                outerAngle: (15 * Math.PI) / 180,
+            },
+            // Wide + soft.
+            {
+                kind: "spot",
+                position: vec3.create(0, 3.5, 0),
+                direction: down,
+                color: [0.95, 0.95, 1],
+                intensity: 60,
+                range: 12,
+                innerAngle: (5 * Math.PI) / 180,
+                outerAngle: (45 * Math.PI) / 180,
+            },
+            // Hard-edged: inner == outer exercises the degenerate-cone clamp.
+            {
+                kind: "spot",
+                position: vec3.create(4, 3.5, 0),
+                direction: down,
+                color: [0.25, 0.5, 1],
+                intensity: 60,
+                range: 12,
+                innerAngle: (25 * Math.PI) / 180,
+                outerAngle: (25 * Math.PI) / 180,
+            },
+            // Control: a plain point light must be unaffected by all of this.
+            {kind: "point", position: vec3.create(0, 0.6, 5), color: [1, 0.9, 0.5], intensity: 12, range: 6},
         );
 
         return scene;
@@ -134,9 +210,9 @@ async function renderInterior() {
         scene.add(roomMesh, roomMaterial);
 
         // Ceiling fixtures.
-        scene.pointLights.push(
-            {position: vec3.create(-2, 3.6, 1), color: [1, 0.92, 0.75], intensity: 5, range: 6},
-            {position: vec3.create(2, 3.6, 1), color: [1, 0.92, 0.75], intensity: 5, range: 6},
+        scene.lights.push(
+            {kind: "point", position: vec3.create(-2, 3.6, 1), color: [1, 0.92, 0.75], intensity: 5, range: 6},
+            {kind: "point", position: vec3.create(2, 3.6, 1), color: [1, 0.92, 0.75], intensity: 5, range: 6},
         );
 
         return scene;
@@ -218,7 +294,7 @@ function buildHdrClipScene(device: GpuDevice): Scene {
     scene.add(floorMesh, floorMaterial);
 
     // Intentionally overbright — a naive clamp will flatten this to a hard white disc.
-    scene.pointLights.push({position: vec3.create(0, 0.4, 0), color: [1, 0.95, 0.85], intensity: 80, range: 5});
+    scene.lights.push({kind: "point", position: vec3.create(0, 0.4, 0), color: [1, 0.95, 0.85], intensity: 80, range: 5});
 
     return scene;
 }
@@ -387,7 +463,7 @@ async function renderTexturedDemo() {
         rotationEuler: vec3.create(Math.PI / 2, 0, 0),
     });
 
-    scene.pointLights.push({position: vec3.create(1.5, 2, 3), color: [1, 0.95, 0.85], intensity: 8, range: 8});
+    scene.lights.push({kind: "point", position: vec3.create(1.5, 2, 3), color: [1, 0.95, 0.85], intensity: 8, range: 8});
 
     for (let i = 0; i < 30; i++) {
         const frame = ctx.beginFrame();
@@ -422,6 +498,7 @@ async function renderTexturedDemo() {
 }
 
 await renderExterior();
+await renderSpotlights();
 await renderInterior();
 await renderHdrClipComparison();
 await renderGltfDemo();

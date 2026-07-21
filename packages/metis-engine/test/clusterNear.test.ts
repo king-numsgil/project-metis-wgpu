@@ -59,7 +59,8 @@ async function meanLuma(clusterNear: number, wallDepth: number): Promise<number>
         new Material({baseColor: [0.8, 0.8, 0.8, 1], metallic: 0, roughness: 0.9}),
         {position: vec3.create(0, 0, -wallDepth - 0.05)},
     );
-    scene.pointLights.push({
+    scene.lights.push({
+        kind: "point",
         position: vec3.create(0, 0, -wallDepth + 0.1),
         color: [1, 1, 1],
         intensity: 3,

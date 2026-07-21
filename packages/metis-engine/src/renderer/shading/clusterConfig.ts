@@ -26,13 +26,14 @@ export const NUM_CLUSTERS = CLUSTER_COUNT_X * CLUSTER_COUNT_Y * CLUSTER_COUNT_Z;
 export const MAX_LIGHTS_PER_CLUSTER = 96;
 
 /**
- * Total point lights the renderer will upload in a single frame. Excess lights
- * are dropped with a one-time console warning (see `LightCuller.write`).
+ * Total local lights (point + spot combined) the renderer will upload in a
+ * single frame. Excess lights are dropped with a console warning (see
+ * `LightCuller.write`).
  *
  * Also allocation-only: cull cost scales with the lights a scene *actually*
  * has, measured dead-linear at a fraction of a microsecond each, and the
  * forward pass scales with lights-per-*fragment* (density), not this cap.
  */
-export const MAX_POINT_LIGHTS = 384;
+export const MAX_LIGHTS = 384;
 
 export const COMPUTE_WORKGROUP_SIZE = 64;

@@ -194,6 +194,7 @@ function buildLightField(count: number): AnimatedLight[] {
             bobAmp: 0.3 + rand() * 1.0,
             bobSpeed: 0.5 + rand() * 2.0,
             light: {
+                kind: "point",
                 position: vec3.create(0, 0, 0),
                 color,
                 intensity: 6 + rand() * 10,
@@ -205,7 +206,7 @@ function buildLightField(count: number): AnimatedLight[] {
 }
 
 const lights = buildLightField(LIGHT_COUNT);
-scene.pointLights = lights.map((l) => l.light);
+scene.lights = lights.map((l) => l.light);
 
 function animateLights(t: number) {
     for (const a of lights) {

@@ -87,9 +87,21 @@ const roomMesh = new Mesh(ctx.device, roomBox(8, 4, 10, {s0: 0.3, s1: 0.7, t0: 0
 const roomMaterial = new Material({baseColor: [0.55, 0.54, 0.52, 1], metallic: 0.0, roughness: 0.85});
 scene.add(roomMesh, roomMaterial);
 
-scene.pointLights.push(
-    {position: vec3.create(-2, 3.6, 1), color: [1, 0.92, 0.75], intensity: 5, range: 6},
-    {position: vec3.create(2, 3.6, 1), color: [1, 0.92, 0.75], intensity: 5, range: 6},
+scene.lights.push(
+    {kind: "point", position: vec3.create(-2, 3.6, 1), color: [1, 0.92, 0.75], intensity: 5, range: 6},
+    {kind: "point", position: vec3.create(2, 3.6, 1), color: [1, 0.92, 0.75], intensity: 5, range: 6},
+    // A ceiling spot aimed down at the console, for eyeballing the cone
+    // interactively (the fixture's `spotlights` scene is the pinned version).
+    {
+        kind: "spot",
+        position: vec3.create(0, 3.8, 3),
+        direction: vec3.create(0, -1, -0.25),
+        color: [0.7, 0.85, 1],
+        intensity: 40,
+        range: 10,
+        innerAngle: (12 * Math.PI) / 180,
+        outerAngle: (26 * Math.PI) / 180,
+    },
 );
 
 // A textured equipment crate on the floor + a lit control console on the

@@ -16,7 +16,7 @@ export type { LoadedTexture, MaterialDefaults } from "./assets/texture.ts";
 export { Mesh, MESH_VERTEX_LAYOUT } from "./scene/mesh.ts";
 export { Material } from "./scene/material.ts";
 export type { MaterialParams } from "./scene/material.ts";
-export type { PointLight } from "./scene/light.ts";
+export type { Light, PointLight, SpotLight } from "./scene/light.ts";
 export { createExteriorEnvironment, createInteriorEnvironment } from "./scene/environment.ts";
 export type { Environment } from "./scene/environment.ts";
 export { Scene, SceneInstance } from "./scene/scene.ts";

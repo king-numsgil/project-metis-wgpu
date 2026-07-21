@@ -52,7 +52,7 @@ scene.camera.target = vec3.create(0, 0, 0);
 scene.camera.setAspectFromSize(ctx.width, ctx.height);
 
 scene.add(new Mesh(ctx.device, cube(1, 1, 1), "box"), new Material({ metallic: 0.8, roughness: 0.3 }));
-scene.pointLights.push({ position: vec3.create(2, 2, 0), color: [1, 0.9, 0.8], intensity: 8, range: 6 });
+scene.lights.push({ kind: "point", position: vec3.create(2, 2, 0), color: [1, 0.9, 0.8], intensity: 8, range: 6 });
 
 let running = true;
 while (running) {
@@ -263,7 +263,7 @@ class Scene {
     camera: Camera;                    // defaults to look-at from (0,0,5)
     environment: Environment;          // defaults to createExteriorEnvironment()
     instances: SceneInstance[];
-    pointLights: PointLight[];
+    lights: Light[];                   // point + spot, discriminated on `kind`
     add(mesh: Mesh, material: Material, transform?: Partial<Transform>): SceneInstance;
 }
 
@@ -311,15 +311,48 @@ the factors. This keeps one pipeline for all materials. Textures multiply their
 factor: albedo/emissive are sRGB source data, normal/metallic/roughness are
 linear; metallic and roughness read the **red channel**.
 
-### `PointLight` / `Environment`
+### `Light` / `Environment`
+
+Local lights are a **discriminated union on `kind`**, all living in one
+`scene.lights` array and sharing one GPU buffer and one culling pass.
 
 ```ts
+type Light = PointLight | SpotLight;
+
 interface PointLight {
+    kind: "point";
     position: Vec3Arg;
     color: [r, g, b];
     intensity: number;   // same linear units as Environment.sunIntensity
     range: number;       // cull radius; contributes nothing beyond
 }
+
+interface SpotLight {
+    kind: "spot";
+    position: Vec3Arg;
+    direction: Vec3Arg;  // direction light TRAVELS (cone axis); normalized on upload
+    color: [r, g, b];
+    intensity: number;
+    range: number;       // cull radius — the full SPHERE, not the cone (see below)
+    innerAngle: number;  // RADIANS, half-angle of the full-brightness core
+    outerAngle: number;  // RADIANS, half-angle at which it reaches zero
+}
+```
+
+**`innerAngle`/`outerAngle` are half-angles in radians** — the angle from the
+cone's axis to its edge, not the full apex angle. A 30-degree-wide beam is
+`outerAngle: 15 * Math.PI / 180`. Between inner and outer the intensity falls
+off smoothly (squared, matching the distance falloff's own window term); setting
+them equal gives a hard edge, and `outerAngle < innerAngle` degrades to a hard
+edge rather than producing anything invalid. Pinned by `test/spotLight.test.ts`,
+which measures the rendered cone and converts it back to an angle.
+
+**A spot light is culled by its range sphere, not its cone.** The clustering
+pass treats every light identically; the cone is applied per fragment, where it
+also acts as an early-out costing one dot product. So a narrow spot is
+over-included into clusters it doesn't actually light — cheap, but it counts
+against `MAX_LIGHTS_PER_CLUSTER`. See CLAUDE.md "Spot lights" for why cone
+culling was measured and deferred.
 
 interface Environment {
     sunDirection: Vec3Arg;   // direction light TRAVELS, normalized
@@ -357,7 +390,7 @@ and what it did *not* break: CLAUDE.md, "Reverse-Z with an infinite far plane".
 
 `clusterNear` / `clusterFar` bound the **clustered light grid**, which needs a
 finite depth range to slice exponentially. Neither is a clip plane: geometry
-outside them renders normally (lit by sun + ambient); only *point lights* past
+outside them renders normally (lit by sun + ambient); only *local lights* past
 `clusterFar` stop being culled into clusters, and so contribute nothing.
 
 **`clusterNear` is deliberately separate from `near`.** Z-slice density is
@@ -459,7 +492,7 @@ it perturbs a byte-exact screenshot baseline.
 CLUSTER_COUNT_X = 16; CLUSTER_COUNT_Y = 9; CLUSTER_COUNT_Z = 24;
 NUM_CLUSTERS = 3456;              // X*Y*Z
 MAX_LIGHTS_PER_CLUSTER = 96;      // per-cluster capacity cap
-MAX_POINT_LIGHTS = 384;           // per-scene cap (excess is dropped with a console.warn)
+MAX_LIGHTS = 384;                 // per-scene cap, point + spot combined (excess dropped with a console.warn)
 COMPUTE_WORKGROUP_SIZE = 64;
 ```
 
@@ -475,7 +508,7 @@ tile-shaped popping/flicker. It is *not* an out-of-bounds bug — the shaders ar
 correctly bounded — it is capacity. This is the first thing to suspect for
 tile-shaped artifacts at high light counts.
 
-**The two caps are coupled** — raising `MAX_POINT_LIGHTS` without also raising
+**The two caps are coupled** — raising `MAX_LIGHTS` without also raising
 this one silently drops light. Peak per-cluster occupancy on `bench/lights.ts`
 (a deliberately dense field) runs at roughly a fifth of the scene's light count,
 so the old 256/64 pair was self-consistent but 384 lights would have overflowed
@@ -741,6 +774,7 @@ bun run fixture          # headless render + screenshot validation -> test/outpu
 bun run demo:exterior    # interactive; WASD+QE fly, arrows look, P profiler, Esc quit
 bun run demo:interior    # + O cycles AO technique
 bun run bench:lights     # windowed light benchmark (see bench/lights.ts header for flags)
+                         #   --lights N  --spots 0..1 (spot fraction, default 0.5)  --profile
 bunx tsc --noEmit        # type-check
 ```
 

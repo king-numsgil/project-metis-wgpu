@@ -18,7 +18,7 @@ import {
     CLUSTER_COUNT_Z,
     COMPUTE_WORKGROUP_SIZE,
     MAX_LIGHTS_PER_CLUSTER,
-    MAX_POINT_LIGHTS,
+    MAX_LIGHTS,
     NUM_CLUSTERS,
 } from "./clusterConfig.ts";
 import { Std140Writer } from "./std140.ts";
@@ -27,7 +27,11 @@ import commonWgsl from "./wgsl/common.wgsl" with { type: "text" };
 import lightCullWgsl from "./wgsl/light_cull.wgsl" with { type: "text" };
 
 const CLUSTER_PARAMS_SIZE = 128; // mat4 invProj + vec4 + vec4<u32> + vec4<u32> + vec4 (depthBounds)
-const POINT_LIGHT_STRIDE = 48; // vec3+f32, vec3+f32, vec3+f32(pad)
+// Keep in sync with common.wgsl's GpuLight:
+// worldPosition+range, viewPosition+intensity, color+cosOuter, worldDirection+spotScale.
+const LIGHT_STRIDE = 64;
+/** `worldDirection` for a point light — unused by the shader, written for determinism. */
+const ZERO_DIRECTION = vec3.create(0, 0, 0);
 const CLUSTER_AABB_STRIDE = 32; // vec3+pad, vec3+pad
 const DISPATCH_GROUPS = Math.ceil(NUM_CLUSTERS / COMPUTE_WORKGROUP_SIZE);
 
@@ -71,7 +75,7 @@ export class LightCuller {
         });
         this.lightsBuffer = device.createBuffer({
             label: "metis-engine/point-lights",
-            size: MAX_POINT_LIGHTS * POINT_LIGHT_STRIDE,
+            size: MAX_LIGHTS * LIGHT_STRIDE,
             usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
         });
         this.clusterAABBsBuffer = device.createBuffer({
@@ -185,7 +189,7 @@ export class LightCuller {
         const clusterNear = Math.max(scene.camera.clusterNear, 1e-4);
         params.vec4(targets.width, targets.height, clusterNear, scene.camera.clusterFar);
         params.vec4u(CLUSTER_COUNT_X, CLUSTER_COUNT_Y, CLUSTER_COUNT_Z, MAX_LIGHTS_PER_CLUSTER);
-        const lightCount = Math.min(scene.pointLights.length, MAX_POINT_LIGHTS);
+        const lightCount = Math.min(scene.lights.length, MAX_LIGHTS);
         params.vec4u(lightCount, 0, 0, 0);
         // True camera near — slice 0's AABB reaches down to this so geometry
         // closer than clusterNear keeps a correct light list.
@@ -195,19 +199,35 @@ export class LightCuller {
         const view = scene.camera.viewMatrix();
         const lights = new Std140Writer();
         for (let i = 0; i < lightCount; i++) {
-            const light = scene.pointLights[i]!;
+            const light = scene.lights[i]!;
             const viewPos = vec3.transformMat4(light.position, view);
             lights.vec3(light.position, light.range);
             lights.vec3(viewPos, light.intensity);
-            lights.vec3(light.color, 0);
+            // A point light is encoded as a cone that can't reject anything:
+            // cosOuter = -2 is below every possible cos, and spotScale = 1 then
+            // saturates the shader's clamp to exactly 1.0. See common.wgsl's
+            // spotAttenuation — this is what keeps the forward loop branchless.
+            if (light.kind === "spot") {
+                const cosInner = Math.cos(light.innerAngle);
+                const cosOuter = Math.cos(light.outerAngle);
+                // Guard the reciprocal: outerAngle <= innerAngle (a degenerate
+                // or inverted cone) would divide by ~0. Clamping the
+                // denominator turns that into a hard-edged cone instead of Inf.
+                const spotScale = 1 / Math.max(cosInner - cosOuter, 1e-4);
+                lights.vec3(light.color, cosOuter);
+                lights.vec3(vec3.normalize(light.direction), spotScale);
+            } else {
+                lights.vec3(light.color, -2);
+                lights.vec3(ZERO_DIRECTION, 1);
+            }
         }
         if (lightCount > 0) {
             this.device.queue.writeBuffer(this.lightsBuffer, 0, lights.toBytes());
         }
-        if (scene.pointLights.length > MAX_POINT_LIGHTS) {
+        if (scene.lights.length > MAX_LIGHTS) {
             console.warn(
-                `metis-engine: scene has ${scene.pointLights.length} point lights, ` +
-                `only the first ${MAX_POINT_LIGHTS} are rendered (MAX_POINT_LIGHTS).`,
+                `metis-engine: scene has ${scene.lights.length} lights, ` +
+                `only the first ${MAX_LIGHTS} are rendered (MAX_LIGHTS).`,
             );
         }
     }

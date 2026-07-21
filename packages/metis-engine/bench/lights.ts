@@ -38,12 +38,12 @@ import {
     History,
     Material,
     MAX_LIGHTS_PER_CLUSTER,
-    MAX_POINT_LIGHTS,
+    MAX_LIGHTS,
     Mesh,
     mulberry32,
     NUM_CLUSTERS,
     plane,
-    type PointLight,
+    type Light,
     type ProfileSpan,
     profileSpansToRows,
     RenderContext,
@@ -82,7 +82,7 @@ const flag = (k: string) => args[k] === true || args[k] === "true";
 
 const WIDTH = num("width", 1280);
 const HEIGHT = num("height", 720);
-const LIGHT_COUNT = Math.min(num("lights", 100), MAX_POINT_LIGHTS);
+const LIGHT_COUNT = Math.min(num("lights", 100), MAX_LIGHTS);
 const DURATION_S = num("duration", 5);
 const WARMUP_S = num("warmup", 0.75); // let auto-exposure settle before collecting stats
 // Frame-rate cap (0 = uncapped, the default, so timings reflect real work).
@@ -99,12 +99,19 @@ const PROFILE = flag("profile");
 // is the forward pass no longer writing 4x-MSAA depth, not early-Z. Pass
 // --no-prepass to A/B it.
 const PREPASS = !flag("no-prepass");
+// Fraction of the field that is spot lights rather than point lights (0..1).
+// Default 0.5 — half and half. **`--spots 0` reproduces the original all-point
+// field exactly**, because buildLightField draws every random parameter
+// unconditionally and only *uses* the spot ones when a light is a spot; the
+// rand() sequence therefore doesn't depend on this fraction. That is what makes
+// `--spots 0` a valid A/B baseline rather than merely a similar scene.
+const SPOT_FRACTION = Math.min(Math.max(num("spots", 0.5), 0), 1);
 
 // The plane the lights hover over, and the volume the lights animate within.
 const PLANE_SIZE = 60;
 const FIELD_HALF = 24; // lights spread over [-24, 24] in x/z
 
-// ── Animated point-light field ───────────────────────────────────────────────
+// ── Animated light field (point + spot) ─────────────────────────────────────
 interface AnimatedLight {
     cx: number;
     cz: number;
@@ -114,12 +121,34 @@ interface AnimatedLight {
     baseY: number;
     bobAmp: number;
     bobSpeed: number;
-    light: PointLight;
+    /** Spot only: tilt of the cone axis away from straight-down, radians. */
+    coneTilt: number;
+    /** Spot only: how fast the tilted axis sweeps around Y, radians/sec (signed). */
+    spinSpeed: number;
+    /** Spot only: starting sweep angle, radians. */
+    spinPhase: number;
+    light: Light;
 }
 
-/** Deterministically scatters `count` lights across the field with per-light orbit + bob animation params. */
+/**
+ * Deterministically scatters `count` lights across the field with per-light
+ * orbit + bob animation params, the first `SPOT_FRACTION` of them as spot
+ * lights that sweep like searchlights.
+ *
+ * Every random draw below is unconditional — including the spot-only ones for a
+ * light that ends up a point — so the sequence, and therefore every light's
+ * position and orbit, is identical at any `SPOT_FRACTION`. Only the light kind
+ * changes. Drawing them inside an `if` would silently make `--spots 0` a
+ * different scene from the pre-spot bench and quietly invalidate the baseline.
+ */
 function buildLightField(count: number): AnimatedLight[] {
     const rand = mulberry32(0x1234_abcd);
+    // Cone parameters come from their OWN stream, so they consume nothing from
+    // `rand`. Appending draws to the main stream instead would shift every
+    // subsequent light's position and quietly make `--spots 0` a different scene
+    // from the pre-spot bench — the baseline would look valid and be worthless.
+    const spotRand = mulberry32(0x5eed_c0de);
+    const spotCount = Math.round(count * SPOT_FRACTION);
     const lights: AnimatedLight[] = [];
     for (let i = 0; i < count; i++) {
         // Warm/cool alternating palette so the field reads as distinct lights.
@@ -127,21 +156,64 @@ function buildLightField(count: number): AnimatedLight[] {
         const color: [number, number, number] = hueWarm
             ? [1.0, 0.55 + 0.35 * rand(), 0.35 + 0.2 * rand()]
             : [0.35 + 0.2 * rand(), 0.6 + 0.3 * rand(), 1.0];
+        // Drawn for every light, spot or not, so the spot stream stays in step
+        // with the light index regardless of SPOT_FRACTION.
+        const coneTilt = (10 + spotRand() * 45) * (Math.PI / 180);
+        const spinSpeed = (spotRand() * 2 - 1) * 2.2;
+        const spinPhase = spotRand() * Math.PI * 2;
+        const outerAngle = (12 + spotRand() * 25) * (Math.PI / 180);
+        // Inner edge somewhere inside the outer one, so the field carries a mix
+        // of sharp and soft cones.
+        const innerAngle = outerAngle * (0.2 + spotRand() * 0.7);
+        const isSpot = i < spotCount;
+        const cx = (rand() * 2 - 1) * FIELD_HALF;
+        const cz = (rand() * 2 - 1) * FIELD_HALF;
+        const orbitRadius = 1.5 + rand() * 4;
+        const orbitSpeed = (rand() * 2 - 1) * 1.6;
+        const phase = rand() * Math.PI * 2;
+        const baseY = 0.8 + rand() * 2.8;
+        const bobAmp = 0.3 + rand() * 1.0;
+        const bobSpeed = 0.5 + rand() * 2.0;
+        // Order matters: these two are drawn here, after the orbit params,
+        // exactly where the original all-point field drew them.
+        const intensity = 6 + rand() * 8;
+        const range = 5 + rand() * 4;
         lights.push({
-            cx: (rand() * 2 - 1) * FIELD_HALF,
-            cz: (rand() * 2 - 1) * FIELD_HALF,
-            orbitRadius: 1.5 + rand() * 4,
-            orbitSpeed: (rand() * 2 - 1) * 1.6,
-            phase: rand() * Math.PI * 2,
-            baseY: 0.8 + rand() * 2.8,
-            bobAmp: 0.3 + rand() * 1.0,
-            bobSpeed: 0.5 + rand() * 2.0,
-            light: {
-                position: vec3.create(0, 0, 0),
-                color,
-                intensity: 6 + rand() * 8,
-                range: 5 + rand() * 4,
-            },
+            cx,
+            cz,
+            orbitRadius,
+            orbitSpeed,
+            phase,
+            baseY,
+            bobAmp,
+            bobSpeed,
+            coneTilt,
+            spinSpeed,
+            spinPhase,
+            light: isSpot
+                ? {
+                      kind: "spot",
+                      position: vec3.create(0, 0, 0),
+                      // Overwritten every frame by animateLights; a placeholder
+                      // rather than a meaningful value.
+                      direction: vec3.create(0, -1, 0),
+                      color,
+                      // Brighter than the point lights: a cone concentrates the
+                      // same nominal intensity into a much smaller footprint, so
+                      // matching numbers would make the spots read as near-black
+                      // against them.
+                      intensity: intensity * 3,
+                      range,
+                      innerAngle: innerAngle,
+                      outerAngle: outerAngle,
+                  }
+                : {
+                      kind: "point",
+                      position: vec3.create(0, 0, 0),
+                      color,
+                      intensity,
+                      range,
+                  },
         });
     }
     return lights;
@@ -154,6 +226,21 @@ function animateLights(lights: AnimatedLight[], t: number) {
         const z = a.cz + Math.sin(angle) * a.orbitRadius;
         const y = a.baseY + Math.sin(t * a.bobSpeed + a.phase) * a.bobAmp;
         a.light.position = vec3.set(x, y, z, a.light.position as Float32Array);
+
+        if (a.light.kind === "spot") {
+            // Searchlight sweep: an axis held `coneTilt` off straight-down,
+            // rotating around Y at this light's own speed. Writing a unit vector
+            // here is not required (LightCuller normalizes on upload) but keeps
+            // the animation readable.
+            const sweep = a.spinPhase + a.spinSpeed * t;
+            const s = Math.sin(a.coneTilt);
+            a.light.direction = vec3.set(
+                s * Math.cos(sweep),
+                -Math.cos(a.coneTilt),
+                s * Math.sin(sweep),
+                a.light.direction as Float32Array,
+            );
+        }
     }
 }
 
@@ -228,7 +315,7 @@ const floorMaterial = new Material({baseColor: [0.5, 0.5, 0.52, 1], metallic: 0.
 scene.add(floorMesh, floorMaterial);
 
 const activeLights = buildLightField(LIGHT_COUNT);
-scene.pointLights = activeLights.map((a) => a.light);
+scene.lights = activeLights.map((a) => a.light);
 
 const triangles = floorMesh.indexCount / 3;
 
@@ -321,10 +408,10 @@ console.log("═".repeat(72));
 console.log(`    Resolution ............ ${ctx.width} x ${ctx.height}  (4x MSAA, immediate, ${CAP_FPS ? `${CAP_FPS} fps cap` : "uncapped"})`);
 console.log(`    GPU profiler .......... ${profiler ? `on (draw zones: ${profiler.canProfileDraws})` : "off  (--profile to enable)"}`);
 console.log(`    Depth prepass ......... ${PREPASS ? "on" : "off  (--no-prepass given)"}`);
-console.log(`    Point lights .......... ${LIGHT_COUNT}`);
+console.log(`    Lights ................ ${LIGHT_COUNT}   (${Math.round(LIGHT_COUNT * SPOT_FRACTION)} spot, ${LIGHT_COUNT - Math.round(LIGHT_COUNT * SPOT_FRACTION)} point — --spots 0..1)`);
 console.log(`    Cluster grid .......... ${CLUSTER_COUNT_X} x ${CLUSTER_COUNT_Y} x ${CLUSTER_COUNT_Z} = ${NUM_CLUSTERS} clusters`);
 console.log(`    Max lights / cluster .. ${MAX_LIGHTS_PER_CLUSTER}   (capacity cap)`);
-console.log(`    Max lights / scene .... ${MAX_POINT_LIGHTS}`);
+console.log(`    Max lights / scene .... ${MAX_LIGHTS}`);
 console.log(`    Forward draw calls .... 1   (${triangles} triangles — a single plane)`);
 console.log(
     `    Per frame ............. shadow + cluster-build + light-cull + ${PREPASS ? "depth-prepass + " : ""}forward + HDR post`,

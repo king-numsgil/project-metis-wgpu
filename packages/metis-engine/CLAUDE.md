@@ -441,7 +441,21 @@ a proper occluder-inclusive fit.
 ### What the forward pass actually costs — measure, don't guess
 
 Re-measure with `bun run bench:lights --profile`, which prints a per-pass GPU
-breakdown; sweep `--lights` to separate fixed cost from per-light cost.
+breakdown; sweep `--lights` to separate fixed cost from per-light cost, and
+`--lights 0` for the true zero-light floor (the reference every light-cost claim
+should be stated against).
+
+`--spots <0..1>` sets what fraction of the field is spot lights (default 0.5).
+Two things to know before comparing runs across it. **Spots are slightly
+*cheaper* than point lights here**, not more expensive — the per-fragment cone
+rejection means a spot shades less of the plane than a point light of the same
+range — so `--spots 0.5` is a *weaker* light-loop stress test than the all-point
+field, and shouldn't be quoted as the headline number. And `--spots 0`
+reproduces the pre-spot field **exactly**: the cone parameters are drawn from
+their own PRNG stream, so the main stream (positions, orbits, intensities) is
+untouched at any fraction. That property is deliberate and load-bearing for A/B
+— appending the cone draws to the main stream instead would shift every
+subsequent light and silently turn the baseline into a different scene.
 
 The forward pass is **light-loop bound, not shadow bound**. Sweeping light count
 gives an almost perfectly linear fit, and the constant term — which contains
@@ -508,11 +522,67 @@ quality.
 
 ### Why "clustered forward," concretely
 
-`ClusteredForwardRenderer.render()` does, every frame: (1) write the camera/environment uniforms, (2) fit one orthographic frustum per cascade to its slice of the camera frustum and render a depth-only pass from the sun's viewpoint per cascade (`shadow.wgsl`), (3) run two compute passes — `cluster_build.wgsl` divides the view frustum into a fixed 16×9×24 grid with exponential depth slicing, `light_cull.wgsl` sphere-tests every point light against every cluster's AABB and writes a per-cluster light-index list — then (4) the actual forward pass, where `forward.wgsl`'s fragment shader looks up its own cluster and only shades the lights assigned to it, plus the sun (shadow-tested) and a flat ambient term. See `math/Clustered forward formulas.md` for the exact formulas, including the two real bugs hit building this (a room mesh's shadow frustum computed from instance *position* instead of mesh *extent*, and shadow-pass backface culling dropping a room's inward-facing geometry when viewed from outside by the light) and how they were diagnosed.
+`ClusteredForwardRenderer.render()` does, every frame: (1) write the camera/environment uniforms, (2) fit one orthographic frustum per cascade to its slice of the camera frustum and render a depth-only pass from the sun's viewpoint per cascade (`shadow.wgsl`), (3) run two compute passes — `cluster_build.wgsl` divides the view frustum into a fixed 16×9×24 grid with exponential depth slicing, `light_cull.wgsl` sphere-tests every local light against every cluster's AABB and writes a per-cluster light-index list — then (4) the actual forward pass, where `forward.wgsl`'s fragment shader looks up its own cluster and only shades the lights assigned to it, plus the sun (shadow-tested) and a flat ambient term. See `math/Clustered forward formulas.md` for the exact formulas, including the two real bugs hit building this (a room mesh's shadow frustum computed from instance *position* instead of mesh *extent*, and shadow-pass backface culling dropping a room's inward-facing geometry when viewed from outside by the light) and how they were diagnosed.
 
 ### Exterior vs. interior is data, not code
 
 There's no `if (interior)` branch anywhere in the shading code. `Environment.ambientIntensity` (near 0 for `createExteriorEnvironment()`, a small nonzero value for `createInteriorEnvironment()`) is the only lighting-model difference between the two; the visual difference between the exterior and interior demos comes from geometry (a room shell with an actual hole cut into one wall — `assets/primitives.ts`'s `roomBox()`) and the directional shadow map actually occluding the sun everywhere except through that hole. See `math/PBR shading formulas.md`'s "ambient / exterior vs. interior" section.
+
+### Spot lights: one buffer, one cull pass, a cone applied per fragment
+
+Local lights are a **discriminated union** (`Light = PointLight | SpotLight`,
+tagged on `kind`) in a single `scene.lights` array. Both kinds share one GPU
+buffer, one cluster-cull pass, and one forward loop; only the per-fragment
+attenuation differs. `scene.pointLights` was renamed to `scene.lights` when this
+landed — a deliberate breaking change, since the old name became a lie.
+
+**Spot-ness is encoded, not branched.** `GpuLight` carries no `isSpot` flag.
+Instead a point light is written as a cone that cannot reject anything —
+`cosOuter = -2`, `spotScale = 1` — so `spotAttenuation`'s `clamp` saturates to
+exactly `1.0` for every possible direction, with no branch and no warp
+divergence. The proof that this is a true no-op is that every fixture golden came
+back **byte-identical** when spot lights were added: the point-light path is not
+merely close, it is bit-for-bit unchanged. That is the assertion worth keeping.
+
+**Spots are culled as spheres, and that was measured, not assumed.** The cluster
+pass treats a spot exactly like a point light — its full `range` sphere — so a
+narrow cone is over-included into clusters it doesn't light. The cone is then
+applied per fragment, where it doubles as an early-out costing a single dot
+product, exactly mirroring the squared-distance range rejection that already
+lives there. Cone-vs-cluster culling was costed and **deliberately deferred**:
+
+- The practical form is cone vs. the cluster AABB's *bounding sphere* (exact
+  cone/AABB has no clean closed form). That's roughly 2-3x the cull loop's ALU
+  plus a `sqrt` — still small, since the cull pass is nowhere near the frame's
+  bottleneck.
+- But the AABB→sphere bound is loose, and Z slicing is exponential, so far
+  clusters are elongated boxes whose bounding spheres eat much of the tightness
+  the cone was supposed to buy.
+- And the per-fragment cone rejection already recovers most of the win: an
+  over-included spot costs a dot product per fragment, not a Cook-Torrance
+  evaluation.
+
+So the remaining benefit is narrow and entirely scene-dependent (how many spots,
+how narrow, how much they overlap). It is a pure optimization touching only
+`light_cull.wgsl` with **zero API impact**, so it can be added and A/B'd whenever
+a real spot-heavy scene exists to measure against. Building it before that scene
+exists would be optimizing against a guessed workload. The one real cost of
+sphere culling meanwhile: spots count against `MAX_LIGHTS_PER_CLUSTER` in
+clusters they don't actually light.
+
+**Angles are half-angles in radians, and that is worth a test.** `innerAngle`/
+`outerAngle` measure from the cone's *axis* to its edge. This is the kind of
+mistake that renders perfectly plausibly while being wrong — a correctly-shaped
+cone of the wrong size — and comparing two cones can't detect it, because the
+*ratio* between two cones is nearly identical under a half-vs-full-angle
+confusion (`tan15/tan25 = 0.575` vs `tan7.5/tan12.5 = 0.594`). Only an absolute
+measurement discriminates, so `test/spotLight.test.ts` renders a hard-edged cone
+at a wall, finds the lit boundary, and converts it back to an angle.
+**Mutation-checked in both directions**: feeding it a full-angle interpretation
+makes it read 10.1 deg for a 20 deg cone, and breaking the point-light `cosOuter`
+sentinel makes the control test go black. Per this package's own history with
+`clusterNear.test.ts`, a passing render-based test proves nothing until you have
+seen it fail for the right reason.
 
 ### Ambient occlusion is a swappable enum, and only touches the ambient term
 
@@ -716,6 +786,6 @@ at 11 px, roughly 10x more than needed. Fixing that means keying the cache by
 ### Known limitations (not yet done)
 
 - No image-based lighting / environment reflections — a pure metal with no texture is lit only by direct lights, nothing else (see `math/PBR shading formulas.md`'s "Where the real handwave lives").
-- Point lights don't cast shadows, only the directional sun does.
+- Local lights (point and spot) don't cast shadows, only the directional sun does. Spot shadows were explicitly scoped out when spot lights were added — they'd need a per-light shadow map, an atlas to hold them, a light-view-proj per light, and N extra depth passes.
 - **Zero-thickness occluder geometry is the one case the shadow system genuinely cannot resolve** — occluder and receiver depths coincide at a shared edge, and no shadow-map representation can separate them. `roomBox` therefore builds solid-slab walls (0.2 units thick), so a corner's occluder record is the wall's sunlit exterior face and the depth gap is ~wall-thickness; a long-running concave-corner light leak in the interior demo was ultimately closed by exactly this, and it also paid for `SHADOW_MAP_SIZE` 4096 → 2048. Prefer closed/thick meshes for anything that must cast interior shadows. `normalOffset` is a texel-count quantity, computed per frame per cascade from that cascade's texel size (`SHADOW_NORMAL_OFFSET_TEXELS`/`_MIN`, uploaded in `CascadeUniforms.normalOffsets`), so it self-rescales with `SHADOW_MAP_SIZE`, `shadowDistance`, and the split scheme; see "Cascaded shadow maps" above.
 - The glTF loader (`assets/gltf.ts`) doesn't read a `TANGENT` accessor (fabricates an arbitrary perpendicular vector instead) and ignores any texture a glTF material references (factors only) — fine for the plain untextured "Box" sample it's validated against, wrong for a real normal-mapped/textured glTF asset. It also only handles a narrow subset generally: separate `.gltf` + `.bin` (no `.glb`, no embedded base64), `f32` POSITION/NORMAL/optional-TEXCOORD_0, `u16`/`u32` indices. Anything with skinning, morph targets, sparse accessors, or multiple buffers will throw.

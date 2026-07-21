@@ -10,7 +10,7 @@ import { Camera } from "../math/camera.ts";
 import { createTransform, normalMatrixFromModel, type Transform, transformToMat4 } from "../math/transform.ts";
 import { Std140Writer } from "../shading/std140.ts";
 import { createExteriorEnvironment, type Environment } from "./environment.ts";
-import type { PointLight } from "./light.ts";
+import type { Light } from "./light.ts";
 import type { Material } from "./material.ts";
 import type { Mesh } from "./mesh.ts";
 
@@ -75,7 +75,8 @@ export class Scene {
     camera = new Camera();
     environment: Environment = createExteriorEnvironment();
     instances: SceneInstance[] = [];
-    pointLights: PointLight[] = [];
+    /** Point + spot lights, culled per-cluster. Discriminate on `kind`. */
+    lights: Light[] = [];
 
     add(mesh: Mesh, material: Material, transform?: Partial<Transform>): SceneInstance {
         const instance = new SceneInstance(mesh, material, transform);

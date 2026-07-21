@@ -22,7 +22,7 @@
 @group(2) @binding(0) var<uniform> modelUniform: Model;
 
 @group(3) @binding(0) var<uniform> clusterParams: ClusterParams;
-@group(3) @binding(1) var<storage, read> pointLights: array<GpuPointLight>;
+@group(3) @binding(1) var<storage, read> lights: array<GpuLight>;
 @group(3) @binding(2) var<storage, read> clusterLightCounts: array<u32>;
 @group(3) @binding(3) var<storage, read> clusterLightIndices: array<u32>;
 
@@ -180,7 +180,7 @@ fn fs(input: VertexOutput) -> @location(0) vec4<f32> {
     let lightCountInCluster = clusterLightCounts[clusterIndex];
     for (var i: u32 = 0u; i < lightCountInCluster; i = i + 1u) {
         let lightIndex = clusterLightIndices[clusterIndex * maxPerCluster + i];
-        let light = pointLights[lightIndex];
+        let light = lights[lightIndex];
         let toLight = light.worldPosition - input.worldPosition;
         let distSq = dot(toLight, toLight);
         // Per-fragment range rejection. A cluster's light list is inherently
@@ -199,7 +199,21 @@ fn fs(input: VertexOutput) -> @location(0) vec4<f32> {
         }
         let dist = sqrt(distSq);
         let L = toLight / max(dist, 1e-5);
-        let attenuation = pointLightAttenuation(dist, light.range);
+        // Per-fragment cone rejection, the angular twin of the range rejection
+        // above and free for the same reason: the cluster pass culls a spot
+        // light by its full range *sphere*, so most fragments carrying one are
+        // outside its cone and would otherwise run the whole Cook-Torrance BRDF
+        // only to be multiplied by a spot factor of exactly 0. One dot product
+        // rejects them instead.
+        //
+        // Point lights are never rejected here — their cosOuter is -2, below
+        // every possible cosine (see common.wgsl's GpuLight), so this is
+        // uniformly false for them and costs only the dot.
+        let spot = spotAttenuation(L, light.worldDirection, light.cosOuter, light.spotScale);
+        if (spot <= 0.0) {
+            continue;
+        }
+        let attenuation = pointLightAttenuation(dist, light.range) * spot;
         let radiance = light.color * light.intensity * attenuation;
         color += shadeLight(N, V, L, radiance, albedo, metallic, roughness);
     }

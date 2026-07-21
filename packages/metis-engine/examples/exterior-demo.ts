@@ -83,9 +83,9 @@ const padMesh = new Mesh(ctx.device, cube(6, 0.1, 6), "deck");
 const padMaterial = new Material({baseColor: [0.15, 0.15, 0.17, 1], metallic: 0.1, roughness: 0.8});
 scene.add(padMesh, padMaterial, {position: vec3.create(0, -1.05, 0)});
 
-scene.pointLights.push(
-    {position: vec3.create(-1.6, 0.3, 0.8), color: [1, 0.15, 0.1], intensity: 6, range: 4},
-    {position: vec3.create(1.6, 0.3, 0.8), color: [0.1, 1, 0.2], intensity: 6, range: 4},
+scene.lights.push(
+    {kind: "point", position: vec3.create(-1.6, 0.3, 0.8), color: [1, 0.15, 0.1], intensity: 6, range: 4},
+    {kind: "point", position: vec3.create(1.6, 0.3, 0.8), color: [0.1, 1, 0.2], intensity: 6, range: 4},
 );
 
 // A textured piece of hull debris + a lit nav-beacon panel — showcasing

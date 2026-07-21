@@ -116,6 +116,24 @@ fn pointLightAttenuation(distance: f32, range: f32) -> f32 {
     return falloff * window * window;
 }
 
+// Cone falloff for a spot light, and **exactly 1.0 for a point light** — no
+// branch. `L` is the unit vector from the fragment *toward* the light, so
+// `-L` is the direction the light travels to reach it; dotting that with the
+// cone axis gives the cosine of the angle off-axis.
+//
+// The point-light case falls out of the encoding rather than being special-cased:
+// with cosOuter = -2 and spotScale = 1, and cos(angle) >= -1 always, the
+// argument to `clamp` is >= 1 for every possible direction, so it saturates to
+// 1.0. That is why GpuLight has no `isSpot` field.
+//
+// Squared for a softer edge, matching how pointLightAttenuation squares its own
+// window term. Squaring leaves the point-light case at exactly 1.0.
+fn spotAttenuation(L: vec3<f32>, coneAxis: vec3<f32>, cosOuter: f32, spotScale: f32) -> f32 {
+    let cosAngle = dot(-L, coneAxis);
+    let t = clamp((cosAngle - cosOuter) * spotScale, 0.0, 1.0);
+    return t * t;
+}
+
 // ── Clustered light culling — shared types ──────────────────────────────────
 // See math/Clustered forward formulas.md. Cluster grid is a fixed
 // clusterCounts.xyz tiling of the viewport; Z slices are exponential (Doom
@@ -131,13 +149,26 @@ struct ClusterParams {
     depthBounds: vec4<f32>,        // x = true camera near (slice 0's catch-all floor)
 };
 
-struct GpuPointLight {
+// One local light — point or spot. 64 bytes; keep in sync with LightCuller.write.
+//
+// Spot-ness is encoded in `cosOuter`/`spotScale` rather than a boolean, so the
+// forward pass needs no branch and no divergence (see spotAttenuation below):
+//   spot  -> cosOuter = cos(outerAngle), spotScale = 1/(cosInner - cosOuter)
+//   point -> cosOuter = -2,              spotScale = 1
+// `worldDirection` is meaningless for a point light and is written as zero.
+//
+// NB the direction is stored in **world** space, because the forward pass shades
+// in world space. The cull pass doesn't need it (every light is culled by its
+// range sphere); a future cone-culling pass would need a view-space copy too.
+struct GpuLight {
     worldPosition: vec3<f32>,
     range: f32,
     viewPosition: vec3<f32>,
     intensity: f32,
     color: vec3<f32>,
-    _pad: f32,
+    cosOuter: f32,
+    worldDirection: vec3<f32>,
+    spotScale: f32,
 };
 
 struct ClusterAABB {
