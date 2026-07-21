@@ -172,11 +172,15 @@ while (running) {
     }
 
     const turnSpeed = 1.5 * dt;
+    // Yaw sign is not arbitrary: `right` is cross(forward, up), which is -X when
+    // facing +Z, while increasing yaw rotates forward toward +X — so a *larger*
+    // yaw turns LEFT. These two were bound the other way round, which read as
+    // inverted steering. Strafing (A/D via `right`) was always correct.
     if (keys.has(SdlKeycode.Left)) {
-        yaw -= turnSpeed;
+        yaw += turnSpeed;
     }
     if (keys.has(SdlKeycode.Right)) {
-        yaw += turnSpeed;
+        yaw -= turnSpeed;
     }
     if (keys.has(SdlKeycode.Up)) {
         pitch = Math.min(pitch + turnSpeed, 1.4);
