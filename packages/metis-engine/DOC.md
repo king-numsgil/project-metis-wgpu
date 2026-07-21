@@ -151,7 +151,11 @@ Two responsibilities `RenderContext` would otherwise have handled for you:
   Forget the middle one and the forward pass keeps drawing at the old size.
 - **Teardown.** Destroy in dependency order: `forward.destroy()`,
   `post.pipeline.destroy()`, `hud?.destroy()`, `targets.destroy()`, then your
-  own `device.destroy()` / `wnd.destroy()` / `sdlQuit()`.
+  own `surface.destroy()` / `device.destroy()` / `wnd.destroy()` / `sdlQuit()`.
+  **`surface.destroy()` must come before `wnd.destroy()`** — dropping a surface
+  after its window (including implicitly, at process exit) segfaults on
+  Linux/X11. See `bun-webgpu-rs/DOC.md` §2. `RenderContext.destroy()` handles
+  this for you; on the caller-owned path it's yours to get right.
 
 Both consumers of the **output** format want your swapchain's format, never
 `HDR_COLOR_FORMAT` — they write the final target, after the tonemap.

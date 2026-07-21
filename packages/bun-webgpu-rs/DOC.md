@@ -63,6 +63,33 @@ surface.configure(device, { width: window.width, height: window.height }); // pr
 which then fails at `configure()` with `"No supported surface formats"`.
 `requestAdapterForWindow` builds a temp surface to guarantee compatibility.
 
+### Shutdown order — `surface.destroy()` before `window.destroy()`
+
+```ts
+surface.destroy();   // FIRST — before the window it was created from
+device.destroy();
+window.destroy();
+sdlQuit();
+```
+
+**Skipping `surface.destroy()` segfaults on Linux/X11, reliably** — including
+when the surface would otherwise just be dropped at process exit, which is why
+this shows up as "the app crashes when I close it" rather than as anything a
+`try`/`catch` can see.
+
+A surface's teardown talks to the window system: Mesa's Vulkan drivers destroy
+per-swapchain-image X11 present fences via `xcb_sync_destroy_fence`, on the xcb
+connection SDL owns. `SDL_DestroyWindow`/`SDL_Quit` close and free that
+connection, so a surface torn down afterwards calls through a dangling pointer
+and dies inside `libxcb` — several frames below any of this crate's code in the
+backtrace, and *after* your last line of JS has run.
+
+`destroy()` is idempotent; every other `GpuSurface` method throws
+`"Surface has been destroyed"` afterwards. `tests/surface-teardown.test.ts`
+pins the ordering (in a subprocess — the failure is a process-level crash, not a
+catchable error). `metis-engine`'s `RenderContext.destroy()` already does this
+for you.
+
 > **`surface.getPreferredFormat()` is not a cheap getter — never call it per
 > frame.** It re-queries the driver (`get_capabilities`: formats, present modes,
 > alpha modes) on every call: **~6 ms** on a GTX 1070 / Vulkan / Windows. Resolve

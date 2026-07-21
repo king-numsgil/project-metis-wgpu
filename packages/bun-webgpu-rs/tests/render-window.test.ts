@@ -129,6 +129,7 @@ describe("render-window", () => {
 
         // ── Cleanup ───────────────────────────────────────────────────────────────
         offscreen.destroy();
+        surface.destroy(); // must precede window.destroy() — see GpuSurface::destroy
         window.destroy();
         sdlQuit();
 

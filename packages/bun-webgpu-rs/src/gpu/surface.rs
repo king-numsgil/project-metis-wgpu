@@ -141,7 +141,10 @@ pub struct SurfaceConfiguration {
 
 #[napi]
 pub struct GpuSurface {
-    pub(crate) inner: wgpu::Surface<'static>,
+    /// `None` after `destroy()`. The surface is droppable on demand because it
+    /// **must** be dropped before the window it was created from — see
+    /// `destroy()` for why that ordering is load-bearing rather than tidy.
+    pub(crate) inner: Mutex<Option<wgpu::Surface<'static>>>,
     pub(crate) adapter: Arc<wgpu::Adapter>,
 }
 
@@ -162,7 +165,9 @@ impl GpuSurface {
     /// value that could change mid-run would be a bug, not a feature.
     #[napi(ts_return_type = "GPUTextureFormat")]
     pub fn get_preferred_format(&self) -> napi::Result<String> {
-        let caps = self.inner.get_capabilities(&self.adapter);
+        let guard = self.inner.lock().unwrap();
+        let surface = Self::alive(&guard)?;
+        let caps = surface.get_capabilities(&self.adapter);
         caps.formats
             .first()
             .map(|f| convert::texture_format_to_str(*f).to_string())
@@ -183,7 +188,9 @@ impl GpuSurface {
             ));
         }
 
-        let caps = self.inner.get_capabilities(&self.adapter);
+        let guard = self.inner.lock().unwrap();
+        let surface = Self::alive(&guard)?;
+        let caps = surface.get_capabilities(&self.adapter);
 
         let format = if let Some(ref f) = config.format {
             convert::texture_format(f)?
@@ -250,7 +257,7 @@ impl GpuSurface {
             _ => *caps.alpha_modes.first().unwrap_or(&wgpu::CompositeAlphaMode::Auto),
         };
 
-        self.inner.configure(
+        surface.configure(
             &device.inner,
             &wgpu::SurfaceConfiguration {
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -270,12 +277,47 @@ impl GpuSurface {
     /// `GpuSurfaceTexture` after submitting your render commands.
     #[napi]
     pub fn get_current_texture(&self) -> napi::Result<GpuSurfaceTexture> {
-        let frame = self
-            .inner
+        let guard = self.inner.lock().unwrap();
+        let surface = Self::alive(&guard)?;
+        let frame = surface
             .get_current_texture()
             .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
         Ok(GpuSurfaceTexture {
             inner: Mutex::new(Some(frame)),
+        })
+    }
+
+    /// Release the swapchain and the underlying `VkSurfaceKHR` / platform
+    /// surface. Idempotent; every method above returns an error afterwards.
+    ///
+    /// **Call this before `window.destroy()` and `sdlQuit()`.** It is not
+    /// optional bookkeeping — leaving it to the automatic drop at process exit
+    /// is a segfault on Linux/X11, reliably. A surface's teardown talks to the
+    /// window system: Mesa's Vulkan drivers destroy per-swapchain-image X11
+    /// present fences via `xcb_sync_destroy_fence`, on the xcb connection SDL
+    /// owns. `SDL_DestroyWindow`/`SDL_Quit` close that connection and free it,
+    /// so a surface dropped afterwards makes xcb calls through a dangling
+    /// connection pointer and crashes inside libxcb — far from the real cause,
+    /// with the addon nowhere near the top of the backtrace.
+    ///
+    /// The old `create_surface` doc ("the window must remain alive for the
+    /// entire lifetime of the surface") stated this invariant but gave callers
+    /// no way to *end* the surface's lifetime early, so it was unsatisfiable at
+    /// shutdown. This is that way.
+    #[napi]
+    pub fn destroy(&self) {
+        // Dropping the Surface destroys the swapchain and the platform surface.
+        drop(self.inner.lock().unwrap().take());
+    }
+
+    fn alive<'a>(
+        guard: &'a std::sync::MutexGuard<'_, Option<wgpu::Surface<'static>>>,
+    ) -> napi::Result<&'a wgpu::Surface<'static>> {
+        guard.as_ref().ok_or_else(|| {
+            napi::Error::new(
+                napi::Status::GenericFailure,
+                "Surface has been destroyed",
+            )
         })
     }
 }
@@ -338,7 +380,9 @@ impl GpuSurfaceTexture {
 /// Create a wgpu rendering surface backed by an SDL3 window.
 ///
 /// The `SdlWindow` must remain alive (and unclosed) for the entire lifetime of
-/// the returned `GpuSurface`.
+/// the returned `GpuSurface` — so at shutdown call `surface.destroy()` *before*
+/// `window.destroy()` / `sdlQuit()`. Skipping it segfaults on Linux/X11; see
+/// `GpuSurface::destroy`.
 #[napi]
 pub fn create_surface(adapter: &GpuAdapter, window: &SdlWindow) -> napi::Result<GpuSurface> {
     let (raw_window_handle, raw_display_handle) = get_raw_handles(window.raw_ptr())?;
@@ -352,7 +396,7 @@ pub fn create_surface(adapter: &GpuAdapter, window: &SdlWindow) -> napi::Result<
     }
         .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
     Ok(GpuSurface {
-        inner: surface,
+        inner: Mutex::new(Some(surface)),
         adapter: Arc::clone(&adapter.inner),
     })
 }

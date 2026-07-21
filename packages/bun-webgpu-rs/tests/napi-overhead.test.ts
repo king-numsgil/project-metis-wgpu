@@ -224,6 +224,7 @@ describe("napi-overhead", () => {
             }
 
             // ── 4. Cleanup ─────────────────────────────────────────────────────────
+            surface.destroy(); // must precede window.destroy() — see GpuSurface::destroy
             window.destroy();
             sdlQuit();
 

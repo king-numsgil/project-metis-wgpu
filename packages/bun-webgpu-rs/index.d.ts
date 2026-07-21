@@ -421,6 +421,26 @@ export declare class GpuSurface {
    * `GpuSurfaceTexture` after submitting your render commands.
    */
   getCurrentTexture(): GpuSurfaceTexture
+  /**
+   * Release the swapchain and the underlying `VkSurfaceKHR` / platform
+   * surface. Idempotent; every method above returns an error afterwards.
+   *
+   * **Call this before `window.destroy()` and `sdlQuit()`.** It is not
+   * optional bookkeeping — leaving it to the automatic drop at process exit
+   * is a segfault on Linux/X11, reliably. A surface's teardown talks to the
+   * window system: Mesa's Vulkan drivers destroy per-swapchain-image X11
+   * present fences via `xcb_sync_destroy_fence`, on the xcb connection SDL
+   * owns. `SDL_DestroyWindow`/`SDL_Quit` close that connection and free it,
+   * so a surface dropped afterwards makes xcb calls through a dangling
+   * connection pointer and crashes inside libxcb — far from the real cause,
+   * with the addon nowhere near the top of the backtrace.
+   *
+   * The old `create_surface` doc ("the window must remain alive for the
+   * entire lifetime of the surface") stated this invariant but gave callers
+   * no way to *end* the surface's lifetime early, so it was unsatisfiable at
+   * shutdown. This is that way.
+   */
+  destroy(): void
 }
 
 export declare class GpuSurfaceTexture {
@@ -696,7 +716,9 @@ export interface BallDelta {
  * Create a wgpu rendering surface backed by an SDL3 window.
  *
  * The `SdlWindow` must remain alive (and unclosed) for the entire lifetime of
- * the returned `GpuSurface`.
+ * the returned `GpuSurface` — so at shutdown call `surface.destroy()` *before*
+ * `window.destroy()` / `sdlQuit()`. Skipping it segfaults on Linux/X11; see
+ * `GpuSurface::destroy`.
  */
 export declare function createSurface(adapter: GpuAdapter, window: SdlWindow): GpuSurface
 

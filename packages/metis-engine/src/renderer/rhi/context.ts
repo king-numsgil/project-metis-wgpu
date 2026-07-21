@@ -364,6 +364,10 @@ export class RenderContext {
     destroy() {
         this.targets.destroy();
         this.offscreenTarget?.destroy();
+        // The surface must go before the window: its teardown talks to the
+        // window system, and SDL_DestroyWindow/sdlQuit close the connection it
+        // needs. Dropping it afterwards segfaults inside libxcb on Linux/X11.
+        this.surface?.destroy();
         this.device.destroy();
         if (this.window) {
             this.window.destroy();

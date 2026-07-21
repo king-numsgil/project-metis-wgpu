@@ -392,6 +392,9 @@ forward.destroy();
 post.pipeline.destroy();
 hud.destroy();
 targets.destroy();
+// Before the window — the surface's teardown talks to the window system, and
+// wnd.destroy()/sdlQuit() close the connection it needs (segfaults on X11).
+surface.destroy();
 device.destroy();
 wnd.destroy();
 sdlQuit();

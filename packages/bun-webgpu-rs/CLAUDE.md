@@ -289,6 +289,53 @@ per frame must be expensive" is wrong by two orders of magnitude here.
 - VSync throttling happens in `getCurrentTexture()` (not `present()`) on DirectX backends. Use `presentMode: 'immediate'` to measure raw CPU costs.
 - **`configure()`'s default present mode is `Mailbox`** (fifo fallback if unsupported) — set in `surface.rs`. This is deliberate: `Fifo`/`AutoVsync` were found to stall `getCurrentTexture()` for a periodic ~50 ms burst on this machine's Vulkan driver when the app renders faster than refresh (a metronomic stutter, diagnosed via a per-phase frame profiler in `metis-game`). `Mailbox` is tear-free and doesn't exhibit it, but is uncapped — pair it with `metis-engine`'s `FrameLimiter` for a frame cap. Don't "restore" a fifo default without re-checking that stall.
 
+### A surface outliving its window is a segfault, not a leak
+
+`GpuSurface::destroy()` exists because **the surface must be released before the
+window it was created from**, and until it existed there was no way to do that.
+The symptom was "every demo segfaults when you press Escape" — on Linux/X11,
+100% reproducible, and only there.
+
+The mechanism: a surface's teardown talks to the window system. Mesa's Vulkan
+drivers destroy per-swapchain-image X11 present fences via
+`xcb_sync_destroy_fence`, on the xcb connection **SDL owns**.
+`SDL_DestroyWindow`/`SDL_Quit` close and free that connection, so a surface
+dropped afterwards calls through a dangling connection pointer. Backtrace:
+
+```
+libxcb  ← SIGSEGV
+xcb_sync_destroy_fence   (libxcb-sync)
+libvulkan_intel          (swapchain teardown)
+bun-webgpu-rs.node       (napi drop of GpuSurface)
+```
+
+**Three things made it hard to see, and they generalise.** The crash is in
+`libxcb` with this crate four frames down and *no* Rust symbol at the top. It
+happens during **process exit**, after the last line of JS has run — so the app
+prints its success message, then dies, and nothing `try`/`catch` can reach it.
+And it needs no explicit mistake to trigger: **just dropping the surface at exit
+is enough**, so code that never mentions the surface again still crashes. That
+last property is why it presented as a platform bug rather than a lifetime bug.
+
+`create_surface`'s doc comment already said "the window must remain alive for
+the entire lifetime of the surface" — a correct invariant that was
+*unsatisfiable*, because nothing could end the surface's lifetime early. **A
+documented invariant with no API to honour it is a latent crash**, and that is
+the general lesson here: when adding a "must outlive" note, check the caller has
+a way to comply.
+
+Why it never showed on Windows: DXGI/D3D12 surface teardown doesn't reach back
+into a window-system connection object the way xcb does, so the same
+out-of-order drop is benign there. A lifetime bug that is only *fatal* on one
+platform is still a lifetime bug on all of them.
+
+`tests/surface-teardown.test.ts` pins it, **in a subprocess** — the failure is a
+process-level crash, so in-process it would take the test runner down instead of
+failing a test (same reason and shape as the VectorContext panic matrix above).
+It asserts on the exit code *and* a completion marker: mutation-checked, the old
+ordering exits **132**, but it still prints the marker first, so the marker alone
+would not catch it.
+
 ---
 
 ## Event system
