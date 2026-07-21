@@ -189,6 +189,60 @@ async function renderSpotlights() {
     });
 }
 
+/**
+ * Spot shadows: two identical cones, one `castsShadow`, one not, each aimed at
+ * a deck with a solid pillar standing in the beam.
+ *
+ * The A/B pairing is the point. A single shadowed cone proves little — a bug
+ * that darkened everything, or one that shadowed nothing, both still render a
+ * plausible cone. Side by side, the *difference* between the halves is the
+ * assertion: the left pillar must throw a visible shadow across the deck, the
+ * right one must not, and everything else about the two halves must match.
+ */
+async function renderSpotShadows() {
+    await renderToFile("spot-shadows", "METIS-ENGINE // SPOT SHADOWS", (device) => {
+        const scene = new Scene();
+        scene.environment = createInteriorEnvironment();
+        scene.environment.sunIntensity = 0.02;
+        scene.environment.ambientIntensity = 0.02;
+        scene.camera.position = vec3.create(0, 6, 9);
+        scene.camera.target = vec3.create(0, 0, -0.5);
+
+        const deck = new Mesh(device, plane(24, 24), "deck");
+        const deckMaterial = new Material({baseColor: [0.55, 0.55, 0.58, 1], metallic: 0.0, roughness: 0.75});
+        scene.add(deck, deckMaterial, {position: vec3.create(0, -1, 0)});
+
+        // One pillar per cone, same size, same offset within its own beam.
+        const pillar = new Mesh(device, cube(0.6, 2.2, 0.6), "pillar");
+        const pillarMaterial = new Material({baseColor: [0.75, 0.7, 0.65, 1], metallic: 0.0, roughness: 0.6});
+        scene.add(pillar, pillarMaterial, {position: vec3.create(-3.5, 0.1, 0)});
+        scene.add(pillar, pillarMaterial, {position: vec3.create(3.5, 0.1, 0)});
+
+        const cone = {
+            direction: vec3.create(0, -1, 0),
+            color: [1, 0.96, 0.9] as [number, number, number],
+            intensity: 90,
+            range: 14,
+            innerAngle: (14 * Math.PI) / 180,
+            outerAngle: (30 * Math.PI) / 180,
+        };
+        // Each light is offset from its pillar by the SAME relative vector, so
+        // the two halves are geometrically identical and `castsShadow` is the
+        // only difference between them. Offsetting matters: a light directly
+        // overhead throws its shadow straight down, where the pillar itself
+        // hides it — which would look like a working shadow and a broken one
+        // alike.
+        scene.lights.push(
+            // Left: casts. The pillar should throw a shadow across the deck.
+            {kind: "spot", position: vec3.create(-4.6, 4.2, -1.2), castsShadow: true, ...cone},
+            // Right: identical but does not cast — the control.
+            {kind: "spot", position: vec3.create(2.4, 4.2, -1.2), ...cone},
+        );
+
+        return scene;
+    });
+}
+
 async function renderInterior() {
     await renderToFile("interior", "METIS-ENGINE // INTERIOR", (device) => {
         const scene = new Scene();
@@ -499,6 +553,7 @@ async function renderTexturedDemo() {
 
 await renderExterior();
 await renderSpotlights();
+await renderSpotShadows();
 await renderInterior();
 await renderHdrClipComparison();
 await renderGltfDemo();

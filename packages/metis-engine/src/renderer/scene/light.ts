@@ -44,6 +44,19 @@ export interface SpotLight extends LightBase {
      * rather than producing anything invalid.
      */
     outerAngle: number;
+    /**
+     * Render a shadow map for this light, so it is occluded by geometry rather
+     * than shining through walls.
+     *
+     * At most `MAX_SHADOW_SPOTS` spots can cast at once; if more are flagged,
+     * the first that many **in `scene.lights` order** win and the rest still
+     * light normally but cast nothing (with a one-time console warning). Each
+     * caster costs one extra depth pass over the geometry inside its cone, so
+     * treat this as a budget to spend on the lights that carry a scene, not a
+     * default. Point lights cannot cast shadows at all — see CLAUDE.md "Spot
+     * light shadows".
+     */
+    castsShadow?: boolean;
 }
 
 /**

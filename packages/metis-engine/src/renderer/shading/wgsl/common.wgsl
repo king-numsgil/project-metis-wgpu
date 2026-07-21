@@ -171,6 +171,25 @@ struct GpuLight {
     spotScale: f32,
 };
 
+// Per-frame spot-light shadow data. Keep MAX_SHADOW_SPOTS (4) in sync with
+// spotShadows.ts — WGSL array lengths must be compile-time constant, which is
+// why the cap isn't a runtime dial.
+//
+// A light's index in the light buffer IS its shadow-map layer: LightCuller
+// packs the shadow-casting spots first, so `lightIndex < params.x` both tests
+// "does this light cast?" and names its layer. That invariant is what lets
+// GpuLight stay at 64 bytes with no shadow-index field.
+struct SpotShadowUniforms {
+    lightViewProj: array<mat4x4<f32>, 4>,
+    // Per-light world size of one shadow texel *per unit distance* from the
+    // light. A spot map is perspective, so texel footprint grows with depth —
+    // the shader scales this by the receiver's distance instead of using a
+    // fixed world-space offset the way the ortho cascades can.
+    texelScale: vec4<f32>,
+    // x = active shadow-casting spot count, y = map size, z = normal-offset texels
+    params: vec4<f32>,
+};
+
 struct ClusterAABB {
     minPoint: vec3<f32>,
     _pad0: f32,

@@ -11,6 +11,7 @@ import {
 import { mat4, vec3 } from "wgpu-matrix";
 import type { GpuProfiler } from "../debug/gpuProfiler.ts";
 import type { RenderTargets } from "../rhi/targets.ts";
+import type { Light, SpotLight } from "../scene/light.ts";
 import type { Scene } from "../scene/scene.ts";
 import {
     CLUSTER_COUNT_X,
@@ -176,7 +177,7 @@ export class LightCuller {
     }
 
     /** Uploads the cluster params + packed point-light array for this frame. Call before `cull`. */
-    write(scene: Scene, targets: RenderTargets) {
+    write(scene: Scene, targets: RenderTargets, shadowSpots: SpotLight[] = []) {
         const invProj = mat4.invert(scene.camera.projectionMatrix());
         const params = new Std140Writer();
         params.mat4(invProj);
@@ -189,7 +190,16 @@ export class LightCuller {
         const clusterNear = Math.max(scene.camera.clusterNear, 1e-4);
         params.vec4(targets.width, targets.height, clusterNear, scene.camera.clusterFar);
         params.vec4u(CLUSTER_COUNT_X, CLUSTER_COUNT_Y, CLUSTER_COUNT_Z, MAX_LIGHTS_PER_CLUSTER);
-        const lightCount = Math.min(scene.lights.length, MAX_LIGHTS);
+        // Shadow-casting spots first, in exactly the order SpotShadows rendered
+        // them: a light's buffer index doubles as its shadow-map layer, which is
+        // what keeps GpuLight at 64 bytes with no shadow-index field. Get this
+        // ordering wrong and fragments are shadowed by the wrong light's map —
+        // a plausible-looking image, not a crash. `orderedLights` is derived
+        // once per frame by the renderer and shared with SpotShadows precisely
+        // so the two cannot disagree.
+        const casters = new Set<Light>(shadowSpots);
+        const ordered: Light[] = [...shadowSpots, ...scene.lights.filter((l) => !casters.has(l))];
+        const lightCount = Math.min(ordered.length, MAX_LIGHTS);
         params.vec4u(lightCount, 0, 0, 0);
         // True camera near — slice 0's AABB reaches down to this so geometry
         // closer than clusterNear keeps a correct light list.
@@ -199,7 +209,7 @@ export class LightCuller {
         const view = scene.camera.viewMatrix();
         const lights = new Std140Writer();
         for (let i = 0; i < lightCount; i++) {
-            const light = scene.lights[i]!;
+            const light = ordered[i]!;
             const viewPos = vec3.transformMat4(light.position, view);
             lights.vec3(light.position, light.range);
             lights.vec3(viewPos, light.intensity);
@@ -224,9 +234,9 @@ export class LightCuller {
         if (lightCount > 0) {
             this.device.queue.writeBuffer(this.lightsBuffer, 0, lights.toBytes());
         }
-        if (scene.lights.length > MAX_LIGHTS) {
+        if (ordered.length > MAX_LIGHTS) {
             console.warn(
-                `metis-engine: scene has ${scene.lights.length} lights, ` +
+                `metis-engine: scene has ${ordered.length} lights, ` +
                 `only the first ${MAX_LIGHTS} are rendered (MAX_LIGHTS).`,
             );
         }

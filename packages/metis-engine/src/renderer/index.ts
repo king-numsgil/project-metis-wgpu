@@ -22,6 +22,7 @@ export type { Environment } from "./scene/environment.ts";
 export { Scene, SceneInstance } from "./scene/scene.ts";
 
 export { ClusteredForwardRenderer } from "./shading/clusteredForwardRenderer.ts";
+export { MAX_SHADOW_SPOTS, SPOT_SHADOW_MAP_SIZE } from "./shading/spotShadows.ts";
 export * from "./shading/clusterConfig.ts";
 export { Std140Writer } from "./shading/std140.ts";
 

@@ -12,6 +12,7 @@
         "fixture": "bun run test/fixture.ts",
         "demo:exterior": "bun run examples/exterior-demo.ts",
         "demo:interior": "bun run examples/interior-demo.ts",
+        "demo:spots": "bun run examples/spots-demo.ts",
         "bench:lights": "bun run bench/lights.ts"
     },
     "devDependencies": {

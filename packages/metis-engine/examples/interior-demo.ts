@@ -96,6 +96,7 @@ scene.lights.push(
         kind: "spot",
         position: vec3.create(0, 3.8, 3),
         direction: vec3.create(0, -1, -0.25),
+        castsShadow: true,
         color: [0.7, 0.85, 1],
         intensity: 40,
         range: 10,

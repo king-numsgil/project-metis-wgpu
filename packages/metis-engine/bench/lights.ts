@@ -39,6 +39,7 @@ import {
     Material,
     MAX_LIGHTS_PER_CLUSTER,
     MAX_LIGHTS,
+    MAX_SHADOW_SPOTS,
     Mesh,
     mulberry32,
     NUM_CLUSTERS,
@@ -106,6 +107,17 @@ const PREPASS = !flag("no-prepass");
 // rand() sequence therefore doesn't depend on this fraction. That is what makes
 // `--spots 0` a valid A/B baseline rather than merely a similar scene.
 const SPOT_FRACTION = Math.min(Math.max(num("spots", 0.5), 0), 1);
+// How many of the spot lights cast shadows (0..MAX_SHADOW_SPOTS). Each costs
+// one extra depth pass over whatever geometry survives its frustum cull.
+// `--shadow-spots 0` removes the cost entirely (the passes still run, but only
+// to clear their layer).
+//
+// NB this bench is a *single large plane*, which is the worst possible case for
+// the frustum culling that makes spot shadows affordable: one instance, always
+// intersecting every cone. The numbers here therefore measure pass and
+// rasterization overhead only, and say nothing about how well culling performs
+// on a real interior. See CLAUDE.md "Spot light shadows".
+const SHADOW_SPOTS = Math.min(Math.max(Math.round(num("shadow-spots", MAX_SHADOW_SPOTS)), 0), MAX_SHADOW_SPOTS);
 
 // The plane the lights hover over, and the volume the lights animate within.
 const PLANE_SIZE = 60;
@@ -206,6 +218,8 @@ function buildLightField(count: number): AnimatedLight[] {
                       range,
                       innerAngle: innerAngle,
                       outerAngle: outerAngle,
+                      // The first SHADOW_SPOTS spots in the field cast.
+                      castsShadow: i < SHADOW_SPOTS,
                   }
                 : {
                       kind: "point",
@@ -408,7 +422,7 @@ console.log("═".repeat(72));
 console.log(`    Resolution ............ ${ctx.width} x ${ctx.height}  (4x MSAA, immediate, ${CAP_FPS ? `${CAP_FPS} fps cap` : "uncapped"})`);
 console.log(`    GPU profiler .......... ${profiler ? `on (draw zones: ${profiler.canProfileDraws})` : "off  (--profile to enable)"}`);
 console.log(`    Depth prepass ......... ${PREPASS ? "on" : "off  (--no-prepass given)"}`);
-console.log(`    Lights ................ ${LIGHT_COUNT}   (${Math.round(LIGHT_COUNT * SPOT_FRACTION)} spot, ${LIGHT_COUNT - Math.round(LIGHT_COUNT * SPOT_FRACTION)} point — --spots 0..1)`);
+console.log(`    Lights ................ ${LIGHT_COUNT}   (${Math.round(LIGHT_COUNT * SPOT_FRACTION)} spot, ${LIGHT_COUNT - Math.round(LIGHT_COUNT * SPOT_FRACTION)} point — --spots 0..1, ${SHADOW_SPOTS} casting shadows)`);
 console.log(`    Cluster grid .......... ${CLUSTER_COUNT_X} x ${CLUSTER_COUNT_Y} x ${CLUSTER_COUNT_Z} = ${NUM_CLUSTERS} clusters`);
 console.log(`    Max lights / cluster .. ${MAX_LIGHTS_PER_CLUSTER}   (capacity cap)`);
 console.log(`    Max lights / scene .... ${MAX_LIGHTS}`);

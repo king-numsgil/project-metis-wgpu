@@ -58,6 +58,7 @@ bun run fixture && git status --short test/output
 # Interactive windowed demos (WASD+QE fly, arrows look, Esc quit)
 bun run demo:exterior
 bun run demo:interior
+bun run demo:spots      # spot-shadow visual test (L toggles shadows, Space pauses orbit)
 
 # Standalone VectorContext (text rendering) smoke test
 bun run test/vectorText.smoke.ts
@@ -584,6 +585,91 @@ sentinel makes the control test go black. Per this package's own history with
 `clusterNear.test.ts`, a passing render-based test proves nothing until you have
 seen it fail for the right reason.
 
+### Spot light shadows — a fixed budget, and the culling that pays for it
+
+Up to `MAX_SHADOW_SPOTS` (4) spot lights may be flagged `castsShadow`. Each gets
+one perspective depth pass into its own layer of a `depth_2d_array`, sampled in
+the forward pass with the same comparison sampler and 3x3 PCF the sun cascades
+use. Point lights **cannot** cast: that needs a cube map, which is 6x the passes
+*and* 6x the draws, and point lights here exist for detail and fake emissive
+glow rather than for lighting a space.
+
+**`MAX_SHADOW_SPOTS` is a compile-time constant, not a runtime dial.** It sizes
+the depth array and the `array<mat4x4, 4>` in `SpotShadowUniforms`, and WGSL
+array lengths must be constant. Changing it is a one-line edit plus a rebuild;
+the *active* count is a uniform, so scenes below the cap cost nothing extra.
+Four is a budget to spend deliberately, not a target to fill.
+
+**A light's buffer index is its shadow-map layer.** `LightCuller.write` packs the
+shadow-casting spots first, so `lightIndex < activeCount` simultaneously answers
+"does this light cast?" and "which layer?". That is what let `GpuLight` stay at
+64 bytes — it is exactly full, with no padding to steal for a shadow index. The
+cost is an ordering invariant, and the failure mode if it breaks is nasty:
+fragments shadowed by the *wrong* light's map, which renders plausibly. It is
+kept safe by deriving the caster list **once** per frame in
+`ClusteredForwardRenderer.render` (`selectShadowCastingSpots`) and handing the
+same array to both the culler and `SpotShadows`. Do not re-derive it in either
+place.
+
+**Frustum culling shipped with this, deliberately, and it is the load-bearing
+part.** There is no frustum culling anywhere else in the engine — every cascade
+and the forward pass both redraw every instance. Spot shadows are where it
+finally pays, because of an asymmetry worth internalising:
+
+- A **cascade's** ortho frustum is fit to a slice of the camera frustum, so
+  essentially everything the camera can see is inside it. Culling wins little.
+- A **spot's** frustum is a genuinely tight bounded volume — a cone capped by
+  `range`. In a corridor, most of a ship falls outside it. Culling wins a lot.
+
+`math/frustum.ts` extracts the six planes (Gribb-Hartmann) and tests each
+instance's world bounding sphere. **The planes use WebGPU's `[0,1]` depth
+convention, not OpenGL's `[-1,1]`** — the near plane is `row2` alone, not
+`row3 + row2`. The GL form compiles and looks reasonable and puts the near plane
+in the wrong place, which culls geometry that is genuinely visible; that shows up
+as objects near the light losing their shadow, not as anything obviously wrong.
+`test/spotShadow.test.ts` pins near/far/side cases on the CPU for that reason.
+
+World spheres come from each instance's **model matrix**, not its `Transform`,
+because `modelMatrixOverride` (the glTF path) bypasses `Transform` entirely, and
+reading position off the transform would silently mis-place those instances.
+They're computed once per frame and reused across all four light frusta.
+
+**Measuring it: `bun run bench:lights --profile --shadow-spots 0..4`.** Each
+casting light gets its own `spot-shadow-N` span. Two caveats before trusting
+those numbers:
+
+- **The bench scene is one big plane**, which is the *worst* case for culling:
+  a single instance that always intersects every cone. The bench measures pass
+  and rasterization overhead only; it says nothing about how much culling saves
+  on a real interior, which is the whole point of having it. Judge culling on a
+  geometry-dense scene or not at all.
+- **Unused layers still run a clear pass.** That's why `--shadow-spots 0` still
+  shows four spans. A stale layer would otherwise be sampled by whichever light
+  inherited that index later.
+
+**The visual test is `bun run demo:spots`**: a metallic sphere on a deck under
+the sun plus four differently-coloured orbiting casters (exactly
+`MAX_SHADOW_SPOTS`). Four *coloured* lights is the deliberate choice — with
+overlapping white lights a shadow is just "darker" and a half-broken one looks
+fine, but with coloured lights each shadow is the region where one specific
+colour is missing, so the deck shows four distinctly hued spokes and any light
+whose map is wrong, stale, or indexed to the wrong layer shows up as the wrong
+colour in the wrong place. `L` toggles all four casters for a direct A/B; the HUD
+reports the frustum cull's drawn/candidate ratio live.
+
+**Zone selection belongs to scene code, not the renderer.** The intent is that a
+game layer flips `castsShadow` as the player moves between spaces — the galley's
+fixtures, then the cargo bay's. The renderer takes "here are the flagged spots"
+and knows nothing about rooms, portals, or zones. Keep that boundary; it is what
+lets a real zone system arrive later without touching the render path.
+
+Known rough edges, deliberate for now: shadow maps are re-rendered every frame
+even when neither the light nor the geometry moved (caching static casters is the
+obvious next win, and probably a bigger one than any micro-optimization here);
+resolution is fixed per light rather than scaled by importance or distance (an
+atlas rather than an array would be the enabling change); and there is no
+filtering beyond 3x3 PCF.
+
 ### Ambient occlusion is a swappable enum, and only touches the ambient term
 
 `ClusteredForwardRenderer` owns an `AmbientOcclusion` (`src/renderer/ao/`); set `renderer.ao.technique` to `AoTechnique.None`, `.SSAO`, or `.HBAO` (a runtime quality dial — the interior demo cycles it with the `O` key). When active it runs three passes *before* the forward pass — a geometry prepass (view-space normals + depth), the chosen occlusion technique (`ssao.wgsl`/`hbao.wgsl`, fullscreen), and a box blur — and `forward.wgsl` multiplies the result into **only** the flat ambient term. That last part is the load-bearing correctness point: AO approximates occlusion of *indirect/bounce* light, so it must never darken the sun or point lights (their occlusion is the shadow map's job). Multiplying the whole lit image by AO — which some engines do — double-darkens shadowed creases and is wrong. `None` is branchless: the renderer clears the AO buffer to white so the forward multiply is a no-op, mirroring the always-bound-placeholder pattern the material textures already use. Both techniques' math (and the deliberate normal-oriented HBAO tangent simplification) is in `math/Ambient occlusion formulas.md`; `test/ao.test.ts` validates the kernel generators on the CPU and, via GPU readback + a `pushErrorScope`, that each technique darkens a box's contact creases without any swallowed WGSL validation error. The prepass is a *second* geometry pass (a production engine would share a depth prepass); at this engine's scale the duplicate draw is cheap and keeps AO decoupled from the forward path.
@@ -786,6 +872,6 @@ at 11 px, roughly 10x more than needed. Fixing that means keying the cache by
 ### Known limitations (not yet done)
 
 - No image-based lighting / environment reflections — a pure metal with no texture is lit only by direct lights, nothing else (see `math/PBR shading formulas.md`'s "Where the real handwave lives").
-- Local lights (point and spot) don't cast shadows, only the directional sun does. Spot shadows were explicitly scoped out when spot lights were added — they'd need a per-light shadow map, an atlas to hold them, a light-view-proj per light, and N extra depth passes.
+- **Point** lights don't cast shadows — only the sun and up to `MAX_SHADOW_SPOTS` flagged spot lights do. Point-light shadows need a cube map (6x the passes and draws) and are not planned; point lights are for detail and fake emissive glow. See "Spot light shadows" above.
 - **Zero-thickness occluder geometry is the one case the shadow system genuinely cannot resolve** — occluder and receiver depths coincide at a shared edge, and no shadow-map representation can separate them. `roomBox` therefore builds solid-slab walls (0.2 units thick), so a corner's occluder record is the wall's sunlit exterior face and the depth gap is ~wall-thickness; a long-running concave-corner light leak in the interior demo was ultimately closed by exactly this, and it also paid for `SHADOW_MAP_SIZE` 4096 → 2048. Prefer closed/thick meshes for anything that must cast interior shadows. `normalOffset` is a texel-count quantity, computed per frame per cascade from that cascade's texel size (`SHADOW_NORMAL_OFFSET_TEXELS`/`_MIN`, uploaded in `CascadeUniforms.normalOffsets`), so it self-rescales with `SHADOW_MAP_SIZE`, `shadowDistance`, and the split scheme; see "Cascaded shadow maps" above.
 - The glTF loader (`assets/gltf.ts`) doesn't read a `TANGENT` accessor (fabricates an arbitrary perpendicular vector instead) and ignores any texture a glTF material references (factors only) — fine for the plain untextured "Box" sample it's validated against, wrong for a real normal-mapped/textured glTF asset. It also only handles a narrow subset generally: separate `.gltf` + `.bin` (no `.glb`, no embedded base64), `f32` POSITION/NORMAL/optional-TEXCOORD_0, `u16`/`u32` indices. Anything with skinning, morph targets, sparse accessors, or multiple buffers will throw.

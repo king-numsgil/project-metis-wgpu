@@ -16,6 +16,7 @@ import { MESH_VERTEX_LAYOUT } from "../scene/mesh.ts";
 import type { Scene } from "../scene/scene.ts";
 import { LightCuller } from "./lightCuller.ts";
 import { CASCADE_SPLIT_LAMBDA_DEFAULT, SHADOW_DISTANCE_DEFAULT, ShadowCascades } from "./shadowCascades.ts";
+import { selectShadowCastingSpots, SpotShadows } from "./spotShadows.ts";
 import { Std140Writer } from "./std140.ts";
 import commonWgsl from "./wgsl/common.wgsl" with { type: "text" };
 import depthPrepassWgsl from "./wgsl/depth_prepass.wgsl" with { type: "text" };
@@ -106,6 +107,8 @@ export class ClusteredForwardRenderer {
     private readonly environmentBuffer: GpuBuffer;
     private readonly culler: LightCuller;
     private readonly shadows: ShadowCascades;
+    /** Per-spot-light shadow maps. `lastDrawnInstances`/`lastCandidateInstances` report cull effectiveness. */
+    readonly spotShadows: SpotShadows;
 
     constructor(device: GpuDevice) {
         this.device = device;
@@ -119,9 +122,14 @@ export class ClusteredForwardRenderer {
                     buffer: {bindingType: "uniform"},
                 },
                 {binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: {bindingType: "uniform"}},
-                // Bindings 2 and 3 (cascade-0 MSM moments + sampler) are gone; the
-                // numbering is left as-is so this change stays confined to the
-                // shadow path. See forward.wgsl.
+                // Spot shadows reuse the slots the cascade-0 MSM moments texture
+                // and its sampler used to occupy.
+                {
+                    binding: 2,
+                    visibility: GPUShaderStage.FRAGMENT,
+                    texture: {sampleType: "depth", viewDimension: "2d-array"},
+                },
+                {binding: 3, visibility: GPUShaderStage.FRAGMENT, buffer: {bindingType: "uniform"}},
                 {binding: 4, visibility: GPUShaderStage.FRAGMENT, buffer: {bindingType: "uniform"}}, // cascade uniforms
                 {binding: 5, visibility: GPUShaderStage.FRAGMENT, texture: {sampleType: "unfilterable-float"}}, // AO
                 // All cascades: depth array + comparison sampler (hardware PCF).
@@ -154,6 +162,7 @@ export class ClusteredForwardRenderer {
         // needs; the shadow + AO subsystems both render from the model layout.
         this.culler = new LightCuller(device);
         this.shadows = new ShadowCascades(device, this.modelBindGroupLayout);
+        this.spotShadows = new SpotShadows(device, this.modelBindGroupLayout);
         this.ao = new AmbientOcclusion(device, this.modelBindGroupLayout);
 
         const pipelineLayout = device.createPipelineLayout({
@@ -234,8 +243,14 @@ ${depthPrepassWgsl}`,
 
     render(encoder: GpuCommandEncoder, targets: RenderTargets, scene: Scene) {
         this.writeFrameUniforms(scene);
-        this.culler.write(scene, targets);
+        // Derived once and shared: LightCuller packs these lights first so a
+        // light's buffer index is also its shadow-map layer, and SpotShadows
+        // renders the layers in the same order. Two independent derivations
+        // could disagree and shadow fragments with the wrong light's map.
+        const shadowSpots = selectShadowCastingSpots(scene.lights);
+        this.culler.write(scene, targets, shadowSpots);
         this.shadows.render(encoder, scene, this.shadowDistance, this.cascadeSplitLambda, this.profiler);
+        this.spotShadows.render(encoder, scene, shadowSpots, this.profiler);
         this.culler.cull(encoder, this.profiler);
 
         // Ambient occlusion (feeds the forward pass's ambient term). `None`
@@ -253,6 +268,8 @@ ${depthPrepassWgsl}`,
             entries: [
                 {binding: 0, buffer: {buffer: this.cameraBuffer}},
                 {binding: 1, buffer: {buffer: this.environmentBuffer}},
+                {binding: 2, textureView: this.spotShadows.depthArrayView},
+                {binding: 3, buffer: {buffer: this.spotShadows.uniformBuffer}},
                 {binding: 4, buffer: {buffer: this.shadows.uniformBuffer}},
                 {binding: 5, textureView: this.ao.resultView},
                 {binding: 6, textureView: this.shadows.depthArrayView},
@@ -327,6 +344,7 @@ ${depthPrepassWgsl}`,
         this.environmentBuffer.destroy();
         this.culler.destroy();
         this.shadows.destroy();
+        this.spotShadows.destroy();
         this.ao.destroy();
     }
 

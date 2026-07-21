@@ -336,8 +336,20 @@ interface SpotLight {
     range: number;       // cull radius — the full SPHERE, not the cone (see below)
     innerAngle: number;  // RADIANS, half-angle of the full-brightness core
     outerAngle: number;  // RADIANS, half-angle at which it reaches zero
+    castsShadow?: boolean;  // render a shadow map for this light (max MAX_SHADOW_SPOTS)
 }
 ```
+
+**`castsShadow` is a budget, not a default.** At most `MAX_SHADOW_SPOTS` (4)
+spots cast at once; flag more and the first that many **in `scene.lights` order**
+win, the rest light normally but cast nothing, and you get a one-time
+`console.warn`. Each caster costs one extra depth pass over whatever geometry
+survives its frustum cull. **Point lights cannot cast shadows at all** — that
+would need a cube map. The sun is separate and always casts (see §5).
+
+The intended usage at scale is for scene code to flip these flags as the player
+moves between spaces, so the four maps follow the action; the renderer itself
+knows nothing about rooms or zones.
 
 **`innerAngle`/`outerAngle` are half-angles in radians** — the angle from the
 cone's axis to its edge, not the full apex angle. A 30-degree-wide beam is
@@ -460,6 +472,7 @@ for the design.
 1. Write camera + environment uniforms.
 2. Write cluster params + pack the point-light array.
 3. **Cascaded shadow passes** (`cullMode: "none"`): one single-sample depth-only pass per cascade, each into its own `depth_2d_array` layer.
+3b. **Spot shadow passes**, one per `MAX_SHADOW_SPOTS` layer. Layers without an active caster are still cleared (so a stale map can't be sampled) but draw nothing. Draws are **frustum-culled per light** against each instance's world bounding sphere.
 4. **Cluster build** (compute) — per-cluster view-space AABBs.
 5. **Light cull** (compute) — sphere-vs-AABB, writes per-cluster light index lists.
 6. **AO** — `clearToWhite` if `technique === None`, else prepass + SSAO/HBAO + blur.
@@ -493,6 +506,8 @@ CLUSTER_COUNT_X = 16; CLUSTER_COUNT_Y = 9; CLUSTER_COUNT_Z = 24;
 NUM_CLUSTERS = 3456;              // X*Y*Z
 MAX_LIGHTS_PER_CLUSTER = 96;      // per-cluster capacity cap
 MAX_LIGHTS = 384;                 // per-scene cap, point + spot combined (excess dropped with a console.warn)
+MAX_SHADOW_SPOTS = 4;             // spots that may cast shadows at once (compile-time: sizes a WGSL array)
+SPOT_SHADOW_MAP_SIZE = 1024;      // per-caster resolution (~16.8 MB total for 4 layers)
 COMPUTE_WORKGROUP_SIZE = 64;
 ```
 
@@ -773,8 +788,11 @@ grading each span green -> amber -> red by its share of the frame (a span that
 bun run fixture          # headless render + screenshot validation -> test/output/*.png
 bun run demo:exterior    # interactive; WASD+QE fly, arrows look, P profiler, Esc quit
 bun run demo:interior    # + O cycles AO technique
+bun run demo:spots       # spot-shadow visual test: 4 coloured orbiting casters
+                         #   L toggles shadows (the A/B), Space pauses the orbit
 bun run bench:lights     # windowed light benchmark (see bench/lights.ts header for flags)
-                         #   --lights N  --spots 0..1 (spot fraction, default 0.5)  --profile
+                         #   --lights N  --spots 0..1 (spot fraction, default 0.5)
+                         #   --shadow-spots 0..4  --profile
 bunx tsc --noEmit        # type-check
 ```
 

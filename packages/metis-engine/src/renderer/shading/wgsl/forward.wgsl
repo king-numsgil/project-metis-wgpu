@@ -3,9 +3,8 @@
 
 @group(0) @binding(0) var<uniform> camera: Camera;
 @group(0) @binding(1) var<uniform> environment: Environment;
-// Bindings 2 and 3 are unused (they held cascade 0's MSM moments texture +
-// sampler). The numbering is left as-is so this diff stays confined to the
-// shadow path.
+@group(0) @binding(2) var spotShadowDepth: texture_depth_2d_array; // one layer per shadow-casting spot
+@group(0) @binding(3) var<uniform> spotShadows: SpotShadowUniforms;
 @group(0) @binding(4) var<uniform> cascades: CascadeUniforms;
 @group(0) @binding(5) var aoTex: texture_2d<f32>; // screen-space ambient occlusion (r8, 1 = fully open)
 @group(0) @binding(6) var cascadeDepth: texture_depth_2d_array; // all cascades (PCF), one layer each
@@ -81,6 +80,40 @@ fn sampleCascadeVis(cascade: i32, worldPosition: vec3<f32>, N: vec3<f32>) -> f32
         for (var dx = -1; dx <= 1; dx++) {
             let o = vec2<f32>(f32(dx), f32(dy)) * texel;
             sum += textureSampleCompareLevel(cascadeDepth, cascadeCompareSampler, cu.xy + o, layer, cu.z);
+        }
+    }
+    return sum / 9.0;
+}
+
+// Shadow test for one spot light. `layer` is the light's own index in the light
+// buffer (see SpotShadowUniforms), `distToLight` sizes the normal offset.
+//
+// Unlike the sun's ortho cascades this projection is perspective, so the
+// perspective divide is real and `clip.w <= 0` (the fragment is behind the
+// light's apex) has to be rejected before dividing — without that check, points
+// behind the light alias onto valid UVs and stamp a mirrored ghost shadow.
+fn sampleSpotShadow(layer: i32, worldPosition: vec3<f32>, N: vec3<f32>, distToLight: f32) -> f32 {
+    // Texel footprint grows with distance under perspective, so the offset is
+    // sized from the receiver's own distance rather than being a world constant.
+    let offset = spotShadows.params.z * spotShadows.texelScale[layer] * distToLight;
+    let clip = spotShadows.lightViewProj[layer] * vec4<f32>(worldPosition + N * offset, 1.0);
+    if (clip.w <= 0.0) {
+        return 1.0;
+    }
+    let ndc = clip.xyz / clip.w;
+    let uv = ndc.xy * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5, 0.5);
+    // Outside the map (or outside the depth range) means "no shadow data" —
+    // fully lit. The cone attenuation has already darkened anything genuinely
+    // outside the light's reach, so this can't leak light into the scene.
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || ndc.z < 0.0 || ndc.z > 1.0) {
+        return 1.0;
+    }
+    let texel = 1.0 / spotShadows.params.y;
+    var sum = 0.0;
+    for (var dy = -1; dy <= 1; dy++) {
+        for (var dx = -1; dx <= 1; dx++) {
+            let o = vec2<f32>(f32(dx), f32(dy)) * texel;
+            sum += textureSampleCompareLevel(spotShadowDepth, cascadeCompareSampler, uv + o, layer, ndc.z);
         }
     }
     return sum / 9.0;
@@ -213,8 +246,18 @@ fn fs(input: VertexOutput) -> @location(0) vec4<f32> {
         if (spot <= 0.0) {
             continue;
         }
+        // Shadow-casting spots are packed first in the light buffer, so the
+        // light's own index is both the "does it cast?" test and its map layer.
+        // Most lights skip this entirely.
+        var visibility = 1.0;
+        if (lightIndex < u32(spotShadows.params.x)) {
+            visibility = sampleSpotShadow(i32(lightIndex), input.worldPosition, geometricNormal, dist);
+            if (visibility <= 0.0) {
+                continue;
+            }
+        }
         let attenuation = pointLightAttenuation(dist, light.range) * spot;
-        let radiance = light.color * light.intensity * attenuation;
+        let radiance = light.color * light.intensity * attenuation * visibility;
         color += shadeLight(N, V, L, radiance, albedo, metallic, roughness);
     }
 
