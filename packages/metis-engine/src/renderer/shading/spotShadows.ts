@@ -10,7 +10,7 @@ import {
     type GpuTexture,
     GPUTextureUsage,
     type GpuTextureView,
-} from "bun-webgpu-rs";
+} from "metis-native";
 import { mat4, type Mat4Arg, vec3 } from "wgpu-matrix";
 import type { GpuProfiler } from "../debug/gpuProfiler.ts";
 import { type Frustum, frustumFromViewProj, sphereInFrustum, worldBoundingSphere } from "../math/frustum.ts";

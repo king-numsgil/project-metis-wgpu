@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-`metis-tui` is a terminal-UI ship-systems sim: a starship power-plant control panel (SMES capacitors, coolant loop, fusion reactor) rendered with [OpenTUI](https://github.com/anomalyco/opentui) (`@opentui/core` + `@opentui/react`, a React reconciler that renders to a terminal instead of the DOM). It was scaffolded with `bun create tui` and is a standalone package in this monorepo — it does not currently depend on `bun-webgpu-rs` or `metis-game`.
+`metis-tui` is a terminal-UI ship-systems sim: a starship power-plant control panel (SMES capacitors, coolant loop, fusion reactor) rendered with [OpenTUI](https://github.com/anomalyco/opentui) (`@opentui/core` + `@opentui/react`, a React reconciler that renders to a terminal instead of the DOM). It was scaffolded with `bun create tui` and is a standalone package in this monorepo — it does not currently depend on `metis-native` or `metis-game`.
 
 ## Commands
 

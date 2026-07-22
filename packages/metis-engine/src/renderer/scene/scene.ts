@@ -4,7 +4,7 @@ import {
     type GpuBuffer,
     GPUBufferUsage,
     type GpuDevice,
-} from "bun-webgpu-rs";
+} from "metis-native";
 import type { Mat4Arg } from "wgpu-matrix";
 import { Camera } from "../math/camera.ts";
 import { createTransform, normalMatrixFromModel, type Transform, transformToMat4 } from "../math/transform.ts";

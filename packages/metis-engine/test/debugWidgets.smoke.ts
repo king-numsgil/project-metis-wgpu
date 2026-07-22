@@ -4,8 +4,8 @@
 // index reads back zeros, and a widget with a bad layout still "renders fine"
 // (just empty). So this asserts on the numbers — non-zero per-pass timings that
 // sum sanely — and only then draws the widgets and screenshots them.
-import { GPUTextureUsage } from "bun-webgpu-rs";
-import { readTexturePixels, savePixelsToFile } from "bun-webgpu-rs";
+import { GPUTextureUsage } from "metis-native";
+import { readTexturePixels, savePixelsToFile } from "metis-native";
 import {
     ClusteredForwardRenderer,
     createDefaultPostProcessPipeline,

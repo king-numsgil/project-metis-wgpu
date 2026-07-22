@@ -7,7 +7,7 @@ import {
     type GpuShaderModule,
     GPUShaderStage,
     type GPUTextureFormat,
-} from "bun-webgpu-rs";
+} from "metis-native";
 import type { ExposureState } from "./exposureState.ts";
 import type { PostProcessFrameContext, PostProcessPass } from "./pipeline.ts";
 import tonemapWgsl from "./wgsl/tonemap.wgsl" with { type: "text" };

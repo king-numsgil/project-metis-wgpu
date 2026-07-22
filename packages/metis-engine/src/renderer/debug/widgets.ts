@@ -1,4 +1,4 @@
-import type { GpuCommandEncoder, GpuDevice, GPUTextureFormat, GpuTextureView } from "bun-webgpu-rs";
+import type { GpuCommandEncoder, GpuDevice, GPUTextureFormat, GpuTextureView } from "metis-native";
 import { MAX_PALETTE_COLORS, type Rgba, VectorText } from "../text/vectorText.ts";
 import type { GpuProfiler, ProfileSpan } from "./gpuProfiler.ts";
 

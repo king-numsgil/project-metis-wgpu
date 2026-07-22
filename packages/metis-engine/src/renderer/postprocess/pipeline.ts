@@ -1,4 +1,4 @@
-import type { GpuCommandEncoder, GpuDevice, GPUTextureFormat, GpuTextureView } from "bun-webgpu-rs";
+import type { GpuCommandEncoder, GpuDevice, GPUTextureFormat, GpuTextureView } from "metis-native";
 import type { GpuProfiler } from "../debug/gpuProfiler.ts";
 import { AutoExposurePass } from "./autoExposure.ts";
 import { ExposureState } from "./exposureState.ts";

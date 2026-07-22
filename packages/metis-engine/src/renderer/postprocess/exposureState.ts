@@ -1,4 +1,4 @@
-import { type GpuBuffer, GPUBufferUsage, type GpuDevice } from "bun-webgpu-rs";
+import { type GpuBuffer, GPUBufferUsage, type GpuDevice } from "metis-native";
 
 /**
  * A single persistent f32 in a storage buffer: the current exposure

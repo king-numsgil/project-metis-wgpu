@@ -1,0 +1,48 @@
+[package]
+authors = ["Daniel Grondin <king@numsgil.co>"]
+edition = "2021"
+name = "metis_native"
+version = "0.1.0"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+napi = { version = "3.0.0", features = ["async"] }
+napi-derive = "3.0.0"
+mimalloc = { version = "0.1", default-features = false }
+wgpu = { version = "24", features = ["wgsl"] }
+raw-window-handle = "0.6"
+tokio = { version = "1", features = ["sync"] }
+sdl3-sys = { version = "0.6.7", features = ["build-from-source-static"] }
+num_enum = "0.7.6"
+lyon_tessellation = "1"
+lyon_path = "1"
+lyon_geom = "1"
+ttf-parser = "0.21"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "tga", "hdr"] }
+half = "2.7.1"
+
+[build-dependencies]
+napi-build = "2"
+
+# TODO(physics): re-evaluate `lto = "fat"` once a physics engine lands here.
+# Fat LTO costs ~103 s per incremental release build (vs ~19 s for `fastdev`)
+# and currently buys close to nothing: this crate is a GPU-bound FFI shim, so
+# the hot path is inside the driver, not in cross-crate inlining. A CPU-bound
+# solver is the opposite case and is where fat LTO would start paying for
+# itself — so measure it then rather than dropping it pre-emptively now.
+# Decided 2026-07-21; physics ETA unknown.
+[profile.release]
+strip = "symbols"
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+
+# Optimized but fast to build — for profiling runs where `release`'s fat-LTO
+# link (measured: ~103 s to rebuild after a one-line change) dominates the
+# edit-measure loop. Ships nothing; use `release` for that.
+[profile.fastdev]
+inherits = "release"
+lto = false
+codegen-units = 16

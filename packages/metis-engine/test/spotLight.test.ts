@@ -9,7 +9,7 @@
 // measurement settles it, which is what this does: render a hard-edged cone
 // straight at a wall, find the lit boundary, and convert it back to an angle.
 import { expect, test } from "bun:test";
-import { readTexturePixels } from "bun-webgpu-rs";
+import { readTexturePixels } from "metis-native";
 import {
     ClusteredForwardRenderer,
     createDefaultPostProcessPipeline,

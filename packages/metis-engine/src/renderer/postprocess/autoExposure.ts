@@ -7,7 +7,7 @@ import {
     type GpuComputePipeline,
     type GpuDevice,
     GPUShaderStage,
-} from "bun-webgpu-rs";
+} from "metis-native";
 import { Std140Writer } from "../shading/std140.ts";
 import type { ExposureState } from "./exposureState.ts";
 import type { LuminanceAveragePass } from "./luminanceAverage.ts";

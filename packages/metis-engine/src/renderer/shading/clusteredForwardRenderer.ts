@@ -7,7 +7,7 @@ import {
     type GpuDevice,
     type GpuRenderPipeline,
     GPUShaderStage,
-} from "bun-webgpu-rs";
+} from "metis-native";
 import { AmbientOcclusion } from "../ao/ambientOcclusion.ts";
 import { AoTechnique } from "../ao/aoConfig.ts";
 import type { GpuProfiler } from "../debug/gpuProfiler.ts";

@@ -4,7 +4,7 @@ import {
     type GpuDevice,
     type GpuRenderPassEncoder,
     type GpuVertexBufferLayout,
-} from "bun-webgpu-rs";
+} from "metis-native";
 import type { MeshData } from "../assets/primitives.ts";
 
 /**

@@ -29,7 +29,7 @@ import {
     sdlPollEvents,
     sdlQuit,
     SdlScancode,
-} from "bun-webgpu-rs";
+} from "metis-native";
 import {
     ClusteredForwardRenderer,
     createDefaultPostProcessPipeline,

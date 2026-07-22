@@ -18,7 +18,7 @@
 //
 // WASD+QE fly, arrows look, L toggles shadows, Space pauses the orbit,
 // P toggles the GPU profiler overlay, Escape/close to quit.
-import { SdlEventType, SdlKeycode, sdlPollEvents } from "bun-webgpu-rs";
+import { SdlEventType, SdlKeycode, sdlPollEvents } from "metis-native";
 import {
     ClusteredForwardRenderer,
     createDefaultPostProcessPipeline,

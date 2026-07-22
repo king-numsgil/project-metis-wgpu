@@ -2,7 +2,7 @@
 // opening (real shadow occlusion, not just an ambient fake), ceiling
 // fixtures, soft ambient fill. WASD+QE to fly, O cycles AO, P toggles the GPU
 // profiler overlay, Escape/close to quit.
-import { SdlEventType, SdlKeycode, sdlPollEvents } from "bun-webgpu-rs";
+import { SdlEventType, SdlKeycode, sdlPollEvents } from "metis-native";
 import {
     AoTechnique,
     ClusteredForwardRenderer,

@@ -16,7 +16,7 @@ import {
     SdlInitFlag,
     sdlQuit,
     type SdlWindow,
-} from "bun-webgpu-rs";
+} from "metis-native";
 import { gpuProfilerFeatures } from "../debug/gpuProfiler.ts";
 import { COMPUTE_WORKGROUP_SIZE, MAX_LIGHTS_PER_CLUSTER, NUM_CLUSTERS } from "../shading/clusterConfig.ts";
 import { RenderTargets } from "./targets.ts";
@@ -286,7 +286,7 @@ export class RenderContext {
     /**
      * Interactive target — opens a real SDL window and presents to its
      * swapchain. Always uses `requestAdapterForWindow` (not `requestAdapter`)
-     * per bun-webgpu-rs/CLAUDE.md: a surfaceless adapter can be incompatible
+     * per metis-native/CLAUDE.md: a surfaceless adapter can be incompatible
      * with the window's surface and fail at `configure()`.
      */
     static async createWindowed(title: string, options: RenderContextOptions): Promise<RenderContext> {

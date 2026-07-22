@@ -6,7 +6,7 @@
 // between two otherwise-identical renders is the only thing that isolates the
 // shadow.
 import { expect, test } from "bun:test";
-import { readTexturePixels } from "bun-webgpu-rs";
+import { readTexturePixels } from "metis-native";
 import {
     ClusteredForwardRenderer,
     createDefaultPostProcessPipeline,

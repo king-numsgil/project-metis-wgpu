@@ -22,7 +22,7 @@
         "typescript": "^7"
     },
     "dependencies": {
-        "bun-webgpu-rs": "workspace:*",
+        "metis-native": "workspace:*",
         "metis-data": "workspace:*",
         "wgpu-matrix": "^3.4.2"
     }

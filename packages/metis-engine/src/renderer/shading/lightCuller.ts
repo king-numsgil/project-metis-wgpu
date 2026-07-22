@@ -7,7 +7,7 @@ import {
     type GpuComputePipeline,
     type GpuDevice,
     GPUShaderStage,
-} from "bun-webgpu-rs";
+} from "metis-native";
 import { mat4, vec3 } from "wgpu-matrix";
 import type { GpuProfiler } from "../debug/gpuProfiler.ts";
 import type { RenderTargets } from "../rhi/targets.ts";

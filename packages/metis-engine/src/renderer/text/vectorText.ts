@@ -9,7 +9,7 @@ import {
     type GPUTextureFormat,
     type GpuTextureView,
     VectorContext,
-} from "bun-webgpu-rs";
+} from "metis-native";
 import { mat4 } from "wgpu-matrix";
 import type { GpuProfiler } from "../debug/gpuProfiler.ts";
 import { Std140Writer } from "../shading/std140.ts";
@@ -27,7 +27,7 @@ export type Rgba = readonly [number, number, number, number];
 export const MAX_PALETTE_COLORS = 64;
 
 /**
- * Thin wrapper over bun-webgpu-rs's `VectorContext` for screen-space HUD
+ * Thin wrapper over metis-native's `VectorContext` for screen-space HUD
  * text and 2D debug vector graphics: loads a TTF, exposes `drawText`, and
  * composites the tessellated geometry with an orthographic pixel-space
  * projection.

@@ -2,7 +2,7 @@
 // ambient, a couple of point "running lights". WASD+QE to fly, P toggles the
 // GPU profiler overlay, Escape/close to quit. Mirrors metis-game/src/index.ts's
 // SDL event-loop pattern.
-import { SdlEventType, SdlKeycode, sdlPollEvents } from "bun-webgpu-rs";
+import { SdlEventType, SdlKeycode, sdlPollEvents } from "metis-native";
 import {
     ClusteredForwardRenderer,
     createDefaultPostProcessPipeline,

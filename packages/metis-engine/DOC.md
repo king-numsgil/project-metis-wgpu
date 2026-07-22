@@ -35,7 +35,7 @@ entirely — see §1.3.
 ### 1.1 Windowed (interactive)
 
 ```ts
-import { SdlEventType, SdlKeycode, sdlPollEvents } from "bun-webgpu-rs";
+import { SdlEventType, SdlKeycode, sdlPollEvents } from "metis-native";
 import { vec3 } from "wgpu-matrix";
 
 // Default present mode is "mailbox" (tear-free, no fifo stall). The FrameLimiter
@@ -154,7 +154,7 @@ Two responsibilities `RenderContext` would otherwise have handled for you:
   own `surface.destroy()` / `device.destroy()` / `wnd.destroy()` / `sdlQuit()`.
   **`surface.destroy()` must come before `wnd.destroy()`** — dropping a surface
   after its window (including implicitly, at process exit) segfaults on
-  Linux/X11. See `bun-webgpu-rs/DOC.md` §2. `RenderContext.destroy()` handles
+  Linux/X11. See `metis-native/DOC.md` §2. `RenderContext.destroy()` handles
   this for you; on the caller-owned path it's yours to get right.
 
 Both consumers of the **output** format want your swapchain's format, never
@@ -177,7 +177,7 @@ Getting any of these wrong produces a plausible-looking but wrong image.
 | The **shadow** pass is orthographic and stays standard-Z (`"less"`, clear `1.0`). Do not "fix" it for consistency. | Shadows invert; the `compare: "less-equal"` sampler reads the comparison backwards. |
 | `Environment.sunDirection` is the direction light **travels** (sun → scene), normalized. | Sun lights the wrong side. |
 | Point lights contribute nothing past `range`; the shader's falloff window matches the cull sphere. | Lights pop at cluster edges. |
-| **`bun-webgpu-rs` never throws on WebGPU validation errors** — they print to stderr as `[wgpu] uncaptured error:` and execution continues with garbage. | A script "succeeds" having rendered nothing. Grep output for `wgpu`, or wrap a frame in `pushErrorScope("validation")` / `await popErrorScope()`. |
+| **`metis-native` never throws on WebGPU validation errors** — they print to stderr as `[wgpu] uncaptured error:` and execution continues with garbage. | A script "succeeds" having rendered nothing. Grep output for `wgpu`, or wrap a frame in `pushErrorScope("validation")` / `await popErrorScope()`. |
 | WGSL has no `#include`; shaders are built by string-concatenating `common.wgsl` + the pass's file. | Missing symbols. |
 
 ---
@@ -679,7 +679,7 @@ hud.profileLabel = "hud-text";    // name the span; set per instance
 ```
 
 Re-draws the last `render()`'s geometry **without re-tessellating**. `drawText`
-costs 100 microseconds+ per string (see `bun-webgpu-rs/DOC.md` §9), so a HUD that
+costs 100 microseconds+ per string (see `metis-native/DOC.md` §9), so a HUD that
 re-stages every frame can cost more than the scene. Only valid if nothing has
 been staged since the last `render()`. `DebugOverlay` (§10) automates this.
 

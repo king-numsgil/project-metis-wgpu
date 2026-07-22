@@ -8,7 +8,7 @@ import {
     GPUMapMode,
     type GpuQuerySet,
     type GpuRenderPassEncoder,
-} from "bun-webgpu-rs";
+} from "metis-native";
 
 /** One measured GPU span. `children` are spans nested inside it (draws within a pass). */
 export interface ProfileSpan {

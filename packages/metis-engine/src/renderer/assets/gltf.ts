@@ -1,4 +1,4 @@
-import type { GpuDevice } from "bun-webgpu-rs";
+import type { GpuDevice } from "metis-native";
 import { dirname, join } from "node:path";
 import { mat4, type Mat4Arg, quat, vec3 } from "wgpu-matrix";
 import { Material, type MaterialParams } from "../scene/material.ts";

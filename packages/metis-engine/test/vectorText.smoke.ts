@@ -1,9 +1,9 @@
-// Standalone validation for bun-webgpu-rs's VectorContext — it's fully
+// Standalone validation for metis-native's VectorContext — it's fully
 // implemented in the native addon but had no consumer anywhere in the repo
 // before src/text/vectorText.ts, so this renders one string to an offscreen
 // target and screenshots it before the HUD overlay leans on it.
-import { type GpuTexture, GPUTextureUsage } from "bun-webgpu-rs";
-import { readTexturePixels, savePixelsToFile } from "bun-webgpu-rs";
+import { type GpuTexture, GPUTextureUsage } from "metis-native";
+import { readTexturePixels, savePixelsToFile } from "metis-native";
 import { RenderContext, type Rgba, VectorText } from "metis-engine/renderer";
 
 const W = 480;

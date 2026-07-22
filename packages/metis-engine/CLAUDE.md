@@ -4,11 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-`metis-engine` is a WebGPU clustered-forward PBR renderer for the space-sim game — built directly on `bun-webgpu-rs`'s raw WebGPU/SDL3 bindings (no other rendering-facing dependency; `wgpu-matrix` is the only non-`bun-webgpu-rs` dependency, for matrix/vector math). It's a standalone package with no dependency on `metis-tui`. `metis-game` consumes it (a 100-point-light demo), and does so via the caller-owned-device path — it never touches `RenderContext`. See "The engine does not own the window" below.
+`metis-engine` is a WebGPU clustered-forward PBR renderer for the space-sim game — built directly on `metis-native`'s raw WebGPU/SDL3 bindings (no other rendering-facing dependency; `wgpu-matrix` is the only non-`metis-native` dependency, for matrix/vector math). It's a standalone package with no dependency on `metis-tui`. `metis-game` consumes it (a 100-point-light demo), and does so via the caller-owned-device path — it never touches `RenderContext`. See "The engine does not own the window" below.
 
 **`src/` is split into two independent subtrees.** `src/renderer/` is the entire renderer described in this doc (including `renderer/debug/` — the opt-in GPU profiler and the debug widgets); `src/ecs/` is a young archetype ECS (Structure-of-Arrays storage, no `metis-data` dependency) that will eventually feed the renderer. They do not depend on each other yet — the renderer still takes a hand-built `Scene`, not ECS data. The root `src/index.ts` re-exports them as namespaces (`export * as Renderer`, `export * as ECS`), but consumers import through the package's **subpath exports** — `metis-engine/renderer` and `metis-engine/ecs` — which is what `examples/`, `test/`, `bench/`, and `metis-game` now do (`import { ClusteredForwardRenderer, … } from "metis-engine/renderer"`). The ECS's current shape and limits are in "The ECS" below.
 
-It's the first package in this monorepo to build a *real* render pipeline — depth buffer, vertex buffers, multiple bind groups, compute passes, multisample-capable targets. Every prior pipeline in `bun-webgpu-rs/tests/render*.test.ts` and `metis-game/src/index.ts` is a hardcoded no-vertex-buffer triangle, so the patterns here (vertex layouts, bind group group-index conventions, WGSL module concatenation) are this repo's first precedent, not a continuation of one.
+It's the first package in this monorepo to build a *real* render pipeline — depth buffer, vertex buffers, multiple bind groups, compute passes, multisample-capable targets. Every prior pipeline in `metis-native/tests/render*.test.ts` and `metis-game/src/index.ts` is a hardcoded no-vertex-buffer triangle, so the patterns here (vertex layouts, bind group group-index conventions, WGSL module concatenation) are this repo's first precedent, not a continuation of one.
 
 ## Read [`DOC.md`](DOC.md) first
 
@@ -49,7 +49,7 @@ Run from `packages/metis-engine/` unless noted.
 bun install
 
 # Headless render + screenshot validation — writes PNGs to test/output/,
-# via bun-webgpu-rs's native readTexturePixels/saveTextureToFile.
+# via metis-native's native readTexturePixels/saveTextureToFile.
 # The goldens are byte-exact: a clean `git status` after this means the render
 # path reproduced exactly. A diff is signal — read "The fixture goldens are a
 # genuine byte-exact baseline" below before reverting it.
@@ -124,7 +124,7 @@ src/renderer/   — the entire renderer; import via "metis-engine/renderer"
                                  wires the three passes below into the standard chain
                 luminanceAverage.ts, autoExposure.ts, tonemap.ts — HDR forward output -> measure
                                  luminance -> adapt exposure -> ACES filmic tonemap
-  text/         vectorText.ts — wraps bun-webgpu-rs's VectorContext for screen-space HUD text
+  text/         vectorText.ts — wraps metis-native's VectorContext for screen-space HUD text
                                  + 2D vector debug graphics; paint colour is a palette indexed
                                  by VectorContext.setId(), and renderCached() replays geometry
                                  without re-tessellating (text is expensive — see "Debug widgets")
@@ -136,7 +136,7 @@ src/renderer/   — the entire renderer; import via "metis-engine/renderer"
                                  network-independent path every demo/fixture scene defaults to)
                 gltf.ts       — a deliberately narrow glTF 2.0 reader (see its doc comment for the
                                  exact supported subset), not a general-purpose importer
-                texture.ts    — loadTexture() (image file -> GpuTexture via bun-webgpu-rs's
+                texture.ts    — loadTexture() (image file -> GpuTexture via metis-native's
                                  `loadImageTexture` — decode + upload happen in Rust, pure-Rust
                                  `image` crate; PNG/TGA/JPEG/Radiance HDR. Replaced the former
                                  from-scratch PNG decoder, then SDL3_image. NB `.hdr` yields an
@@ -228,7 +228,7 @@ strictly optional, and don't let engine types acquire a window/surface dependenc
 
 ### Present mode is `mailbox`, and pacing is a separate `FrameLimiter`
 
-The default present mode is **`mailbox`** (the `bun-webgpu-rs` binding default;
+The default present mode is **`mailbox`** (the `metis-native` binding default;
 `RenderContext` passes no `presentMode` unless you set one). This came out of a
 stutter hunt: native `fifo`/`auto-vsync` periodically stall `getCurrentTexture()`
 for a ~50 ms multi-vblank burst on this machine's Vulkan driver when the loop
@@ -258,7 +258,7 @@ cap back by switching to `fifo` — that reintroduces the stall. The demos and
 `RenderContext.outputFormat` used to be a plain getter delegating to
 `surface.getPreferredFormat()`, and `beginFrame()` reads it to build the
 `FrameTarget`. That call is a `get_capabilities` WSI round-trip — milliseconds,
-not microseconds (see `bun-webgpu-rs/DOC.md` §2) — so every windowed frame
+not microseconds (see `metis-native/DOC.md` §2) — so every windowed frame
 through `RenderContext` paid it, roughly halving the frame rate no matter how
 little work the GPU had. It's resolved once in the constructor now
 (`windowedFormat`). Encode and GPU time were unaffected, as they should be: the
@@ -682,7 +682,7 @@ Linux-generated goldens produced no diff at all.
 
 This was **not** true before the image decoder was replaced, and the reason is
 the whole point. SDL3_image's 16-bit PNG handling was platform-dependent (the
-"works on Windows, garbage on Linux" byte-order bug — see `bun-webgpu-rs`'s
+"works on Windows, garbage on Linux" byte-order bug — see `metis-native`'s
 `CLAUDE.md`), so the two platforms were feeding *different texture bytes* into an
 otherwise identical render. The renders differed because the **inputs** differed.
 The pure-Rust `image` crate decodes bit-identically everywhere, which removed
@@ -793,11 +793,11 @@ Every material's bind group has exactly 6 texture-related bindings (1 sampler + 
 
 ### Debugging WebGPU validation errors — read this before assuming something "worked"
 
-**`bun-webgpu-rs` does not throw or reject on WebGPU validation errors.** They print to stderr as `[wgpu] uncaptured error: ...` and execution continues with whatever partial/garbage state resulted (an invalid command encoder, an unwritten buffer, a texture that silently kept its cleared value). A script can run to completion, write a file, and print a success message while having done nothing correct. **Always grep test/demo output for `wgpu` or run without piping through `tail`/`head`** — several real bugs during this engine's development (a shader with unreachable code after a `return`, a debug texture read missing `COPY_SRC`) were completely invisible until stderr was checked directly instead of trusting a clean exit code.
+**`metis-native` does not throw or reject on WebGPU validation errors.** They print to stderr as `[wgpu] uncaptured error: ...` and execution continues with whatever partial/garbage state resulted (an invalid command encoder, an unwritten buffer, a texture that silently kept its cleared value). A script can run to completion, write a file, and print a success message while having done nothing correct. **Always grep test/demo output for `wgpu` or run without piping through `tail`/`head`** — several real bugs during this engine's development (a shader with unreachable code after a `return`, a debug texture read missing `COPY_SRC`) were completely invisible until stderr was checked directly instead of trusting a clean exit code.
 
 ### WGSL module concatenation
 
-`bun-webgpu-rs`'s `createShaderModule` takes one `code: string`; WGSL has no `#include`. Every shader that needs the shared structs/BRDF/cluster-math in `common.wgsl` gets it via plain string concatenation (`` `${commonWgsl}\n${forwardWgsl}` ``) at pipeline creation — in `clusteredForwardRenderer.ts` (forward), `lightCuller.ts` (cluster_build/light_cull), and `shadowCascades.ts` (shadow). `.wgsl` files are imported as raw text via Bun's `with { type: "text" }` import attribute (ambient-declared in `src/renderer/shading/wgsl.d.ts`).
+`metis-native`'s `createShaderModule` takes one `code: string`; WGSL has no `#include`. Every shader that needs the shared structs/BRDF/cluster-math in `common.wgsl` gets it via plain string concatenation (`` `${commonWgsl}\n${forwardWgsl}` ``) at pipeline creation — in `clusteredForwardRenderer.ts` (forward), `lightCuller.ts` (cluster_build/light_cull), and `shadowCascades.ts` (shadow). `.wgsl` files are imported as raw text via Bun's `with { type: "text" }` import attribute (ambient-declared in `src/renderer/shading/wgsl.d.ts`).
 
 ### Profiling is opt-in, threaded through, and tiered
 
@@ -861,7 +861,7 @@ and leaves `drawCalls` populated, so replaying is valid until the next `flush()`
 The GPU numbers were unaffected either way — the overlay's cost is CPU-side, so
 it never corrupted what the profiler measures.
 
-Two bugs in `bun-webgpu-rs`'s `VectorContext` were found and fixed building this
+Two bugs in `metis-native`'s `VectorContext` were found and fixed building this
 (both documented in that package's CLAUDE.md): stroking an *open* polyline
 panicked the process via lyon, and `drawText` built a full glyph outline on every
 call that the `fill()` path then discarded. The remaining text cost is the glyph

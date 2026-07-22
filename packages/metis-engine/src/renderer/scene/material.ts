@@ -5,7 +5,7 @@ import {
     GPUBufferUsage,
     type GpuDevice,
     type GpuTextureView,
-} from "bun-webgpu-rs";
+} from "metis-native";
 import { getMaterialDefaults } from "../assets/texture.ts";
 import { Std140Writer } from "../shading/std140.ts";
 

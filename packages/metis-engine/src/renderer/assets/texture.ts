@@ -7,7 +7,7 @@ import {
     type GpuTextureView,
     ImageColorSpace,
     loadImageTexture,
-} from "bun-webgpu-rs";
+} from "metis-native";
 
 export interface LoadedTexture {
     texture: GpuTexture;
@@ -15,7 +15,7 @@ export interface LoadedTexture {
 }
 
 /**
- * Loads an image file into a GPU texture via bun-webgpu-rs's `loadImageTexture`,
+ * Loads an image file into a GPU texture via metis-native's `loadImageTexture`,
  * which decodes *and* uploads entirely in Rust — the pixel bytes never cross the
  * FFI boundary. Handles PNG/TGA/JPEG/Radiance HDR. Async: the decode + upload run
  * on a native worker thread, so a big texture doesn't stall the frame loop, and

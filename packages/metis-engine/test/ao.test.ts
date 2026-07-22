@@ -8,8 +8,8 @@
 //      forward/AO passes wrapped in a validation error scope, so a broken WGSL
 //      shader fails loudly instead of silently rendering garbage (see
 //      packages/metis-engine/CLAUDE.md's note on swallowed wgpu errors).
-import { requestAdapter } from "bun-webgpu-rs";
-import { readTexturePixels, savePixelsToFile } from "bun-webgpu-rs";
+import { requestAdapter } from "metis-native";
+import { readTexturePixels, savePixelsToFile } from "metis-native";
 import { describe, expect, it } from "bun:test";
 import {
     AO_NOISE_DIM,

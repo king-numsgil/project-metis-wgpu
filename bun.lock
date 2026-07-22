@@ -11,19 +11,6 @@
         "typescript": "^7",
       },
     },
-    "packages/bun-webgpu-rs": {
-      "name": "bun-webgpu-rs",
-      "version": "0.1.0",
-      "devDependencies": {
-        "@emnapi/core": "^1.5.0",
-        "@emnapi/runtime": "^1.5.0",
-        "@napi-rs/cli": "^3.2.0",
-        "@oxc-node/core": "^0.1.0",
-        "@tybys/wasm-util": "^0.10.0",
-        "@types/bun": "latest",
-        "typescript": "^7",
-      },
-    },
     "packages/metis-data": {
       "name": "metis-data",
       "dependencies": {
@@ -39,8 +26,8 @@
     "packages/metis-engine": {
       "name": "metis-engine",
       "dependencies": {
-        "bun-webgpu-rs": "workspace:*",
         "metis-data": "workspace:*",
+        "metis-native": "workspace:*",
         "wgpu-matrix": "^3.4.2",
       },
       "devDependencies": {
@@ -53,15 +40,28 @@
     "packages/metis-game": {
       "name": "metis-game",
       "dependencies": {
-        "bun-webgpu-rs": "workspace:*",
         "metis-data": "workspace:*",
         "metis-engine": "workspace:*",
+        "metis-native": "workspace:*",
         "wgpu-matrix": "^3.4.2",
       },
       "devDependencies": {
         "@types/bun": "latest",
       },
       "peerDependencies": {
+        "typescript": "^7",
+      },
+    },
+    "packages/metis-native": {
+      "name": "metis-native",
+      "version": "0.1.0",
+      "devDependencies": {
+        "@emnapi/core": "^1.5.0",
+        "@emnapi/runtime": "^1.5.0",
+        "@napi-rs/cli": "^3.2.0",
+        "@oxc-node/core": "^0.1.0",
+        "@tybys/wasm-util": "^0.10.0",
+        "@types/bun": "latest",
         "typescript": "^7",
       },
     },
@@ -365,8 +365,6 @@
 
     "bun-types": ["bun-types@1.3.14", "", { "dependencies": { "@types/node": "*" } }, "sha512-4N0ig0fEomHt5R0KCFWjovxow98rIoRwKolrYdCcknNwMekCXRnWEUvgu5soYV8QXtVsrUD8B95MBOZGPvr6KQ=="],
 
-    "bun-webgpu-rs": ["bun-webgpu-rs@workspace:packages/bun-webgpu-rs"],
-
     "chardet": ["chardet@2.2.0", "", {}, "sha512-rddelWYNPRrXq6PtNEN2S3f6t9ILzvqaN5pVgi4kqt9jHQaXIial9PznB5iSPVlQSLNaaH22ItWz3EJtQ10+OA=="],
 
     "cli-width": ["cli-width@4.1.0", "", {}, "sha512-ouuZd4/dm2Sw5Gmqy6bGyNNNe1qt9RpmxveLSO7KcgsTnU7RXfsw+/bukWGo1abgBiMAic068rclZsO4IWmmxQ=="],
@@ -410,6 +408,8 @@
     "metis-engine": ["metis-engine@workspace:packages/metis-engine"],
 
     "metis-game": ["metis-game@workspace:packages/metis-game"],
+
+    "metis-native": ["metis-native@workspace:packages/metis-native"],
 
     "metis-tui": ["metis-tui@workspace:packages/metis-tui"],
 

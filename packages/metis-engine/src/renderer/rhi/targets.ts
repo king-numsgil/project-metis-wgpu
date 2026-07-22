@@ -1,4 +1,4 @@
-import { type GpuDevice, type GpuTexture, GPUTextureUsage, type GpuTextureView } from "bun-webgpu-rs";
+import { type GpuDevice, type GpuTexture, GPUTextureUsage, type GpuTextureView } from "metis-native";
 
 /** Renderer-owned formats — fixed, not user-tunable (changing them means touching every shader that reads them). */
 export const HDR_COLOR_FORMAT = "rgba16float" as const;

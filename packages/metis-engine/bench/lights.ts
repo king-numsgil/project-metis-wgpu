@@ -23,7 +23,7 @@
 // is the real perf metric. Pass --fps N (or --vsync for 60) to cap the frame rate
 // via the engine FrameLimiter; the cap is applied AFTER the GPU measurement each
 // frame, so it only moves the achieved-frame-rate line, never the GPU number.
-import { SdlEventType, SdlKeycode, sdlPollEvents } from "bun-webgpu-rs";
+import { SdlEventType, SdlKeycode, sdlPollEvents } from "metis-native";
 import {
     CLUSTER_COUNT_X,
     CLUSTER_COUNT_Y,
@@ -398,7 +398,7 @@ function renderFrame(dt: number, hudLine: string): { frame: FrameTarget; acquire
 }
 
 // ── Validation guard ─────────────────────────────────────────────────────────
-// bun-webgpu-rs swallows WebGPU validation errors (they only hit stderr), so a
+// metis-native swallows WebGPU validation errors (they only hit stderr), so a
 // broken bench can silently "succeed". Catch it up front. See metis-engine
 // CLAUDE.md "Debugging WebGPU validation errors".
 ctx.device.pushErrorScope("validation");

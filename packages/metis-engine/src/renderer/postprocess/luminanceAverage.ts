@@ -8,7 +8,7 @@ import {
     type GpuDevice,
     GPUShaderStage,
     type GpuTextureView,
-} from "bun-webgpu-rs";
+} from "metis-native";
 import { Std140Writer } from "../shading/std140.ts";
 import type { PostProcessFrameContext, PostProcessPass } from "./pipeline.ts";
 import luminanceAverageWgsl from "./wgsl/luminance_average.wgsl" with { type: "text" };

@@ -1,6 +1,6 @@
 // Headless (no SDL window) render + screenshot validation, via
-// bun-webgpu-rs's native `readTexturePixels` / `saveTextureToFile` — see
-// bun-webgpu-rs/tests/render.test.ts for the offscreen-rgba8unorm pattern
+// metis-native's native `readTexturePixels` / `saveTextureToFile` — see
+// metis-native/tests/render.test.ts for the offscreen-rgba8unorm pattern
 // this mirrors.
 import {
     type GpuBindGroupLayout,
@@ -12,7 +12,7 @@ import {
     readTexturePixels,
     savePixelsToFile,
     saveTextureToFile,
-} from "bun-webgpu-rs";
+} from "metis-native";
 import {
     ClusteredForwardRenderer,
     createDefaultPostProcessPipeline,

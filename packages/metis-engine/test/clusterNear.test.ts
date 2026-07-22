@@ -13,7 +13,7 @@
 // correct implementation must shade identically at any clusterNear. Any
 // difference means lights were lost.
 import { expect, test } from "bun:test";
-import { readTexturePixels } from "bun-webgpu-rs";
+import { readTexturePixels } from "metis-native";
 import {
     ClusteredForwardRenderer,
     createDefaultPostProcessPipeline,

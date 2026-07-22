@@ -29,8 +29,8 @@
             "@types/bun"
         ],
         "paths": {
-            "bun-webgpu-rs": [
-                "./packages/bun-webgpu-rs"
+            "metis-native": [
+                "./packages/metis-native"
             ],
             "metis-engine": [
                 "./packages/metis-engine"
@@ -39,5 +39,12 @@
                 "./packages/metis-data"
             ]
         }
-    }
+    },
+    // Cargo build dirs contain CMake `compiler_depend.ts` timestamp files —
+    // not TypeScript, but tsc globs them in and reports hundreds of parse
+    // errors that drown out real ones.
+    "exclude": [
+        "**/target",
+        "node_modules"
+    ]
 }
