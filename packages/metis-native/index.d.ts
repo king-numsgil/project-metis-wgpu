@@ -1259,6 +1259,10 @@ export interface GpuVertexState {
  * **Ignored for floating-point source formats** (Radiance HDR): those carry
  * linear radiance by definition, so there is no sRGB transfer curve to undo and
  * no `-srgb` float texture format to request. See [`decode_image`].
+ *
+ * KTX2 has no equivalent option — a `.ktx2` file states its own format, so
+ * [`super::compressed`] reads the colour space out of the file rather than
+ * taking it from the caller.
  */
 export declare enum ImageColorSpace {
   /**
@@ -1282,6 +1286,13 @@ export interface ImageLoadOptions {
   usage?: number
 }
 
+export interface Ktx2LoadOptions {
+  /** Debug label applied to the created GPU texture. */
+  label?: string
+  /** `GpuTextureUsage` bitmask. Defaults to `TEXTURE_BINDING | COPY_DST`. */
+  usage?: number
+}
+
 /**
  * Decode an image file (PNG, TGA, JPEG, Radiance HDR) straight into a
  * `GpuTexture` ready to bind, off the JS thread. The pixels never cross into JS.
@@ -1292,9 +1303,32 @@ export interface ImageLoadOptions {
  * `path` is a filesystem path. The returned promise rejects with a decode error
  * string on failure. The resulting texture's `format` is `rgba8unorm(-srgb)`
  * for 8-bit sources and `rgba16float` for HDR — read it off the returned handle
- * rather than assuming.
+ * rather than assuming. The result always has **one mip level**; for a
+ * pre-built mip chain of GPU-compressed blocks, use `loadKtx2Texture`.
  */
 export declare function loadImageTexture(device: GpuDevice, path: string, options?: ImageLoadOptions | undefined | null): Promise<GpuTexture>
+
+/**
+ * Load a **KTX2** file of GPU-block-compressed texture data (BC1-BC7),
+ * including its full mip chain, straight into a `GpuTexture` — off the JS
+ * thread, with no decoding step: the blocks in the file are the bytes the GPU
+ * samples, so they stay compressed in VRAM (a 2K BC7 texture is 5.5 MB rather
+ * than 16 MB).
+ *
+ * Unlike `loadImageTexture` there is no `colorSpace` option — the file states
+ * its own format, and `BC7_SRGB_BLOCK` becomes `bc7-rgba-unorm-srgb`
+ * accordingly. Read `format` and `mipLevelCount` off the returned handle.
+ *
+ * **Requires the `texture-compression-bc` device feature.** The returned
+ * promise rejects with an actionable error if the device lacks it — there is
+ * no software fallback, so ship an uncompressed asset for such devices. In
+ * practice every desktop GPU on Windows and Linux supports BC.
+ *
+ * Zstandard supercompression is handled transparently. BasisLZ payloads are
+ * rejected (they need a transcoder — see the module docs). Cubemaps, texture
+ * arrays and 3D textures are rejected for now.
+ */
+export declare function loadKtx2Texture(device: GpuDevice, path: string, options?: Ktx2LoadOptions | undefined | null): Promise<GpuTexture>
 
 export interface MouseRect {
   x: number

@@ -485,6 +485,75 @@ signature, so a `.tga` file must actually be named `.tga`.
 > Animated images (`sdlImageLoadAnimation`, GIF/WebP/APNG) were **removed** along
 > with SDL3_image — the API had no consumers.
 
+### Compressed textures: `loadKtx2Texture`
+
+A **separate** loader for GPU-block-compressed data in a KTX2 container. There
+is no decode step — the blocks in the file are the bytes the GPU samples, so
+they stay compressed in VRAM (a 2K BC7 texture is 5.5 MB, not 16 MB) and the
+whole pre-built mip chain uploads with them.
+
+```ts
+import { loadKtx2Texture } from "metis-native";
+
+// Requires the device feature — there is NO software fallback.
+const device = await adapter.requestDevice({
+    requiredFeatures: ["texture-compression-bc"],
+});
+
+const albedo = await loadKtx2Texture(device, "hull_albedo.ktx2");   // bc7-rgba-unorm-srgb
+const normal = await loadKtx2Texture(device, "hull_normal.ktx2", {  // bc5-rg-unorm
+    label: "hull-normal",
+    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,  // default
+});
+albedo.mipLevelCount;   // full chain from the file, e.g. 11 for 1024x1024
+```
+
+**There is no `colorSpace` option** — a KTX2 file states its own format, so
+`BC7_SRGB_BLOCK` becomes `bc7-rgba-unorm-srgb` on its own. Read `format` and
+`mipLevelCount` off the returned handle.
+
+**Which format for what** (all 4:1 or 8:1 vs RGBA8, in VRAM as well as on disk):
+
+| map | format in the file | wgpu format | bpp |
+|---|---|---|---|
+| albedo, emissive | `BC7_SRGB_BLOCK` | `bc7-rgba-unorm-srgb` | 8 |
+| normal | `BC5_UNORM_BLOCK` | `bc5-rg-unorm` | 8 |
+| roughness / metallic / AO | `BC4_UNORM_BLOCK` | `bc4-r-unorm` | 4 |
+| HDR env map | `BC6H_SFLOAT_BLOCK` | `bc6h-rgb-float` | 8 |
+| opaque colour, size-critical | `BC1_RGBA_UNORM_BLOCK` | `bc1-rgba-unorm` | 4 |
+
+BC5 for normals rather than BC7 is not a size trade — it is better *quality* for
+two-channel data at the same bitrate (store XY, reconstruct Z in the shader).
+BC2/BC3 are mapped so old assets load, but BC7 beats both at the same size.
+
+**Making the files** is an offline asset-pipeline job — BC7 encoding is far too
+slow to do at load. Use `ktx` from KTX-Software:
+
+```sh
+ktx create --format BC7_UNORM_BLOCK --generate-mipmap --zstd 18 in.png out.ktx2
+```
+
+**Zstandard supercompression is handled transparently** (pure-Rust `ruzstd`);
+BC blocks compress a further ~2x on disk while staying compressed in VRAM.
+
+Rejections — all reject the promise with an actionable message, never a panic:
+
+| case | why |
+|---|---|
+| device lacks `texture-compression-bc` | no software fallback exists; ship an uncompressed asset and use `loadImageTexture` |
+| BasisLZ payload / `vkFormat` 0 | needs a transcoder; there is deliberately none (C++ dependency — see `CLAUDE.md`) |
+| ZLIB supercompression | only zstd is supported |
+| base dimensions not a multiple of the block size | WebGPU cannot create such a texture; re-encode padded |
+| ETC2 / ASTC | valid KTX2, but unmapped — this crate targets desktop, where BC is universal |
+| cubemaps, texture arrays, 3D | not supported yet |
+| truncated mip level | caught before upload, so you get an error rather than a texture full of garbage |
+
+> **BC support is effectively universal on desktop** (Windows/Linux, any vendor).
+> The relevant axis is the GPU/driver, not the OS — KTX2 parsing itself is
+> platform-independent. On macOS, BC is available on Apple Silicon but was not on
+> all older Intel Macs; gate on `adapter.features.has("texture-compression-bc")`
+> and it is correct everywhere.
+
 ### Saving: texture → file
 
 Three orthogonal calls, so nothing pays for work it doesn't need. All async
@@ -519,6 +588,11 @@ The source texture must have **`GPUTextureUsage.COPY_SRC`**.
 | `rgba8unorm(-srgb)` | ✅ | `.png` / `.jpg` / `.tga` |
 | `bgra8unorm(-srgb)` | ✅ (swizzled to RGBA) | `.png` / `.jpg` / `.tga` |
 | `rgba16float` | ❌ rejected | `.hdr` only |
+| `bc1`–`bc7` (block-compressed) | ❌ rejected | ❌ rejected |
+
+Block-compressed textures cannot be read back: undoing the block encoding would
+mean shipping a BC *decoder*, which nothing here needs. Keep the source image if
+you want to inspect a texture you loaded with `loadKtx2Texture`.
 
 `rgba16float` is refused by `readTexturePixels` on purpose: reinterpreting f16
 bytes as 8-bit colour is silently meaningless, so save it as `.hdr` instead.

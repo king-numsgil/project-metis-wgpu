@@ -117,6 +117,7 @@ once it does, rather than assuming either answer.
 - **napi-rs**: 3.x — uses `#[napi]`, `#[napi(object)]`, `Reference<T>`, async napi fns
 - **SDL3**: built from source via `sdl3-sys = { version = "0.6.7", features = ["build-from-source-static"] }` (bundles SDL 3.4.12)
 - **Image decoding**: `image = { version = "0.25", default-features = false, features = ["png", "jpeg", "tga", "hdr"] }` — pure Rust, no C decoder. Plus `half` for the f32→f16 conversion HDR needs. (SDL3_image was removed; see "Why SDL3_image is gone" below.)
+- **Compressed textures**: `ktx2` (container parsing, zero transitive deps) and `ruzstd` (zstd supercompression). Both pure Rust — deliberately *not* the `zstd` crate, which is C bindings, nor any Basis transcoder. Same rule as the decoder above.
 - **wgpu**: 24.0.5 with WGSL feature
 
 Cargo cache / sdl3-sys source:
@@ -146,10 +147,18 @@ src/
     gamepad.rs    — SdlGamepadAxis/Button enums, SdlGamepad class, sdlGetGamepads
     debug.rs      — sdlLog, sdlGetPerformanceCounter, sdlGetPerformanceFrequency
   image/
-    mod.rs        — pure-Rust image file loading that decodes straight into wgpu
+    mod.rs        — module root: shared helpers only (make_gpu_texture, the error
+                    helper, default usage flags) + re-exports. The two loaders
+                    below are deliberately NOT merged; see "Two loaders" below
+    uncompressed.rs — pure-Rust image file loading that decodes straight into wgpu
                     textures (loadImageTexture, ImageColorSpace enum), backed by
                     the `image` crate. PNG/TGA/JPEG/Radiance HDR. No pixel bytes
-                    cross the napi boundary; file readers only
+                    cross the napi boundary; file readers only. Row strides in
+                    PIXELS, always one mip level
+    compressed.rs — KTX2 container loading (loadKtx2Texture): pre-compressed BC1-BC7
+                    blocks + their mip chain, no decode step, zstd supercompression
+                    via `ruzstd`. Row strides in BLOCKS. Every block-alignment rule
+                    in the package lives here and nowhere else
     save.rs       — the write half: saveTextureToFile, readTexturePixels,
                     savePixelsToFile. GPU readback (row-unpadding, BGRA swizzle)
                     + encoding. Replaced tests/helpers/screenshot.ts
@@ -648,23 +657,135 @@ errors: the suite was green. Only grepping stderr for `wgpu` found it, then
 per-test bisection localised it. That is the failure mode "Debugging WebGPU
 validation errors" warns about, hitting a brand-new test file.
 
+### Two loaders, kept apart on purpose
+
+`loadImageTexture` (`uncompressed.rs`) and `loadKtx2Texture` (`compressed.rs`)
+look alike from JS and are almost entirely different underneath. One *decodes*
+pixels and uploads a single mip with strides in pixels; the other *parses a
+container* — no decode at all — and uploads a mip pyramid with strides in
+**blocks**. They share only the napi handle construction, which lives in
+`mod.rs`.
+
+**Don't merge them.** The merged version is one function where every line is
+guarded by "is this the block case or the pixel case", which is exactly the
+confusion the split avoids. Shared code goes up into `mod.rs`; format-specific
+code stays down in its own file.
+
+The practical payoff: the block-alignment rules cannot reach the uncompressed
+path. `save.rs` was already safe here — `source_kind` is a whitelist with a
+catch-all `Err`, so a BC texture handed to `readTexturePixels` gets a clear
+error rather than a bad row calculation producing garbage.
+
+### KTX2: three things wgpu enforces that the obvious code gets wrong
+
+All three were caught by the same technique — wrapping the load in
+`pushErrorScope('validation')` in the test — and **none of them throws**. This
+binding doesn't surface validation errors as exceptions, so all three produce a
+`GpuTexture` with correct-looking dimensions and a silently broken upload. Tests
+that only assert on the returned handle would have been green for every one.
+
+1. **`bytes_per_row` counts blocks, not pixels.** A BC7 row is `ceil(w/4) * 16`,
+   not `w * 4`. This is the whole reason `compressed.rs` exists as its own file.
+2. **The copy extent must be the *physical* (block-rounded) size, not the
+   logical mip size.** Level 6 of a 64x64 BC7 texture is 1x1 logically but
+   occupies a full 4x4 block, and wgpu rejects a non-block-multiple copy width
+   ("Copy width is not a multiple of block width"). Passing the logical size
+   looks obviously correct and fails on **every mipped texture, at the small
+   levels only** — so a test using a single-mip fixture, or one that stops at
+   4x4, never sees it. `tests/image-ktx2.test.ts` has a 12x4 case whose whole
+   job is to have a mip tail below block size.
+3. **Base dimensions must be a multiple of the block size.** `create_texture`
+   refuses otherwise ("Width 13 is not a multiple of Bc7RgbaUnorm's block width")
+   — this is a WebGPU rule, not a wgpu quirk, so it can't be worked around and is
+   rejected with a pointed error instead. Encoders pad; an unaligned file is a
+   bad asset.
+
+### KTX2 tests: two tiers of fixture, and why both are needed
+
+`tests/image-ktx2.test.ts` runs against two kinds of fixture, and the split is
+load-bearing rather than incidental.
+
+**Tier 1 — an inline KTX2 writer.** Builds files byte by byte, so the malformed
+cases (truncated levels, cubemaps, BasisLZ, unaligned dimensions, ZLIB) need no
+committed binaries. Level *data* is written smallest-mip-first, as the real
+`ktx` tool emits it, while the index lists level 0 first — a loader that walked
+storage order instead of the index would read the chain upside down.
+
+**Tier 2 — real KTX-Software output**, committed in `tests/assets/quad-*.ktx2`,
+regenerated by `tests/assets/generate-ktx2-fixtures.ts` (needs `ktx` on PATH;
+AUR `ktx-software-bin`). Committed rather than generated at test time so the
+suite doesn't depend on the tool. The source is 64x64 with four solid 32x32
+quadrants, and **every property of that image is deliberate**: solid colours on
+4x4 block boundaries are something BC7/BC5/BC1 encode *exactly* (measured
+bit-exact, even through the UASTC intermediate), so the assertions can be exact
+rather than tolerance-based; four *distinct* quadrants make position observable;
+and the mip chain runs to 1x1 so both ends are checkable.
+
+**Why tier 2 exists.** An error scope only proves wgpu *accepted* the upload, not
+that the bytes landed in the right place. Tier 1 never looks at a texel — its
+fixture payloads are arbitrary counter bytes — so it cannot see mip levels
+swapped or a level offset by a block. Demonstrated by mutation: uploading level
+0's bytes to *every* level, truncated to each level's correct size, keeps all
+sizes valid, raises no validation error, and **passes all 19 structural tests**.
+Exactly one test catches it — the mip-ordering pixel test. Conversely, reverting
+the physical-extent fix fails 5 tests, and reversing the mip order fails 9.
+
+Reading a BC texture back requires rendering it: `readTexturePixels` rejects
+block-compressed formats on purpose, so `tests/helpers/texture-render.ts` samples
+one mip level at a time (via a single-level `createView`) into an `rgba8unorm`
+target and reads *that* back.
+
+**One fixture gotcha worth not rediscovering:** `ktx transcode --target bc5`
+packs **R→R and A→G**, the normal-map convention — not R→R, G→G. The quadrant
+fixture is opaque, so its BC5 green channel reads 255 everywhere and only red
+carries position. That is why the four-way positional assertion lives on the BC7
+case.
+
+### The format tables in `convert.rs` are two one-way maps, and they drifted
+
+`texture_format_from_str` accepted every BC/ETC2/ASTC name, but
+`texture_format_to_str` stopped at the uncompressed formats and fell through to
+`"unknown"`. So a block-compressed texture was **creatable but not reportable** —
+`texture.format` came back `"unknown"`, which is useless given the API's own
+advice is "read the format off the returned handle rather than assuming".
+
+This is the same failure the `FEATURES` table note above warns about ("a name
+could become requestable but unreportable"), in the other direction, and it went
+unnoticed because nothing created a compressed texture until `loadKtx2Texture`
+did. Both directions are now complete. **If you add a texture format, add it to
+both maps** — unlike `FEATURES`, these two can't be collapsed into one table,
+because ASTC is a single wgpu variant with block/channel fields rather than one
+variant per name.
+
 ### Formats deliberately not supported (yet)
 
 - **Animated images** (GIF/WebP/APNG). `sdlImageLoadAnimation` and
   `SdlImageAnimation` were removed with SDL3_image rather than ported — nothing
   in the monorepo called them. `image` can decode GIF/WebP animation if this
   comes back.
-- **Compressed / transcoded GPU textures** (Basis Universal, KTX2, DDS).
-  Evaluated and deferred, and the reasoning should be re-checked rather than
-  re-derived: the mature `basis-universal` crate is **C++ bindings**, which
-  reintroduces exactly the risk this module was rewritten to remove, and it has
-  not shipped since 2023-11. The pure-Rust `basisu` crate exists and claims
-  bit-exactness, but as of 2026-07 it is v0.1.0 with ~10 downloads — not
-  something to put in the path of every texture load. The recommended entry
-  point when this is wanted is the mature pure-Rust `ktx2` container crate,
-  uploading **pre-compressed** BC7/BC5/ASTC blocks with `device.features`
-  gating — no transcoder involved. Note that path needs block-aligned uploads
-  and `bytes_per_row` in blocks, which the current RGBA8/RGBA16F code does not do.
+- **Basis Universal transcoding** (and the `.basis` container). KTX2 with
+  *pre-compressed* BC blocks **is** supported now — that was the recommendation
+  this bullet used to make, and `compressed.rs` is it. What stays deferred is
+  the transcoder, and the reasoning should be re-checked rather than re-derived:
+  the mature `basis-universal` crate is **C++ bindings**, which reintroduces
+  exactly the risk this module was rewritten to remove, and it has not shipped
+  since 2023-11. The pure-Rust `basisu` crate exists and claims bit-exactness,
+  but as of 2026-07 it is v0.1.0 with ~10 downloads — not something to put in
+  the path of every texture load. A KTX2 file with no `vkFormat` is therefore
+  rejected with an error telling the caller to re-encode to a concrete format.
+- **DDS.** No container parser. KTX2 covers the same ground and is the format
+  the Khronos tooling emits; add DDS only if an asset pipeline forces it.
+- **ETC2 / ASTC.** Both are valid KTX2 payloads and wgpu supports both, and
+  `convert.rs` maps their names in *both* directions — but `compressed.rs`
+  deliberately does not list them in `BLOCK_FORMATS`, because this crate targets
+  desktop where BC is universal. Enabling one is a table entry plus its feature
+  name; the block math already generalises (it reads `block_dimensions()` off
+  the format, so a 5x5 ASTC block needs no new code).
+- **Cubemaps, texture arrays and 3D textures from KTX2.** The container supports
+  all three; the loader rejects them. `make_gpu_texture` hardcodes
+  `depth_or_array_layers: 1`, and the level data layout for those cases is
+  `layer -> face -> z-slice -> row -> block`, which is a real (if mechanical)
+  extension to the upload loop. Env-map cubemaps are the likeliest first need.
 
 ---
 

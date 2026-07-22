@@ -19,6 +19,7 @@
 //! the napi boundary; splitting it keeps the common case free while still
 //! letting a test do both from one GPU readback.
 
+use super::generic_err;
 use crate::gpu::{GpuDevice, GpuTexture};
 use image::ImageEncoder;
 use napi::bindgen_prelude::{AsyncTask, Uint8Array};
@@ -46,10 +47,6 @@ impl TextureRef {
             usage: t.usage,
         }
     }
-}
-
-fn generic_err(msg: String) -> napi::Error {
-    napi::Error::new(napi::Status::GenericFailure, msg)
 }
 
 /// `GPUTextureUsage.COPY_SRC` — required on any texture being read back.

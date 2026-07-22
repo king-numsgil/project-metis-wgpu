@@ -628,6 +628,7 @@ module.exports.GPUTextureUsage = nativeBinding.GPUTextureUsage
 module.exports.GpuTextureUsage = nativeBinding.GpuTextureUsage
 module.exports.ImageColorSpace = nativeBinding.ImageColorSpace
 module.exports.loadImageTexture = nativeBinding.loadImageTexture
+module.exports.loadKtx2Texture = nativeBinding.loadKtx2Texture
 module.exports.readTexturePixels = nativeBinding.readTexturePixels
 module.exports.requestAdapter = nativeBinding.requestAdapter
 module.exports.requestAdapterForWindow = nativeBinding.requestAdapterForWindow

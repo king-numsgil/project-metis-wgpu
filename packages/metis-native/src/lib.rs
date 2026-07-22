@@ -74,9 +74,14 @@ pub use gpu::{GpuBufferUsage, GpuTextureUsage, GpuShaderStage, GpuMapMode, GpuCo
 
 pub use vector::{VectorContext, FontMetrics, DrawCall};
 
-// ── Image loading (file -> wgpu texture), pure Rust via the `image` crate ───────
+// ── Image loading (file -> wgpu texture), pure Rust — no C decoder in the path ──
+//
+// Two separate loaders, deliberately: `load_image_texture` decodes pixels
+// (PNG/JPEG/TGA/HDR, via the `image` crate) into a single-mip texture, while
+// `load_ktx2_texture` uploads pre-compressed BC blocks and their mip chain from
+// a KTX2 container. See `image/mod.rs` for why they aren't one function.
 
 pub use image::{
-    ImageColorSpace, ImageLoadOptions, load_image_texture, read_texture_pixels, save_pixels_to_file,
-    save_texture_to_file,
+    ImageColorSpace, ImageLoadOptions, Ktx2LoadOptions, load_image_texture, load_ktx2_texture,
+    read_texture_pixels, save_pixels_to_file, save_texture_to_file,
 };

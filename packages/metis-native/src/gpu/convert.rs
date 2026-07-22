@@ -150,6 +150,76 @@ pub fn texture_format_to_str(f: wgpu::TextureFormat) -> &'static str {
         wgpu::TextureFormat::Depth24PlusStencil8 => "depth24plus-stencil8",
         wgpu::TextureFormat::Depth32Float => "depth32float",
         wgpu::TextureFormat::Depth32FloatStencil8 => "depth32float-stencil8",
+        // ── Compressed formats ──────────────────────────────────────────────
+        //
+        // These were missing until `loadKtx2Texture` landed, so a BC texture
+        // could be *created* (the name parses in `texture_format_from_str`) but
+        // not *reported* — `texture.format` came back "unknown". That is the
+        // same asymmetry the `FEATURES` table warns about further down this
+        // file, in the other direction: if you add a format above, add it here
+        // too, or it becomes creatable-but-unreadable.
+        wgpu::TextureFormat::Bc1RgbaUnorm => "bc1-rgba-unorm",
+        wgpu::TextureFormat::Bc1RgbaUnormSrgb => "bc1-rgba-unorm-srgb",
+        wgpu::TextureFormat::Bc2RgbaUnorm => "bc2-rgba-unorm",
+        wgpu::TextureFormat::Bc2RgbaUnormSrgb => "bc2-rgba-unorm-srgb",
+        wgpu::TextureFormat::Bc3RgbaUnorm => "bc3-rgba-unorm",
+        wgpu::TextureFormat::Bc3RgbaUnormSrgb => "bc3-rgba-unorm-srgb",
+        wgpu::TextureFormat::Bc4RUnorm => "bc4-r-unorm",
+        wgpu::TextureFormat::Bc4RSnorm => "bc4-r-snorm",
+        wgpu::TextureFormat::Bc5RgUnorm => "bc5-rg-unorm",
+        wgpu::TextureFormat::Bc5RgSnorm => "bc5-rg-snorm",
+        wgpu::TextureFormat::Bc6hRgbUfloat => "bc6h-rgb-ufloat",
+        wgpu::TextureFormat::Bc6hRgbFloat => "bc6h-rgb-float",
+        wgpu::TextureFormat::Bc7RgbaUnorm => "bc7-rgba-unorm",
+        wgpu::TextureFormat::Bc7RgbaUnormSrgb => "bc7-rgba-unorm-srgb",
+        wgpu::TextureFormat::Etc2Rgb8Unorm => "etc2-rgb8unorm",
+        wgpu::TextureFormat::Etc2Rgb8UnormSrgb => "etc2-rgb8unorm-srgb",
+        wgpu::TextureFormat::Etc2Rgb8A1Unorm => "etc2-rgb8a1unorm",
+        wgpu::TextureFormat::Etc2Rgb8A1UnormSrgb => "etc2-rgb8a1unorm-srgb",
+        wgpu::TextureFormat::Etc2Rgba8Unorm => "etc2-rgba8unorm",
+        wgpu::TextureFormat::Etc2Rgba8UnormSrgb => "etc2-rgba8unorm-srgb",
+        wgpu::TextureFormat::EacR11Unorm => "eac-r11unorm",
+        wgpu::TextureFormat::EacR11Snorm => "eac-r11snorm",
+        wgpu::TextureFormat::EacRg11Unorm => "eac-rg11unorm",
+        wgpu::TextureFormat::EacRg11Snorm => "eac-rg11snorm",
+        // ASTC is one wgpu variant with block/channel fields rather than a
+        // variant per name, so it round-trips through a nested match instead of
+        // 39 arms.
+        wgpu::TextureFormat::Astc { block, channel } => {
+            use wgpu::{AstcBlock as B, AstcChannel as C};
+            match (block, channel) {
+                (B::B4x4, C::Unorm) => "astc-4x4-unorm",
+                (B::B4x4, C::UnormSrgb) => "astc-4x4-unorm-srgb",
+                (B::B4x4, C::Hdr) => "astc-4x4-hdr",
+                (B::B5x4, C::Unorm) => "astc-5x4-unorm",
+                (B::B5x4, C::UnormSrgb) => "astc-5x4-unorm-srgb",
+                (B::B5x5, C::Unorm) => "astc-5x5-unorm",
+                (B::B5x5, C::UnormSrgb) => "astc-5x5-unorm-srgb",
+                (B::B6x5, C::Unorm) => "astc-6x5-unorm",
+                (B::B6x5, C::UnormSrgb) => "astc-6x5-unorm-srgb",
+                (B::B6x6, C::Unorm) => "astc-6x6-unorm",
+                (B::B6x6, C::UnormSrgb) => "astc-6x6-unorm-srgb",
+                (B::B8x5, C::Unorm) => "astc-8x5-unorm",
+                (B::B8x5, C::UnormSrgb) => "astc-8x5-unorm-srgb",
+                (B::B8x6, C::Unorm) => "astc-8x6-unorm",
+                (B::B8x6, C::UnormSrgb) => "astc-8x6-unorm-srgb",
+                (B::B8x8, C::Unorm) => "astc-8x8-unorm",
+                (B::B8x8, C::UnormSrgb) => "astc-8x8-unorm-srgb",
+                (B::B10x5, C::Unorm) => "astc-10x5-unorm",
+                (B::B10x5, C::UnormSrgb) => "astc-10x5-unorm-srgb",
+                (B::B10x6, C::Unorm) => "astc-10x6-unorm",
+                (B::B10x6, C::UnormSrgb) => "astc-10x6-unorm-srgb",
+                (B::B10x8, C::Unorm) => "astc-10x8-unorm",
+                (B::B10x8, C::UnormSrgb) => "astc-10x8-unorm-srgb",
+                (B::B10x10, C::Unorm) => "astc-10x10-unorm",
+                (B::B10x10, C::UnormSrgb) => "astc-10x10-unorm-srgb",
+                (B::B12x10, C::Unorm) => "astc-12x10-unorm",
+                (B::B12x10, C::UnormSrgb) => "astc-12x10-unorm-srgb",
+                (B::B12x12, C::Unorm) => "astc-12x12-unorm",
+                (B::B12x12, C::UnormSrgb) => "astc-12x12-unorm-srgb",
+                _ => "unknown",
+            }
+        }
         _ => "unknown",
     }
 }
