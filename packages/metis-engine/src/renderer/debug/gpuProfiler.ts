@@ -315,13 +315,12 @@ export class GpuProfiler {
         entry.readback
             .mapAsync(GPUMapMode.READ, 0, byteSize)
             .then(() => {
-                const bytes = entry.readback.getMappedRange(0, byteSize);
-                // Reinterpret the bytes as u64. `new BigUint64Array(bytes)` would
-                // convert *values* element-by-element instead — the same trap that
-                // once produced a phantom shadow bug in this repo.
-                const ticks = new BigUint64Array(
-                    bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + byteSize),
-                );
+                const mapped = entry.readback.getMappedRange(0, byteSize);
+                // Copy the bytes out before unmap() detaches the mapped range,
+                // reinterpreting them as u64. `slice(0)` copies into a standalone
+                // ArrayBuffer; `BigUint64Array` over an ArrayBuffer reinterprets
+                // bytes (not values — the trap that once caused a phantom shadow bug).
+                const ticks = new BigUint64Array(mapped.slice(0));
                 this.build(entry.layout, ticks);
                 entry.readback.unmap();
                 entry.state = "free";

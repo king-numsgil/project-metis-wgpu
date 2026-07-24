@@ -53,7 +53,7 @@ pub use save::{read_texture_pixels, save_pixels_to_file, save_texture_to_file};
 pub use uncompressed::{ImageColorSpace, ImageLoadOptions, load_image_texture};
 
 use crate::gpu::GpuTexture;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// `GpuTextureUsage.TEXTURE_BINDING | GpuTextureUsage.COPY_DST` — a sampleable
 /// texture you can also re-upload to. The default for a loaded image.
@@ -76,6 +76,7 @@ pub(crate) fn make_gpu_texture(
     mip_level_count: u32,
     format: wgpu::TextureFormat,
     usage: u32,
+    label: Option<String>,
 ) -> GpuTexture {
     GpuTexture {
         inner,
@@ -87,5 +88,6 @@ pub(crate) fn make_gpu_texture(
         dimension: wgpu::TextureDimension::D2,
         format,
         usage,
+        label: Mutex::new(label),
     }
 }

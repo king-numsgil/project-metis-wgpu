@@ -1,6 +1,6 @@
 use super::convert;
 use napi_derive::napi;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 #[napi(object)]
 pub struct GpuSamplerDescriptor {
@@ -31,12 +31,22 @@ pub struct GpuSamplerDescriptor {
 #[napi]
 pub struct GpuSampler {
     pub(crate) inner: Arc<wgpu::Sampler>,
+    label: Mutex<Option<String>>,
 }
 
 impl GpuSampler {
-    pub(crate) fn new(inner: wgpu::Sampler) -> Self {
-        Self { inner: Arc::new(inner) }
+    pub(crate) fn new(inner: wgpu::Sampler, label: Option<String>) -> Self {
+        Self { inner: Arc::new(inner), label: Mutex::new(label) }
     }
+}
+
+#[napi]
+impl GpuSampler {
+    /// Debug label (read-write).
+    #[napi(getter)]
+    pub fn label(&self) -> Option<String> { self.label.lock().unwrap().clone() }
+    #[napi(setter)]
+    pub fn set_label(&self, label: String) { *self.label.lock().unwrap() = Some(label); }
 }
 
 pub fn build_descriptor(desc: &GpuSamplerDescriptor) -> napi::Result<wgpu::SamplerDescriptor<'_>> {

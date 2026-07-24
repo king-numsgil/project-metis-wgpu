@@ -61,7 +61,7 @@ async function load(path: string, srgb: boolean) {
     device.queue.submit([enc.finish()]);
     await device.queue.onSubmittedWorkDone();
     await buf.mapAsync(GPUMapMode.READ);
-    const mapped = buf.getMappedRange();
+    const mapped = new Uint8Array(buf.getMappedRange());
     const out = new Uint8Array(unpadded * h);
     for (let y = 0; y < h; y++) {
         out.set(mapped.subarray(y * padded, y * padded + unpadded), y * unpadded);

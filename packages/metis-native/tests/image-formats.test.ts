@@ -106,7 +106,7 @@ async function readTexels(path: string, srgb: boolean, bpp: number, count: numbe
     device!.queue.submit([enc.finish()]);
     await device!.queue.onSubmittedWorkDone();
     await buf.mapAsync(GPUMapMode.READ);
-    const m = buf.getMappedRange();
+    const m = new Uint8Array(buf.getMappedRange());
     // Row 0, plus the first texel of row 1 (at `padded`) for row-order checks.
     const first = new Uint8Array(m.subarray(0, count * bpp));
     const secondRow = new Uint8Array(m.subarray(padded, padded + bpp));

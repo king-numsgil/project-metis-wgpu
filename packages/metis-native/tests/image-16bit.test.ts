@@ -160,7 +160,7 @@ async function readBack(path: string, srgb: boolean) {
     device!.queue.submit([enc.finish()]);
     await device!.queue.onSubmittedWorkDone();
     await buf.mapAsync(GPUMapMode.READ);
-    const m = buf.getMappedRange();
+    const m = new Uint8Array(buf.getMappedRange());
     const px = Array.from(m.subarray(0, 8));
     buf.unmap();
     buf.destroy();

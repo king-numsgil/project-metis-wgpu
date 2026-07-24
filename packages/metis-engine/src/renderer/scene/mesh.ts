@@ -56,7 +56,7 @@ export class Mesh {
             usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
             mappedAtCreation: true,
         });
-        this.vertexBuffer.writeMappedRange(toBytes(data.vertices));
+        new Uint8Array(this.vertexBuffer.getMappedRange()).set(toBytes(data.vertices));
         this.vertexBuffer.unmap();
 
         this.indexBuffer = device.createBuffer({
@@ -65,7 +65,7 @@ export class Mesh {
             usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
             mappedAtCreation: true,
         });
-        this.indexBuffer.writeMappedRange(toBytes(data.indices));
+        new Uint8Array(this.indexBuffer.getMappedRange()).set(toBytes(data.indices));
         this.indexBuffer.unmap();
 
         this.indexCount = data.indices.length;

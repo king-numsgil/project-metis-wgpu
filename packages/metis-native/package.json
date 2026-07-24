@@ -2,11 +2,14 @@
   "name": "metis-native",
   "version": "0.1.0",
   "description": "",
-  "main": "index.js",
+  "main": "webgpu.js",
+  "types": "webgpu.d.ts",
   "license": "MIT",
   "files": [
     "index.d.ts",
-    "index.js"
+    "index.js",
+    "webgpu.d.ts",
+    "webgpu.js"
   ],
   "napi": {
     "binaryName": "metis-native",

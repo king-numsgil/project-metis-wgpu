@@ -1,6 +1,9 @@
 use super::error::map_err_display;
 use napi::bindgen_prelude::*;
+use napi::sys;
+use napi::Env;
 use napi_derive::napi;
+use std::os::raw::c_void;
 use std::sync::{Arc, Mutex};
 
 #[napi(object)]
@@ -11,26 +14,80 @@ pub struct GpuBufferDescriptor {
     pub mapped_at_creation: Option<bool>,
 }
 
-/// A block of GPU memory created by `device.createBuffer`.
+/// A range handed out by `getMappedRange`: the wgpu view keeps the mapping (and
+/// its host pointer) alive, and `ab_ref` is a persistent napi reference to the
+/// external `ArrayBuffer` that aliases it, so `unmap()`/`destroy()` can **detach**
+/// the ArrayBuffer before the pointer dies.
+struct HandedRange {
+    _view: wgpu::BufferView,
+    ab_ref: usize, // sys::napi_ref as usize — only ever used on the JS thread
+}
+
+/// The mapped ArrayBuffers handed out for this buffer.
 ///
-/// Fill it from the CPU via `queue.writeBuffer` (the usual path), or — for a
-/// buffer created `mappedAtCreation` or after `mapAsync` — through
-/// `getMappedRange` / `writeMappedRange`. Bind it to shaders as a vertex,
-/// index, uniform or storage buffer per its `usage` flags. Call `destroy()`
-/// when done to free the memory eagerly rather than waiting for GC.
+/// SAFETY: only ever created, read, and dropped on the JS (napi) thread —
+/// `getMappedRange` / `unmap` / `destroy` are synchronous napi methods, and
+/// `map_async` (which runs on a worker) never touches this, only the boolean
+/// flag. The raw wgpu view pointer and the napi ref are therefore never used
+/// off-thread, so the manual `Send`/`Sync` is sound.
+struct MappedRanges(Vec<HandedRange>);
+unsafe impl Send for MappedRanges {}
+unsafe impl Sync for MappedRanges {}
+
 #[napi]
 pub struct GpuBuffer {
     pub(crate) inner: Arc<wgpu::Buffer>,
     pub(crate) device: Arc<wgpu::Device>,
     pub(crate) size: u64,
     pub(crate) usage: u32,
-    label: Option<String>,
+    label: Mutex<Option<String>>,
     mapped: Mutex<bool>,
+    mapped_ranges: Mutex<MappedRanges>,
 }
 
 impl GpuBuffer {
     pub(crate) fn new(inner: wgpu::Buffer, device: Arc<wgpu::Device>, size: u64, usage: u32, label: Option<String>, mapped_at_creation: bool) -> Self {
-        Self { inner: Arc::new(inner), device, size, usage, label, mapped: Mutex::new(mapped_at_creation) }
+        Self {
+            inner: Arc::new(inner),
+            device,
+            size,
+            usage,
+            label: Mutex::new(label),
+            mapped: Mutex::new(mapped_at_creation),
+            mapped_ranges: Mutex::new(MappedRanges(Vec::new())),
+        }
+    }
+
+    /// Detach every handed-out mapped ArrayBuffer and release its wgpu view.
+    ///
+    /// Detaching first (while the view — and thus the host pointer — is still
+    /// alive) is what makes this safe: after this returns, JS holds detached
+    /// (zero-length) ArrayBuffers instead of live aliases into memory that the
+    /// following `unmap()`/`destroy()` invalidates.
+    fn detach_all(&self, env: &Env) {
+        let mut ranges = self.mapped_ranges.lock().unwrap();
+        for range in ranges.0.drain(..) {
+            let ab_ref = range.ab_ref as sys::napi_ref;
+            unsafe {
+                let mut val: sys::napi_value = std::ptr::null_mut();
+                if sys::napi_get_reference_value(env.raw(), ab_ref, &mut val) == sys::Status::napi_ok
+                    && !val.is_null()
+                {
+                    // Ignore the result: an already-detached buffer is fine.
+                    let _ = sys::napi_detach_arraybuffer(env.raw(), val);
+                }
+                let _ = sys::napi_delete_reference(env.raw(), ab_ref);
+            }
+            // range._view drops here, releasing wgpu's range tracking.
+        }
+    }
+}
+
+fn napi_ok(status: sys::napi_status, msg: &str) -> napi::Result<()> {
+    if status == sys::Status::napi_ok {
+        Ok(())
+    } else {
+        Err(napi::Error::new(napi::Status::GenericFailure, format!("{msg} (napi_status={status})")))
     }
 }
 
@@ -42,9 +99,11 @@ impl GpuBuffer {
     /// The `GPUBufferUsage` bitmask this buffer was created with.
     #[napi(getter)]
     pub fn usage(&self) -> u32 { self.usage }
-    /// The debug label passed at creation, or `null`.
+    /// The debug label (read-write).
     #[napi(getter)]
-    pub fn label(&self) -> Option<String> { self.label.clone() }
+    pub fn label(&self) -> Option<String> { self.label.lock().unwrap().clone() }
+    #[napi(setter)]
+    pub fn set_label(&self, label: String) { *self.label.lock().unwrap() = Some(label); }
 
     /// Current map state: `"mapped"` or `"unmapped"`. (The transient
     /// `"pending"` state the spec defines is not surfaced separately here.)
@@ -59,8 +118,8 @@ impl GpuBuffer {
     /// have the matching `MAP_READ` / `MAP_WRITE` usage. `offset`/`size` bound
     /// the mapped region (defaults: whole buffer from 0). This drives the
     /// device poll internally, so the returned promise settling means the range
-    /// is ready for `getMappedRange` / `writeMappedRange`. Call `unmap()` before
-    /// using the buffer on the GPU again.
+    /// is ready for `getMappedRange`. Call `unmap()` before using the buffer on
+    /// the GPU again.
     #[napi]
     pub async fn map_async(&self, mode: u32, offset: Option<f64>, size: Option<f64>) -> napi::Result<()> {
         let offset = offset.unwrap_or(0.0) as u64;
@@ -98,64 +157,73 @@ impl GpuBuffer {
         Ok(())
     }
 
-    /// Copy the mapped range out as a fresh `Uint8Array`. The buffer must be
-    /// mapped (via `mapAsync` or `mappedAtCreation`). `offset`/`size` default to
-    /// the whole buffer.
+    /// Return an `ArrayBuffer` that **aliases** the mapped memory directly — no
+    /// copy — matching the WebGPU spec (offset multiple of 8, size multiple of
+    /// 4; defaults to the whole buffer). The buffer must be mapped (via
+    /// `mapAsync` or `mappedAtCreation`). Wrap it to read/write, e.g.
+    /// `new Float32Array(range)`.
     ///
-    /// Unlike the browser spec — which returns a live `ArrayBuffer` view into
-    /// the mapping — this returns an owned **copy**, because the napi boundary
-    /// can't hand back a borrow of GPU memory. To write into a mapped buffer use
-    /// `writeMappedRange`.
-    #[napi]
-    pub fn get_mapped_range(&self, offset: Option<f64>, size: Option<f64>) -> napi::Result<Uint8Array> {
+    /// The range stays valid until `unmap()` / `destroy()`, which **detach** it
+    /// (its `byteLength` becomes 0 and further access throws) so JS can never
+    /// read freed GPU memory. Writes into a `MAP_WRITE` / `mappedAtCreation`
+    /// range are flushed to the GPU by `unmap()`.
+    ///
+    /// Non-overlapping ranges may be requested with multiple calls. (Note:
+    /// mapped memory can be write-combining on some backends, so reading back a
+    /// value you just wrote into a write-mapped range is not guaranteed fast or
+    /// coherent — write-mapped ranges are meant to be written, not read.)
+    #[napi(ts_return_type = "ArrayBuffer")]
+    pub fn get_mapped_range<'env>(&self, env: &'env Env, offset: Option<f64>, size: Option<f64>) -> napi::Result<Unknown<'env>> {
         if !*self.mapped.lock().unwrap() {
             return Err(napi::Error::new(napi::Status::GenericFailure, "Buffer is not mapped"));
         }
         let offset = offset.unwrap_or(0.0) as u64;
         let end = size.map_or(self.size, |s| offset + s as u64);
         let view = self.inner.slice(offset..end).get_mapped_range().map_err(map_err_display)?;
-        Ok(Uint8Array::new(view.to_vec()))
+        // Pointer into the live mapped memory. The `HandedRange` keeps `view`
+        // alive (and thus this pointer valid) until unmap()/destroy().
+        let ptr = view.as_ptr() as *mut c_void;
+        let len = view.len();
+
+        // Aliasing external ArrayBuffer — no copy. No finalizer: wgpu owns the
+        // memory, and we invalidate JS access explicitly via detach on unmap.
+        let mut ab: sys::napi_value = std::ptr::null_mut();
+        napi_ok(
+            unsafe {
+                sys::napi_create_external_arraybuffer(env.raw(), ptr, len, None, std::ptr::null_mut(), &mut ab)
+            },
+            "napi_create_external_arraybuffer failed (does this runtime support external ArrayBuffers?)",
+        )?;
+
+        // Persistent reference so unmap()/destroy() can detach this exact buffer.
+        let mut ab_ref: sys::napi_ref = std::ptr::null_mut();
+        napi_ok(
+            unsafe { sys::napi_create_reference(env.raw(), ab, 1, &mut ab_ref) },
+            "napi_create_reference failed",
+        )?;
+
+        self.mapped_ranges.lock().unwrap().0.push(HandedRange { _view: view, ab_ref: ab_ref as usize });
+
+        unsafe { Unknown::from_napi_value(env.raw(), ab) }
     }
 
-    /// Write `data` into the mapped buffer (this binding's replacement for
-    /// mutating the spec's live mapped `ArrayBuffer`, which the napi boundary
-    /// can't expose). The buffer must be mapped for writing.
-    ///
-    /// `bufferOffset` is where in the buffer to start (default 0);
-    /// `dataOffset`/`size` select a sub-slice of `data` (defaults: all of it).
+    /// Unmap the buffer, making it usable by the GPU again. Detaches every
+    /// `ArrayBuffer` handed out by `getMappedRange` (they become zero-length),
+    /// and flushes writes made into a `MAP_WRITE` / `mappedAtCreation` range.
     #[napi]
-    pub fn write_mapped_range(
-        &self,
-        data: Uint8Array,
-        buffer_offset: Option<f64>,
-        data_offset: Option<f64>,
-        size: Option<f64>,
-    ) -> napi::Result<()> {
-        if !*self.mapped.lock().unwrap() {
-            return Err(napi::Error::new(napi::Status::GenericFailure, "Buffer is not mapped"));
-        }
-        let buf_off = buffer_offset.unwrap_or(0.0) as u64;
-        let dat_off = data_offset.unwrap_or(0.0) as usize;
-        let dat_end = size.map_or(data.len(), |s| dat_off + s as usize);
-        let src = &data[dat_off..dat_end];
-        let end = buf_off + src.len() as u64;
-        let mut view = self.inner.slice(buf_off..end).get_mapped_range_mut().map_err(map_err_display)?;
-        view.copy_from_slice(src);
-        Ok(())
-    }
-
-    /// Unmap the buffer, flushing any `writeMappedRange` edits and making it
-    /// usable by the GPU again. Any array returned by `getMappedRange` is a copy
-    /// and stays valid, but must not be written back after this.
-    #[napi]
-    pub fn unmap(&self) -> napi::Result<()> {
+    pub fn unmap(&self, env: &Env) -> napi::Result<()> {
+        self.detach_all(env);
         self.inner.unmap();
         *self.mapped.lock().unwrap() = false;
         Ok(())
     }
 
-    /// Free the buffer's GPU memory now. Subsequent use is a validation error;
-    /// the handle itself becomes inert.
+    /// Free the buffer's GPU memory now. Detaches any mapped `ArrayBuffer`
+    /// first. Subsequent use is a validation error; the handle becomes inert.
     #[napi]
-    pub fn destroy(&self) { self.inner.destroy(); }
+    pub fn destroy(&self, env: &Env) {
+        self.detach_all(env);
+        self.inner.destroy();
+        *self.mapped.lock().unwrap() = false;
+    }
 }

@@ -141,7 +141,7 @@ describe("GPUBuffer", () => {
         });
         expect(buf.mapState).toBe("mapped");
         const data = new Uint8Array([1, 2, 3, 4]);
-        buf.writeMappedRange(data, 0);
+        new Uint8Array(buf.getMappedRange()).set(data, 0);
         buf.unmap();
         expect(buf.mapState).toBe("unmapped");
         buf.destroy();
@@ -158,7 +158,7 @@ describe("GPUBuffer", () => {
             mappedAtCreation: true,
         });
         const initData = new Uint8Array(size).fill(42);
-        src.writeMappedRange(initData);
+        new Uint8Array(src.getMappedRange()).set(initData);
         src.unmap();
 
         const dst = device.createBuffer({
@@ -172,14 +172,49 @@ describe("GPUBuffer", () => {
         device.queue.submit([cmdBuf]);
 
         await dst.mapAsync(GPUMapMode.READ);
-        const result = dst.getMappedRange();
-        expect(result).toBeInstanceOf(Uint8Array);
+        const mapped = dst.getMappedRange();
+        expect(mapped).toBeInstanceOf(ArrayBuffer);
+        const result = new Uint8Array(mapped);
         expect(result[0]).toBe(42);
         expect(result[size - 1]).toBe(42);
         dst.unmap();
 
         src.destroy();
         dst.destroy();
+    });
+
+    it("getMappedRange returns a zero-copy ArrayBuffer that detaches on unmap", () => {
+        if (!device) {
+            return;
+        }
+        const buf = device.createBuffer({size: 16, usage: GPUBufferUsage.COPY_SRC, mappedAtCreation: true});
+        const range = buf.getMappedRange();
+        expect(range).toBeInstanceOf(ArrayBuffer);
+        expect(range.byteLength).toBe(16);
+
+        // A write into the range is visible through a fresh view of the same
+        // ArrayBuffer — i.e. it aliases the mapping rather than a copy.
+        new Uint8Array(range).set([9, 8, 7, 6]);
+        expect(new Uint8Array(range)[0]).toBe(9);
+
+        // Spec + safety: unmap() detaches every handed-out range, so JS can never
+        // read the (now freed/reused) mapped memory. A detached buffer reports
+        // byteLength 0.
+        buf.unmap();
+        expect(range.byteLength).toBe(0);
+
+        buf.destroy();
+    });
+
+    it("destroy() also detaches an outstanding mapped range", () => {
+        if (!device) {
+            return;
+        }
+        const buf = device.createBuffer({size: 16, usage: GPUBufferUsage.COPY_SRC, mappedAtCreation: true});
+        const range = buf.getMappedRange();
+        expect(range.byteLength).toBe(16);
+        buf.destroy();
+        expect(range.byteLength).toBe(0);
     });
 });
 
@@ -352,7 +387,7 @@ describe("GPUComputePipeline", () => {
 
         await readBuffer.mapAsync(GPUMapMode.READ);
         const raw = readBuffer.getMappedRange();
-        const floats = new Float32Array(raw.buffer, raw.byteOffset, N);
+        const floats = new Float32Array(raw, 0, N);
         expect(floats[0]).toBe(0);
         expect(floats[1]).toBe(2);
         expect(floats[63]).toBe(126);
@@ -381,7 +416,7 @@ describe("GPUCommandEncoder", () => {
             return;
         }
         const src = device.createBuffer({size: 16, usage: GPUBufferUsage.COPY_SRC, mappedAtCreation: true});
-        src.writeMappedRange(new Uint8Array(16).fill(7));
+        new Uint8Array(src.getMappedRange()).set(new Uint8Array(16).fill(7));
         src.unmap();
         const dst = device.createBuffer({size: 16, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ});
         const enc = device.createCommandEncoder();
@@ -432,7 +467,7 @@ describe("GPUQueue", () => {
         device.queue.writeBuffer(buf, 0, data);
         await device.queue.onSubmittedWorkDone();
         await buf.mapAsync(GPUMapMode.READ);
-        const result = buf.getMappedRange(0, 4);
+        const result = new Uint8Array(buf.getMappedRange(0, 4));
         expect(result[0]).toBe(10);
         expect(result[3]).toBe(40);
         buf.unmap();

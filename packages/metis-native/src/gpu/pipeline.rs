@@ -3,7 +3,7 @@ use super::convert;
 use super::shader::GpuShaderModule;
 use napi::bindgen_prelude::Reference;
 use napi_derive::napi;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 // ── Owned (Send) pipeline args for async creation ─────────────────────────────
 
@@ -108,22 +108,29 @@ pub struct GpuComputePipelineDescriptor {
 #[napi]
 pub struct GpuComputePipeline {
     pub(crate) inner: Arc<wgpu::ComputePipeline>,
+    label: Mutex<Option<String>>,
 }
 
 impl GpuComputePipeline {
-    pub(crate) fn new(inner: wgpu::ComputePipeline) -> Self {
-        Self { inner: Arc::new(inner) }
+    pub(crate) fn new(inner: wgpu::ComputePipeline, label: Option<String>) -> Self {
+        Self { inner: Arc::new(inner), label: Mutex::new(label) }
     }
 }
 
 #[napi]
 impl GpuComputePipeline {
+    /// Debug label (read-write).
+    #[napi(getter)]
+    pub fn label(&self) -> Option<String> { self.label.lock().unwrap().clone() }
+    #[napi(setter)]
+    pub fn set_label(&self, label: String) { *self.label.lock().unwrap() = Some(label); }
+
     /// Get the auto-generated bind group layout for group `index`. Useful when
     /// the pipeline was created with `layout: "auto"` and you need a layout to
     /// build matching bind groups.
     #[napi]
     pub fn get_bind_group_layout(&self, index: u32) -> GpuBindGroupLayout {
-        GpuBindGroupLayout::new(self.inner.get_bind_group_layout(index))
+        GpuBindGroupLayout::new(self.inner.get_bind_group_layout(index), None)
     }
 }
 
@@ -249,21 +256,28 @@ pub struct GpuRenderPipelineDescriptor {
 #[napi]
 pub struct GpuRenderPipeline {
     pub(crate) inner: Arc<wgpu::RenderPipeline>,
+    label: Mutex<Option<String>>,
 }
 
 impl GpuRenderPipeline {
-    pub(crate) fn new(inner: wgpu::RenderPipeline) -> Self {
-        Self { inner: Arc::new(inner) }
+    pub(crate) fn new(inner: wgpu::RenderPipeline, label: Option<String>) -> Self {
+        Self { inner: Arc::new(inner), label: Mutex::new(label) }
     }
 }
 
 #[napi]
 impl GpuRenderPipeline {
+    /// Debug label (read-write).
+    #[napi(getter)]
+    pub fn label(&self) -> Option<String> { self.label.lock().unwrap().clone() }
+    #[napi(setter)]
+    pub fn set_label(&self, label: String) { *self.label.lock().unwrap() = Some(label); }
+
     /// Get the auto-generated bind group layout for group `index` — chiefly for
     /// pipelines created with `layout: "auto"`.
     #[napi]
     pub fn get_bind_group_layout(&self, index: u32) -> GpuBindGroupLayout {
-        GpuBindGroupLayout::new(self.inner.get_bind_group_layout(index))
+        GpuBindGroupLayout::new(self.inner.get_bind_group_layout(index), None)
     }
 }
 
@@ -304,7 +318,7 @@ pub fn build_compute_pipeline(device: &wgpu::Device, desc: &GpuComputePipelineDe
         compilation_options: wgpu::PipelineCompilationOptions::default(),
         cache: None,
     });
-    Ok(GpuComputePipeline::new(pipeline))
+    Ok(GpuComputePipeline::new(pipeline, desc.label.clone()))
 }
 
 pub fn build_render_pipeline(device: &wgpu::Device, desc: &GpuRenderPipelineDescriptor) -> napi::Result<GpuRenderPipeline> {
@@ -457,7 +471,7 @@ pub fn build_render_pipeline(device: &wgpu::Device, desc: &GpuRenderPipelineDesc
         multiview_mask: None,
         cache: None,
     });
-    Ok(GpuRenderPipeline::new(pipeline))
+    Ok(GpuRenderPipeline::new(pipeline, desc.label.clone()))
 }
 
 // ── Async-capable helpers ─────────────────────────────────────────────────────
@@ -481,7 +495,7 @@ pub(crate) fn build_compute_from_args(device: &wgpu::Device, args: OwnedComputeA
         compilation_options: wgpu::PipelineCompilationOptions::default(),
         cache: None,
     });
-    GpuComputePipeline::new(pipeline)
+    GpuComputePipeline::new(pipeline, args.label.clone())
 }
 
 pub(crate) fn extract_render_args(desc: &GpuRenderPipelineDescriptor) -> napi::Result<OwnedRenderArgs> {
@@ -630,5 +644,5 @@ pub(crate) fn build_render_from_args(device: &wgpu::Device, args: OwnedRenderArg
         multiview_mask: None,
         cache: None,
     });
-    GpuRenderPipeline::new(pipeline)
+    GpuRenderPipeline::new(pipeline, args.label.clone())
 }

@@ -123,7 +123,7 @@ async function readback(device: GpuDevice, texture: GpuTexture, width: number, h
     await device.queue.onSubmittedWorkDone();
 
     await buffer.mapAsync(1 /* GPUMapMode.READ */);
-    const mapped = buffer.getMappedRange();
+    const mapped = new Uint8Array(buffer.getMappedRange());
     const out = new Uint8Array(unpadded * height);
     for (let y = 0; y < height; y++) {
         out.set(mapped.subarray(y * padded, y * padded + unpadded), y * unpadded);

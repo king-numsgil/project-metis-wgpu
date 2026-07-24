@@ -409,7 +409,7 @@ impl Task for LoadKtx2Task {
             &format!("loadKtx2Texture('{}')", self.path),
             || Ok(upload_blocks(&self.device, &self.queue, &info, &levels, self.usage, self.label.as_deref())),
         )?;
-        Ok(make_gpu_texture(inner, info.width, info.height, info.level_count, format, self.usage))
+        Ok(make_gpu_texture(inner, info.width, info.height, info.level_count, format, self.usage, self.label.clone()))
     }
 
     fn resolve(&mut self, _env: Env, output: GpuTexture) -> napi::Result<GpuTexture> {

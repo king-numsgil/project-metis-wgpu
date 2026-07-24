@@ -5,7 +5,7 @@ use super::texture::{GpuExtent3D, GpuImageCopyTexture, GpuImageDataLayout};
 use napi::bindgen_prelude::{Reference, Uint8Array};
 use super::error::map_err_display;
 use napi_derive::napi;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// The device's command queue, reached via `device.queue`. Submit recorded
 /// command buffers here, and upload data straight to buffers/textures with
@@ -14,15 +14,21 @@ use std::sync::Arc;
 pub struct GpuQueue {
     pub(crate) inner: Arc<wgpu::Queue>,
     pub(crate) device: Arc<wgpu::Device>,
-    pub(crate) label: Option<String>,
+    // Shared with the owning device so a label set here survives the next
+    // `device.queue` access (each returns a fresh handle over the same queue).
+    pub(crate) label: Arc<Mutex<Option<String>>>,
 }
 
 #[napi]
 impl GpuQueue {
-    /// The queue's debug label, or `null`.
+    /// The queue's debug label (read-write).
     #[napi(getter)]
     pub fn label(&self) -> Option<String> {
-        self.label.clone()
+        self.label.lock().unwrap().clone()
+    }
+    #[napi(setter)]
+    pub fn set_label(&self, label: String) {
+        *self.label.lock().unwrap() = Some(label);
     }
 
     /// Nanoseconds per timestamp-query tick — the multiplier that turns the raw

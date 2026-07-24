@@ -4,7 +4,7 @@ use super::sampler::GpuSampler;
 use super::buffer::GpuBuffer;
 use napi::bindgen_prelude::Reference;
 use napi_derive::napi;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 // ── Bind Group Layout ─────────────────────────────────────────────────────────
 
@@ -102,11 +102,12 @@ fn entry_to_wgpu(e: &GpuBindGroupLayoutEntry) -> napi::Result<wgpu::BindGroupLay
 #[napi]
 pub struct GpuBindGroupLayout {
     pub(crate) inner: Arc<wgpu::BindGroupLayout>,
+    label: Mutex<Option<String>>,
 }
 
 impl GpuBindGroupLayout {
-    pub(crate) fn new(inner: wgpu::BindGroupLayout) -> Self {
-        Self { inner: Arc::new(inner) }
+    pub(crate) fn new(inner: wgpu::BindGroupLayout, label: Option<String>) -> Self {
+        Self { inner: Arc::new(inner), label: Mutex::new(label) }
     }
 
     pub(crate) fn from_desc(device: &wgpu::Device, desc: &GpuBindGroupLayoutDescriptor) -> napi::Result<Self> {
@@ -115,8 +116,17 @@ impl GpuBindGroupLayout {
             label: desc.label.as_deref(),
             entries: &entries,
         });
-        Ok(Self::new(layout))
+        Ok(Self::new(layout, desc.label.clone()))
     }
+}
+
+#[napi]
+impl GpuBindGroupLayout {
+    /// Debug label (read-write).
+    #[napi(getter)]
+    pub fn label(&self) -> Option<String> { self.label.lock().unwrap().clone() }
+    #[napi(setter)]
+    pub fn set_label(&self, label: String) { *self.label.lock().unwrap() = Some(label); }
 }
 
 // ── Pipeline Layout ───────────────────────────────────────────────────────────
@@ -135,12 +145,22 @@ pub struct GpuPipelineLayoutDescriptor {
 #[napi]
 pub struct GpuPipelineLayout {
     pub(crate) inner: Arc<wgpu::PipelineLayout>,
+    label: Mutex<Option<String>>,
 }
 
 impl GpuPipelineLayout {
-    pub(crate) fn new(inner: wgpu::PipelineLayout) -> Self {
-        Self { inner: Arc::new(inner) }
+    pub(crate) fn new(inner: wgpu::PipelineLayout, label: Option<String>) -> Self {
+        Self { inner: Arc::new(inner), label: Mutex::new(label) }
     }
+}
+
+#[napi]
+impl GpuPipelineLayout {
+    /// Debug label (read-write).
+    #[napi(getter)]
+    pub fn label(&self) -> Option<String> { self.label.lock().unwrap().clone() }
+    #[napi(setter)]
+    pub fn set_label(&self, label: String) { *self.label.lock().unwrap() = Some(label); }
 }
 
 // ── Bind Group ────────────────────────────────────────────────────────────────
@@ -173,11 +193,21 @@ pub struct GpuBindGroupDescriptor {
 #[napi]
 pub struct GpuBindGroup {
     pub(crate) inner: Arc<wgpu::BindGroup>,
+    label: Mutex<Option<String>>,
+}
+
+#[napi]
+impl GpuBindGroup {
+    /// Debug label (read-write).
+    #[napi(getter)]
+    pub fn label(&self) -> Option<String> { self.label.lock().unwrap().clone() }
+    #[napi(setter)]
+    pub fn set_label(&self, label: String) { *self.label.lock().unwrap() = Some(label); }
 }
 
 impl GpuBindGroup {
-    pub(crate) fn new(inner: wgpu::BindGroup) -> Self {
-        Self { inner: Arc::new(inner) }
+    pub(crate) fn new(inner: wgpu::BindGroup, label: Option<String>) -> Self {
+        Self { inner: Arc::new(inner), label: Mutex::new(label) }
     }
 
     pub(crate) fn from_desc(device: &wgpu::Device, desc: &GpuBindGroupDescriptor) -> napi::Result<Self> {
@@ -211,6 +241,6 @@ impl GpuBindGroup {
             layout: &desc.layout.inner,
             entries: &wgpu_entries,
         });
-        Ok(Self::new(bind_group))
+        Ok(Self::new(bind_group, desc.label.clone()))
     }
 }

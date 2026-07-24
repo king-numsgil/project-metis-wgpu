@@ -32,9 +32,19 @@ print "success" having done nothing correct.
 ```ts
 device.pushErrorScope("validation");
 // ... GPU work ...
-const err = await device.popErrorScope();   // GpuError | null
-if (err) throw new Error(`${err.type}: ${err.message}`);
+const err = await device.popErrorScope();   // GPUError subclass | null
+if (err instanceof GPUValidationError) throw err;   // also: err.message, err.type
 ```
+
+`popErrorScope()` resolves a real `GPUError` subclass —
+`GPUValidationError` / `GPUOutOfMemoryError` / `GPUInternalError` (exported from
+`metis-native`) — so `instanceof` works per the WebGPU spec; `.message` and a
+non-spec `.type` (`"validation"` etc.) are both available. To be notified of
+errors that escape every scope, set `device.onuncapturederror = e => …` (readable
+back out) or `device.addEventListener("uncapturederror", e => …)`; the event's
+`e.error` is the same subclass. **These live in the package's public entry
+(`webgpu.js`); the raw `metis-native/index.js` returns a plain `{ type, message }`
+and has no error classes.**
 
 Always either wrap suspect work in an error scope, or run the script **without**
 piping stderr through `tail`/`head` and grep the output for `wgpu`.
@@ -127,7 +137,15 @@ for you.
 `device` is a numeric PCI id as a string.
 
 `adapter.features` / `device.features` are spec-setlike: `.has(name)`, `.size`,
-`.keys()`. Not an array.
+`.keys()`, and iterable — `for (const f of device.features)` and
+`[...device.features]` work (the iterator comes from the public `webgpu.js`
+entry). Not an array.
+
+**Labels are read-write on every object** (`GPUObjectBase`): pass `label` in any
+descriptor and read it back off the handle (`buffer.label`, `texture.label`,
+`pipeline.label`, …) or reassign it (`buffer.label = "x"`). The label given at
+creation is the one GPU debuggers show; a later reassignment updates only the
+JS-visible string.
 
 ### Features — spec vs. native
 
@@ -298,9 +316,9 @@ budget absorbs ~180 000 calls.
 const buf = device.createBuffer({ size, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
 device.queue.writeBuffer(buf, 0, bytes);                 // bytes: Uint8Array
 
-// mappedAtCreation
+// mappedAtCreation — write INTO the mapped range, then unmap flushes it
 const b = device.createBuffer({ size, usage: GPUBufferUsage.INDEX, mappedAtCreation: true });
-b.writeMappedRange(new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
+new Uint8Array(b.getMappedRange()).set(new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
 b.unmap();
 
 // Readback
@@ -309,19 +327,24 @@ encoder.copyBufferToBuffer(src, 0, dst, 0, size);
 device.queue.submit([encoder.finish()]);
 await device.queue.onSubmittedWorkDone();
 await dst.mapAsync(GPUMapMode.READ);
-const raw = dst.getMappedRange();      // Uint8Array — a BYTE view
+const raw = dst.getMappedRange();      // ArrayBuffer aliasing the mapping — no copy
+const floats = new Float32Array(raw.slice(0));  // copy OUT before unmap detaches it
 dst.unmap();
 ```
 
-**`getMappedRange()` returns bytes.** To reinterpret as floats you must go
-through the buffer, not the values:
+**`getMappedRange()` returns an `ArrayBuffer` that *aliases* the mapped memory —
+zero-copy, per the WebGPU spec (it replaced the old copy-returning `Uint8Array`,
+and `writeMappedRange` is gone: write into the returned buffer instead).** Two
+rules follow:
 
-```ts
-const floats = new Float32Array(raw.buffer, raw.byteOffset, raw.byteLength / 4);  // correct
-const wrong  = new Float32Array(raw);   // WRONG — converts each byte to a float
-```
-
-That exact mistake cost a real debugging session (see metis-engine CLAUDE.md).
+- **`unmap()` / `destroy()` detach the range** (its `byteLength` becomes 0, and
+  any typed-array view over it goes empty). So anything you keep past `unmap()`
+  must be **copied out first** — `raw.slice(0)`, or `new Uint8Array(raw).slice()`.
+  A view you only read *before* unmap is fine.
+- **Reinterpret through the buffer, not the values:** `new Float32Array(raw, 0, n)`
+  (or over a `slice`) — never `new Float32Array(new Uint8Array(raw))`, which
+  converts each byte to a float. That mistake cost a real debugging session (see
+  metis-engine CLAUDE.md).
 
 To copy a texture out, it needs `GPUTextureUsage.COPY_SRC`, and
 `copyTextureToBuffer` requires `bytesPerRow` to be a multiple of 256.

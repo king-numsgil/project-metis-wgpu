@@ -447,6 +447,7 @@ impl GpuSurfaceTexture {
             .create_view(&wgpu::TextureViewDescriptor::default());
         Ok(GpuTextureView {
             inner: Arc::new(view),
+            label: Mutex::new(None),
         })
     }
 

@@ -23,12 +23,22 @@ pub(crate) struct EncoderState {
 #[napi]
 pub struct GpuCommandBuffer {
     pub(crate) inner: Mutex<Option<wgpu::CommandBuffer>>,
+    label: Mutex<Option<String>>,
 }
 
 impl GpuCommandBuffer {
     pub(crate) fn take(&self) -> Option<wgpu::CommandBuffer> {
         self.inner.lock().unwrap().take()
     }
+}
+
+#[napi]
+impl GpuCommandBuffer {
+    /// Debug label (read-write).
+    #[napi(getter)]
+    pub fn label(&self) -> Option<String> { self.label.lock().unwrap().clone() }
+    #[napi(setter)]
+    pub fn set_label(&self, label: String) { *self.label.lock().unwrap() = Some(label); }
 }
 
 // ── Descriptor types ──────────────────────────────────────────────────────────
@@ -519,12 +529,12 @@ impl GpuComputePassEncoder {
 #[napi]
 pub struct GpuCommandEncoder {
     state: Arc<Mutex<EncoderState>>,
-    label: Option<String>,
+    label: Mutex<Option<String>>,
 }
 
 impl GpuCommandEncoder {
     pub(crate) fn new(encoder: wgpu::CommandEncoder, label: Option<String>) -> Self {
-        Self { state: Arc::new(Mutex::new(EncoderState { encoder: Some(encoder) })), label }
+        Self { state: Arc::new(Mutex::new(EncoderState { encoder: Some(encoder) })), label: Mutex::new(label) }
     }
 
     fn with_encoder<F, R>(&self, f: F) -> napi::Result<R>
@@ -541,9 +551,11 @@ impl GpuCommandEncoder {
 
 #[napi]
 impl GpuCommandEncoder {
-    /// The debug label passed at creation, or `null`.
+    /// The debug label (read-write).
     #[napi(getter)]
-    pub fn label(&self) -> Option<String> { self.label.clone() }
+    pub fn label(&self) -> Option<String> { self.label.lock().unwrap().clone() }
+    #[napi(setter)]
+    pub fn set_label(&self, label: String) { *self.label.lock().unwrap() = Some(label); }
 
     /// Begin a render pass with the given attachments and return its encoder.
     /// The command encoder is locked until the returned pass `end()`s.
@@ -921,11 +933,12 @@ impl GpuCommandEncoder {
     /// The encoder is consumed — no further commands may be recorded, and any
     /// open pass must have `end()`ed first.
     #[napi]
-    pub fn finish(&self, _descriptor: Option<GpuCommandEncoderDescriptor>) -> napi::Result<GpuCommandBuffer> {
+    pub fn finish(&self, descriptor: Option<GpuCommandEncoderDescriptor>) -> napi::Result<GpuCommandBuffer> {
         let mut state = self.state.lock().unwrap();
         let encoder = state.encoder.take().ok_or_else(|| {
             napi::Error::new(napi::Status::GenericFailure, "CommandEncoder already finished or locked by active pass")
         })?;
-        Ok(GpuCommandBuffer { inner: Mutex::new(Some(encoder.finish())) })
+        let label = descriptor.and_then(|d| d.label);
+        Ok(GpuCommandBuffer { inner: Mutex::new(Some(encoder.finish())), label: Mutex::new(label) })
     }
 }

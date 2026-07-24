@@ -324,6 +324,96 @@ error comes from wgpu rather than from this crate's own CPU-side checks, which
 were never affected. Mutation-checked: drop `with_validation_scope` from
 `LoadKtx2Task` and exactly those two tests fail while the other 21 pass.
 
+### Buffer mapping is genuinely zero-copy — external ArrayBuffer + detach-on-unmap
+
+`GpuBuffer.getMappedRange()` returns an `ArrayBuffer` that **aliases the mapped
+GPU memory directly**, matching the WebGPU spec. It did not always: the first
+cut returned a `to_vec()` **copy** as a `Uint8Array`, with a bespoke
+`writeMappedRange()` to copy back — a double-copy staging path wearing a
+mapping-shaped costume, worst on the upload path (`mesh.ts`). Both are gone.
+
+The mechanism, and why each piece is load-bearing:
+
+- **`napi_create_external_arraybuffer`** builds a JS `ArrayBuffer` over the raw
+  pointer from wgpu's `BufferView` (`read_slice`). No finalizer — wgpu owns the
+  memory, not JS.
+- **Detach on `unmap()`/`destroy()` is the whole safety story.** wgpu's `unmap`
+  invalidates the mapped pointer; an external ArrayBuffer still pointing there
+  is a use-after-free the instant JS touches it. So each handed-out range keeps
+  a **persistent napi reference** (`napi_create_reference`), and `unmap`/`destroy`
+  **detach** every one (`napi_detach_arraybuffer`) *before* dropping the wgpu
+  view — turning post-unmap access into a clean "zero-length buffer" instead of
+  UB. This is why both methods take an injected `&Env`. `tests/gpu.test.ts` pins
+  it: after `unmap()`, `range.byteLength === 0`.
+- **`detach()`/`napi_detach_arraybuffer` need the `napi8` feature** (napi7+
+  actually, but the crate pins `napi8` to match the engine's Node-API target).
+  It was **verified against Bun first** (a throwaway spike proved Bun 1.3.14
+  supports external + detach ArrayBuffers with true bidirectional aliasing)
+  before any of this was written — the copy would have been *forced* if Bun
+  lacked either, so that feasibility check gated the whole rewrite.
+
+Two wgpu-imposed subtleties:
+
+- **One code path via `get_mapped_range()` (read view), not the mode-matched
+  view.** wgpu's *mutable* mapped view (`BufferViewMut`) is deliberately
+  **write-only** and exposes no raw pointer (mapped memory may be
+  write-combining, where reads misbehave). Both views wrap the *same* pointer,
+  and the host→device flush on `unmap` is driven by the **map mode** set at map
+  time (`MAP_WRITE`/`mappedAtCreation`), not by which view you took — so reading
+  the pointer off the read view and letting JS write through it still flushes.
+  Verified end-to-end: the engine's mesh upload goes through this, and the
+  byte-exact fixture goldens reproduced unchanged.
+- **The write-combining caveat is real but out of scope on desktop.** Reading
+  back a value you just wrote into a *write*-mapped range isn't guaranteed
+  coherent on WC memory; documented on `getMappedRange`, and a non-issue for the
+  upload pattern (write-only) and desktop host-coherent buffers.
+
+Consumers that keep data past `unmap()` must **copy out first** (`raw.slice(0)`),
+because the range detaches — the old copy-returning version let a stale
+`Uint8Array` survive unmap, this one does not. See `DOC.md` §4.
+
+### `webgpu.js` — a JS compat layer for the spec shapes napi can't express
+
+The package's public entry is **`webgpu.js`** (hand-written), not the
+napi-generated `index.js` (`package.json` `main`/`types` point at
+`webgpu.js`/`webgpu.d.ts`). It `require`s `index.js`, augments a few prototypes,
+re-exports everything, and **makes no N-API calls** — it is pure JS ergonomics.
+It exists because four WebGPU-spec shapes have no napi representation:
+
+- **`GPUValidationError`/`GPUOutOfMemoryError`/`GPUInternalError`** — real JS
+  classes, so `err instanceof GPUValidationError` works. napi returns a plain
+  `#[napi(object)]` `{ type, message }`; the layer maps it to a subclass in the
+  wrapped `popErrorScope()` and the uncaptured-error event. The subclass **keeps
+  `.type`** as a non-spec convenience, so existing `err.type` callers (and the
+  `{type,message}` structural type in `index.d.ts`) still work — that's why no
+  `.d.ts` return-type surgery was needed.
+- **`device.addEventListener("uncapturederror", …)`** + a readable
+  `onuncapturederror` — the native setter takes one write-only callback; the
+  layer registers a single dispatcher over it and fans out to a handler +
+  listener set (per-device `WeakMap`).
+- **`for (const f of device.features)`** — napi's `#[napi(iterator)]` makes the
+  object a one-shot stateful iterator, wrong for a re-iterable setlike; a
+  `Symbol.iterator` returning `this.keys()[Symbol.iterator]()` is correct and
+  re-iterable.
+- **A stable `device.lost`** — the napi async getter mints a fresh promise per
+  access; the layer memoizes it per device (`WeakMap`).
+
+**Labels were done in Rust, not here** (read-write `label` on every
+`GPUObjectBase`, stored `Mutex<Option<String>>`), because that *is* expressible
+in napi. Only the four above needed JS.
+
+Two load-bearing facts about the split:
+
+- **The `tests/` import `../index.js` directly** (the raw binding), so they
+  exercise napi without the layer and are unaffected by it;
+  `tests/webgpu-compat.test.ts` is the one that imports `../webgpu.js` and pins
+  the layer. **`metis-engine`/`metis-game` import `"metis-native"`** → `main` →
+  `webgpu.js`, so they get the spec shapes.
+- **`napi build` regenerates `index.js`/`index.d.ts` but never touches
+  `webgpu.*` or `package.json`**, so the layer and the entry-point redirect
+  survive rebuilds. If you add a spec ergonomic that napi can't express, it goes
+  here; anything napi *can* do (like labels) stays in Rust.
+
 ### VectorContext: lyon panics, and the one rule behind all of them
 
 **Every point handed to lyon must be finite and have an open sub-path, or lyon

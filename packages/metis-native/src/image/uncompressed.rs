@@ -194,7 +194,7 @@ impl Task for LoadTextureTask {
             &format!("loadImageTexture('{}')", self.path),
             || Ok(upload_texture(&self.device, &self.queue, &img, self.usage, self.label.as_deref())),
         )?;
-        Ok(make_gpu_texture(inner, img.width, img.height, 1, img.format, self.usage))
+        Ok(make_gpu_texture(inner, img.width, img.height, 1, img.format, self.usage, self.label.clone()))
     }
 
     fn resolve(&mut self, _env: Env, output: GpuTexture) -> napi::Result<GpuTexture> {

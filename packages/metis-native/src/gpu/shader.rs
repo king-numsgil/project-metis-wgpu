@@ -1,5 +1,5 @@
 use napi_derive::napi;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 #[napi(object)]
 pub struct GpuShaderModuleDescriptor {
@@ -30,16 +30,23 @@ pub struct GpuCompilationInfo {
 #[napi]
 pub struct GpuShaderModule {
     pub(crate) inner: Arc<wgpu::ShaderModule>,
+    label: Mutex<Option<String>>,
 }
 
 impl GpuShaderModule {
-    pub(crate) fn new(inner: wgpu::ShaderModule) -> Self {
-        Self { inner: Arc::new(inner) }
+    pub(crate) fn new(inner: wgpu::ShaderModule, label: Option<String>) -> Self {
+        Self { inner: Arc::new(inner), label: Mutex::new(label) }
     }
 }
 
 #[napi]
 impl GpuShaderModule {
+    /// Debug label (read-write).
+    #[napi(getter)]
+    pub fn label(&self) -> Option<String> { self.label.lock().unwrap().clone() }
+    #[napi(setter)]
+    pub fn set_label(&self, label: String) { *self.label.lock().unwrap() = Some(label); }
+
     /// Resolve with the compiler's diagnostics for this module — errors,
     /// warnings and info messages, each with a source location. Empty on a clean
     /// compile.

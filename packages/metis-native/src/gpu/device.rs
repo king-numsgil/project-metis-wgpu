@@ -124,8 +124,10 @@ ThreadsafeFunction<GpuUncapturedErrorEvent, (), GpuUncapturedErrorEvent>;
 pub struct GpuDevice {
     pub(crate) inner: Arc<wgpu::Device>,
     pub(crate) queue_inner: Arc<wgpu::Queue>,
-    label: Option<String>,
-    queue_label: Option<String>,
+    label: Mutex<Option<String>>,
+    /// Shared with every `GpuQueue` handle `device.queue` hands out, so a label
+    /// set on the queue persists (the getter returns a fresh handle each call).
+    queue_label: Arc<Mutex<Option<String>>>,
     raw_adapter_info: wgpu::AdapterInfo,
     /// Watch channel receiver for `device.lost`. Shared via Arc so async fns
     /// can clone a fresh receiver without borrowing &self across .await.
@@ -147,8 +149,8 @@ impl GpuDevice {
         Self {
             inner: device,
             queue_inner: queue,
-            label,
-            queue_label,
+            label: Mutex::new(label),
+            queue_label: Arc::new(Mutex::new(queue_label)),
             raw_adapter_info,
             lost_rx,
             uncaptured_error_tsfn,
@@ -158,10 +160,14 @@ impl GpuDevice {
 
 #[napi]
 impl GpuDevice {
-    /// The debug label passed in `requestDevice`, or `null`.
+    /// The debug label (read-write).
     #[napi(getter)]
     pub fn label(&self) -> Option<String> {
-        self.label.clone()
+        self.label.lock().unwrap().clone()
+    }
+    #[napi(setter)]
+    pub fn set_label(&self, label: String) {
+        *self.label.lock().unwrap() = Some(label);
     }
 
     /// The features actually enabled on this device — a subset of what was
@@ -205,7 +211,7 @@ impl GpuDevice {
         GpuQueue {
             inner: Arc::clone(&self.queue_inner),
             device: Arc::clone(&self.inner),
-            label: self.queue_label.clone(),
+            label: Arc::clone(&self.queue_label),
         }
     }
 
@@ -236,10 +242,13 @@ impl GpuDevice {
 
     // ── onuncapturederror ─────────────────────────────────────────────────────
 
-    /// Always `undefined`: this handler is write-only. A callback registered via
-    /// the setter can't be read back out, so reading the property returns
-    /// nothing rather than the function you set.
-    #[napi(getter)]
+    /// The current uncaptured-error handler, or `null`.
+    ///
+    /// Readback is provided by the package's public entry (`webgpu.js`); the raw
+    /// `index.js` getter returns `undefined` (the native handler can't be read
+    /// back out), which is why the type here describes the `webgpu.js`
+    /// behaviour. Import from `metis-native`, not `metis-native/index.js`.
+    #[napi(getter, ts_return_type = "((event: GpuUncapturedErrorEvent) => void) | null")]
     pub fn get_onuncapturederror(&self) {}
 
     /// Set an `onuncapturederror` handler. The handler is called with a
@@ -318,7 +327,7 @@ impl GpuDevice {
         } else {
             self.inner.create_sampler(&wgpu::SamplerDescriptor::default())
         };
-        Ok(GpuSampler::new(sampler))
+        Ok(GpuSampler::new(sampler, descriptor.and_then(|d| d.label)))
     }
 
     /// Create a `GpuBindGroupLayout`: the shape (binding indices, types and
@@ -349,7 +358,7 @@ impl GpuDevice {
             bind_group_layouts: &bgl_refs,
             immediate_size: descriptor.immediate_size.unwrap_or(0),
         });
-        Ok(GpuPipelineLayout::new(layout))
+        Ok(GpuPipelineLayout::new(layout, descriptor.label.clone()))
     }
 
     /// Create a `GpuBindGroup`: the concrete resources (buffers, samplers,
@@ -367,7 +376,7 @@ impl GpuDevice {
             label: descriptor.label.as_deref(),
             source: wgpu::ShaderSource::Wgsl(descriptor.code.into()),
         });
-        GpuShaderModule::new(module)
+        GpuShaderModule::new(module, descriptor.label)
     }
 
     /// Create a compute pipeline synchronously. This blocks while the driver
@@ -431,7 +440,7 @@ impl GpuDevice {
             ty: qt,
             count: descriptor.count,
         });
-        Ok(GpuQuerySet::new(qs, qt, descriptor.count))
+        Ok(GpuQuerySet::new(qs, qt, descriptor.count, descriptor.label))
     }
 
     // ── error scopes ─────────────────────────────────────────────────────────

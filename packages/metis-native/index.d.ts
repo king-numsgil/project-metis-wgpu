@@ -246,7 +246,9 @@ export declare class GpuAdapter {
  * pass with `pass.setBindGroup(index, group)`.
  */
 export declare class GpuBindGroup {
-
+  /** Debug label (read-write). */
+  get label(): string | null
+  set label(label: string)
 }
 
 /**
@@ -257,25 +259,19 @@ export declare class GpuBindGroup {
  * bind groups validated against it.
  */
 export declare class GpuBindGroupLayout {
-
+  /** Debug label (read-write). */
+  get label(): string | null
+  set label(label: string)
 }
 
-/**
- * A block of GPU memory created by `device.createBuffer`.
- *
- * Fill it from the CPU via `queue.writeBuffer` (the usual path), or — for a
- * buffer created `mappedAtCreation` or after `mapAsync` — through
- * `getMappedRange` / `writeMappedRange`. Bind it to shaders as a vertex,
- * index, uniform or storage buffer per its `usage` flags. Call `destroy()`
- * when done to free the memory eagerly rather than waiting for GC.
- */
 export declare class GpuBuffer {
   /** Size of the buffer in bytes (as requested at creation). */
   get size(): number
   /** The `GPUBufferUsage` bitmask this buffer was created with. */
   get usage(): number
-  /** The debug label passed at creation, or `null`. */
+  /** The debug label (read-write). */
   get label(): string | null
+  set label(label: string)
   /**
    * Current map state: `"mapped"` or `"unmapped"`. (The transient
    * `"pending"` state the spec defines is not surfaced separately here.)
@@ -288,39 +284,37 @@ export declare class GpuBuffer {
    * have the matching `MAP_READ` / `MAP_WRITE` usage. `offset`/`size` bound
    * the mapped region (defaults: whole buffer from 0). This drives the
    * device poll internally, so the returned promise settling means the range
-   * is ready for `getMappedRange` / `writeMappedRange`. Call `unmap()` before
-   * using the buffer on the GPU again.
+   * is ready for `getMappedRange`. Call `unmap()` before using the buffer on
+   * the GPU again.
    */
   mapAsync(mode: number, offset?: number | undefined | null, size?: number | undefined | null): Promise<void>
   /**
-   * Copy the mapped range out as a fresh `Uint8Array`. The buffer must be
-   * mapped (via `mapAsync` or `mappedAtCreation`). `offset`/`size` default to
-   * the whole buffer.
+   * Return an `ArrayBuffer` that **aliases** the mapped memory directly — no
+   * copy — matching the WebGPU spec (offset multiple of 8, size multiple of
+   * 4; defaults to the whole buffer). The buffer must be mapped (via
+   * `mapAsync` or `mappedAtCreation`). Wrap it to read/write, e.g.
+   * `new Float32Array(range)`.
    *
-   * Unlike the browser spec — which returns a live `ArrayBuffer` view into
-   * the mapping — this returns an owned **copy**, because the napi boundary
-   * can't hand back a borrow of GPU memory. To write into a mapped buffer use
-   * `writeMappedRange`.
-   */
-  getMappedRange(offset?: number | undefined | null, size?: number | undefined | null): Uint8Array
-  /**
-   * Write `data` into the mapped buffer (this binding's replacement for
-   * mutating the spec's live mapped `ArrayBuffer`, which the napi boundary
-   * can't expose). The buffer must be mapped for writing.
+   * The range stays valid until `unmap()` / `destroy()`, which **detach** it
+   * (its `byteLength` becomes 0 and further access throws) so JS can never
+   * read freed GPU memory. Writes into a `MAP_WRITE` / `mappedAtCreation`
+   * range are flushed to the GPU by `unmap()`.
    *
-   * `bufferOffset` is where in the buffer to start (default 0);
-   * `dataOffset`/`size` select a sub-slice of `data` (defaults: all of it).
+   * Non-overlapping ranges may be requested with multiple calls. (Note:
+   * mapped memory can be write-combining on some backends, so reading back a
+   * value you just wrote into a write-mapped range is not guaranteed fast or
+   * coherent — write-mapped ranges are meant to be written, not read.)
    */
-  writeMappedRange(data: Uint8Array, bufferOffset?: number | undefined | null, dataOffset?: number | undefined | null, size?: number | undefined | null): void
+  getMappedRange(offset?: number | undefined | null, size?: number | undefined | null): ArrayBuffer
   /**
-   * Unmap the buffer, flushing any `writeMappedRange` edits and making it
-   * usable by the GPU again. Any array returned by `getMappedRange` is a copy
-   * and stays valid, but must not be written back after this.
+   * Unmap the buffer, making it usable by the GPU again. Detaches every
+   * `ArrayBuffer` handed out by `getMappedRange` (they become zero-length),
+   * and flushes writes made into a `MAP_WRITE` / `mappedAtCreation` range.
    */
   unmap(): void
   /**
-   * Free the buffer's GPU memory now. Subsequent use is a validation error;
-   * the handle itself becomes inert.
+   * Free the buffer's GPU memory now. Detaches any mapped `ArrayBuffer`
+   * first. Subsequent use is a validation error; the handle becomes inert.
    */
   destroy(): void
 }
@@ -332,7 +326,9 @@ export declare class GpuBuffer {
  * error.
  */
 export declare class GpuCommandBuffer {
-
+  /** Debug label (read-write). */
+  get label(): string | null
+  set label(label: string)
 }
 
 /**
@@ -346,8 +342,9 @@ export declare class GpuCommandBuffer {
  * `queue.submit`.
  */
 export declare class GpuCommandEncoder {
-  /** The debug label passed at creation, or `null`. */
+  /** The debug label (read-write). */
   get label(): string | null
+  set label(label: string)
   /**
    * Begin a render pass with the given attachments and return its encoder.
    * The command encoder is locked until the returned pass `end()`s.
@@ -488,6 +485,9 @@ export declare class GpuComputePassEncoder {
  * `pass.setPipeline`.
  */
 export declare class GpuComputePipeline {
+  /** Debug label (read-write). */
+  get label(): string | null
+  set label(label: string)
   /**
    * Get the auto-generated bind group layout for group `index`. Useful when
    * the pipeline was created with `layout: "auto"` and you need a layout to
@@ -508,8 +508,9 @@ export declare class GpuComputePipeline {
  * goes away.
  */
 export declare class GpuDevice {
-  /** The debug label passed in `requestDevice`, or `null`. */
+  /** The debug label (read-write). */
   get label(): string | null
+  set label(label: string)
   /**
    * The features actually enabled on this device — a subset of what was
    * requested. Check with `device.features.has(name)` before using a
@@ -538,11 +539,14 @@ export declare class GpuDevice {
    */
   get lost(): Promise<GpuDeviceLostInfo>
   /**
-   * Always `undefined`: this handler is write-only. A callback registered via
-   * the setter can't be read back out, so reading the property returns
-   * nothing rather than the function you set.
+   * The current uncaptured-error handler, or `null`.
+   *
+   * Readback is provided by the package's public entry (`webgpu.js`); the raw
+   * `index.js` getter returns `undefined` (the native handler can't be read
+   * back out), which is why the type here describes the `webgpu.js`
+   * behaviour. Import from `metis-native`, not `metis-native/index.js`.
    */
-  get onuncapturederror(): void
+  get onuncapturederror(): ((event: GpuUncapturedErrorEvent) => void) | null
   /**
    * Set an `onuncapturederror` handler. The handler is called with a
    * `GpuUncapturedErrorEvent` whenever a GPU error escapes all error scopes.
@@ -662,7 +666,9 @@ export declare class GpuDevice {
  * alternative to `"auto"`).
  */
 export declare class GpuPipelineLayout {
-
+  /** Debug label (read-write). */
+  get label(): string | null
+  set label(label: string)
 }
 
 /**
@@ -672,6 +678,9 @@ export declare class GpuPipelineLayout {
  * results back by `encoder.resolveQuerySet` into a buffer.
  */
 export declare class GpuQuerySet {
+  /** Debug label (read-write). */
+  get label(): string | null
+  set label(label: string)
   /** The kind of queries this set holds: `"occlusion"` or `"timestamp"`. */
   get type(): GPUQueryType
   /** The number of query slots in the set. */
@@ -689,8 +698,9 @@ export declare class GpuQuerySet {
  * `writeBuffer` / `writeTexture`.
  */
 export declare class GpuQueue {
-  /** The queue's debug label, or `null`. */
+  /** The queue's debug label (read-write). */
   get label(): string | null
+  set label(label: string)
   /**
    * Nanoseconds per timestamp-query tick — the multiplier that turns the raw
    * `u64` deltas written by `writeTimestamp` / `timestampWrites` into real
@@ -854,6 +864,9 @@ export declare class GpuRenderPassEncoder {
  * `device.createRenderPipeline(Async)` and bound with `pass.setPipeline`.
  */
 export declare class GpuRenderPipeline {
+  /** Debug label (read-write). */
+  get label(): string | null
+  set label(label: string)
   /**
    * Get the auto-generated bind group layout for group `index` — chiefly for
    * pipelines created with `layout: "auto"`.
@@ -868,7 +881,9 @@ export declare class GpuRenderPipeline {
  * through a bind group.
  */
 export declare class GpuSampler {
-
+  /** Debug label (read-write). */
+  get label(): string | null
+  set label(label: string)
 }
 
 /**
@@ -878,6 +893,9 @@ export declare class GpuSampler {
  * `getCompilationInfo()` or wrap creation in an error scope.
  */
 export declare class GpuShaderModule {
+  /** Debug label (read-write). */
+  get label(): string | null
+  set label(label: string)
   /**
    * Resolve with the compiler's diagnostics for this module — errors,
    * warnings and info messages, each with a source location. Empty on a clean
@@ -972,6 +990,12 @@ export declare class GpuSurfaceTexture {
  */
 export declare class GpuTexture {
   /**
+   * Debug label (read-write), as set at creation or reassigned. The label
+   * given at creation is what GPU debuggers show.
+   */
+  get label(): string | null
+  set label(label: string)
+  /**
    * Create a `GpuTextureView` for binding or as a render attachment. The
    * descriptor can narrow to a single mip level, array layer or aspect, or
    * reinterpret the format — omit it for a default view of the whole texture.
@@ -1005,7 +1029,9 @@ export declare class GpuTexture {
  * actually put in a bind group entry or use as a render-pass attachment.
  */
 export declare class GpuTextureView {
-
+  /** Debug label (read-write). */
+  get label(): string | null
+  set label(label: string)
 }
 
 /** A system-defined or custom mouse cursor. Destroy with `.destroy()`. */

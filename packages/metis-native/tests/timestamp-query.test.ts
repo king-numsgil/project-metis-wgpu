@@ -64,10 +64,10 @@ async function readQueries(dev: GpuDevice, querySet: GpuQuerySet, count: number)
     await dev.queue.onSubmittedWorkDone();
 
     await readback.mapAsync(GPUMapMode.READ);
-    // getMappedRange hands back the raw bytes; reinterpret them as u64 via the
-    // underlying ArrayBuffer. `new BigUint64Array(bytes)` would convert *values*.
-    const bytes = readback.getMappedRange();
-    const ticks = new BigUint64Array(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + byteSize));
+    // getMappedRange hands back the mapped memory as an ArrayBuffer. Copy it out
+    // (slice) before unmap() detaches it, reinterpreting the bytes as u64 —
+    // `BigUint64Array` over an ArrayBuffer reinterprets bytes, not values.
+    const ticks = new BigUint64Array(readback.getMappedRange().slice(0, byteSize));
     readback.unmap();
     resolve.destroy();
     readback.destroy();

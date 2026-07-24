@@ -1,7 +1,7 @@
 ﻿use super::convert;
 use napi::bindgen_prelude::Reference;
 use napi_derive::napi;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 #[napi(object)]
 pub struct GpuExtent3D {
@@ -85,6 +85,7 @@ pub struct GpuTexture {
     pub(crate) dimension: wgpu::TextureDimension,
     pub(crate) format: wgpu::TextureFormat,
     pub(crate) usage: u32,
+    pub(crate) label: Mutex<Option<String>>,
 }
 
 impl GpuTexture {
@@ -99,12 +100,20 @@ impl GpuTexture {
             dimension: desc.dimension,
             format: desc.format,
             usage,
+            label: Mutex::new(desc.label.map(String::from)),
         }
     }
 }
 
 #[napi]
 impl GpuTexture {
+    /// Debug label (read-write), as set at creation or reassigned. The label
+    /// given at creation is what GPU debuggers show.
+    #[napi(getter)]
+    pub fn label(&self) -> Option<String> { self.label.lock().unwrap().clone() }
+    #[napi(setter)]
+    pub fn set_label(&self, label: String) { *self.label.lock().unwrap() = Some(label); }
+
     /// Create a `GpuTextureView` for binding or as a render attachment. The
     /// descriptor can narrow to a single mip level, array layer or aspect, or
     /// reinterpret the format — omit it for a default view of the whole texture.
@@ -151,7 +160,7 @@ impl GpuTexture {
             array_layer_count,
             usage: None,
         };
-        Ok(GpuTextureView { inner: Arc::new(self.inner.create_view(&desc)) })
+        Ok(GpuTextureView { inner: Arc::new(self.inner.create_view(&desc)), label: Mutex::new(label.clone()) })
     }
 
     #[napi(getter)]
@@ -203,4 +212,14 @@ impl GpuTexture {
 #[napi]
 pub struct GpuTextureView {
     pub(crate) inner: Arc<wgpu::TextureView>,
+    pub(crate) label: Mutex<Option<String>>,
+}
+
+#[napi]
+impl GpuTextureView {
+    /// Debug label (read-write).
+    #[napi(getter)]
+    pub fn label(&self) -> Option<String> { self.label.lock().unwrap().clone() }
+    #[napi(setter)]
+    pub fn set_label(&self, label: String) { *self.label.lock().unwrap() = Some(label); }
 }
