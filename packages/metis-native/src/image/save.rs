@@ -20,6 +20,7 @@
 //! letting a test do both from one GPU readback.
 
 use super::generic_err;
+use crate::gpu::error::with_validation_scope;
 use crate::gpu::{GpuDevice, GpuTexture};
 use image::ImageEncoder;
 use napi::bindgen_prelude::{AsyncTask, Uint8Array};
@@ -123,7 +124,21 @@ fn bytes_per_pixel(kind: &SourceKind) -> u32 {
 ///
 /// Runs on an async worker, so blocking on `poll(Wait)` here is fine — it is a
 /// worker thread, not the JS thread.
+/// Wraps the GPU half in a validation scope, because both callers are
+/// `AsyncTask::compute` bodies running on a libuv worker — where a caller's
+/// own `pushErrorScope()` does not reach since wgpu 30 made scopes
+/// thread-local. See `gpu::error::with_validation_scope`.
 fn readback(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    texture: &TextureRef,
+) -> napi::Result<(Vec<u8>, SourceKind)> {
+    with_validation_scope(device, "texture readback", || {
+        readback_inner(device, queue, texture)
+    })
+}
+
+fn readback_inner(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     texture: &TextureRef,

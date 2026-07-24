@@ -239,11 +239,31 @@ load-bearing:
   `popErrorScope()` reject, and a synchronous throw is not something a `.catch()`
   on the returned promise can ever observe.
 
-Soundness rests on one property: every GPU call this crate exposes is a
-synchronous napi method running on the JS thread, so a scope is opened, filled,
-and closed all on one thread. **If a GPU operation is ever moved onto a worker
-thread, error scopes stop capturing it** — silently, because an uncaptured error
-just goes to the `onuncapturederror` path instead.
+Soundness rests on one property: the call is a synchronous napi method running
+on the JS thread, so a scope is opened, filled, and closed all on one thread.
+
+**That property does not hold for everything, and assuming it did was a live
+bug for one commit.** Every operation returning an `AsyncTask` —
+`createRenderPipelineAsync`, `createComputePipelineAsync`, `loadImageTexture`,
+`loadKtx2Texture`, `saveTextureToFile`, `readTexturePixels` — does its GPU work
+inside `Task::compute`, on a libuv worker. A caller's scope on the JS thread
+cannot see it. Under wgpu 24 scopes were device-global and *could*, so the
+upgrade silently broke it: the load still returned a plausible handle and the
+error went to `onuncapturederror`/stderr.
+
+The fix is `gpu::error::with_validation_scope`: each of those tasks brackets
+its own GPU work in a scope **on the worker thread** and turns a captured error
+into a rejected promise. So the contract is split, and both halves matter:
+
+- **Synchronous calls** — covered by the caller's `pushErrorScope`, as before.
+- **Async calls** — reject on their own; a caller's scope will *not* see them
+  and will return `null`.
+
+That second half reads exactly like success, which is why it is pinned by tests
+rather than left to memory (see below). **Any new `AsyncTask` that touches the
+GPU must go through `with_validation_scope`**, or it silently reacquires the
+bug. The helper is also strictly better than what wgpu 24 did: a caller no
+longer has to remember to bracket an async load to find out it failed.
 
 `tests/error-scope.test.ts` pins this, and exists because of a specific blind
 spot: every *other* test that uses an error scope asserts the result is `null`
@@ -251,6 +271,18 @@ spot: every *other* test that uses an error scope asserts the result is `null`
 guard entirely would return `null` from every pop and **keep the whole suite
 green**. The first test there provokes a validation error on purpose and
 requires it to come back; that is the one that fails if this plumbing breaks.
+
+That blind spot was not hypothetical — it was **live in `image-ktx2.test.ts`**.
+Its `loadChecked` helper wrapped `loadKtx2Texture` in a scope and asserted the
+pop was `null`, which after the upgrade it was, unconditionally. Its own comment
+called it "the load-bearing part of every success-path test" while it had
+stopped loading anything. It now just `await`s the loader and lets a rejection
+fail the test, and the `"GPU-side validation errors reach the caller"` block
+proves the rejection actually fires — using a **well-formed** file with an
+illegal usage flag (`STORAGE_BINDING` on a block-compressed format), so the
+error comes from wgpu rather than from this crate's own CPU-side checks, which
+were never affected. Mutation-checked: drop `with_validation_scope` from
+`LoadKtx2Task` and exactly those two tests fail while the other 21 pass.
 
 ### VectorContext: lyon panics, and the one rule behind all of them
 

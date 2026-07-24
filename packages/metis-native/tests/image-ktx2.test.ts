@@ -242,18 +242,26 @@ function write(name: string, bytes: Uint8Array): string {
 }
 
 /**
- * Loads inside a validation error scope and fails if wgpu complained.
+ * Loads and fails if wgpu complained.
  *
  * This is the load-bearing part of every success-path test: a wrong
  * `bytes_per_row` produces a valid-looking `GpuTexture` and a validation error
  * that nothing would otherwise observe.
+ *
+ * **This used to wrap the load in `pushErrorScope`/`popErrorScope`, and that
+ * stopped working in the wgpu 30 upgrade.** wgpu 30 made error scopes
+ * thread-local, and `loadKtx2Texture` does its GPU work inside an
+ * `AsyncTask::compute` on a libuv worker — so a scope opened here, on the JS
+ * thread, could not see it. The pop returned `null` unconditionally and every
+ * assertion below it was vacuous while staying green.
+ *
+ * The loader now brackets its own GPU work in a scope on the worker thread and
+ * rejects the promise (see `gpu::error::with_validation_scope`), so an
+ * unobserved validation error becomes a failed `await` right here. Nothing to
+ * remember to wrap; `loadGpuValidationRejects` below pins that it really fires.
  */
 async function loadChecked(dev: GpuDevice, path: string) {
-    dev.pushErrorScope("validation");
-    const texture = await loadKtx2Texture(dev, path);
-    const error = await dev.popErrorScope();
-    expect(error?.message ?? null).toBeNull();
-    return texture;
+    return await loadKtx2Texture(dev, path);
 }
 
 describe("loadKtx2Texture", () => {
@@ -475,6 +483,54 @@ describe("loadKtx2Texture rejections", () => {
 // half-block offset.
 
 const ASSETS = join(import.meta.dir, "assets");
+
+describe("GPU-side validation errors reach the caller", () => {
+    // The regression these guard against is specific and was live for exactly
+    // one commit: wgpu 30's error scopes are thread-local, so a scope opened on
+    // the JS thread cannot see work done inside `AsyncTask::compute` on a libuv
+    // worker. Everything below happens on that worker.
+    //
+    // Both tests pass a *well-formed* file. The failure is raised by wgpu at
+    // `create_texture`, not by any of this crate's own CPU-side checks — which
+    // is the point, because CPU-side rejections were never affected.
+    //
+    // Mutation check: remove `with_validation_scope` from `LoadKtx2Task` and
+    // both of these fail, while every other test in this file still passes.
+
+    it("rejects when wgpu refuses the texture, instead of returning a broken one", async () => {
+        if (!device) return;
+        // STORAGE_BINDING is not allowed on block-compressed formats. Nothing
+        // on the CPU side checks usage bits, so this reaches wgpu.
+        const load = loadKtx2Texture(device, join(ASSETS, "quad-bc7.ktx2"), {
+            usage: GPUTextureUsage.TEXTURE_BINDING
+                | GPUTextureUsage.COPY_DST
+                | GPUTextureUsage.STORAGE_BINDING,
+        });
+        await expect(load).rejects.toThrow(/STORAGE_BINDING/);
+    });
+
+    it("names the failing operation in the rejection", async () => {
+        if (!device) return;
+        // A bare "Validation Error" gives no clue which of a frame's many async
+        // loads produced it, so the operation and path are prefixed.
+        const load = loadKtx2Texture(device, join(ASSETS, "quad-bc7.ktx2"), {
+            usage: GPUTextureUsage.TEXTURE_BINDING
+                | GPUTextureUsage.COPY_DST
+                | GPUTextureUsage.STORAGE_BINDING,
+        });
+        await expect(load).rejects.toThrow(/loadKtx2Texture\('.*quad-bc7\.ktx2'\)/);
+    });
+
+    it("still resolves normally when the usage flags are legal", async () => {
+        if (!device) return;
+        const texture = await loadKtx2Texture(device, join(ASSETS, "quad-bc7.ktx2"), {
+            usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+        });
+        expect(texture.format).toBe("bc7-rgba-unorm");
+        expect(texture.usage & GPUTextureUsage.STORAGE_BINDING).toBe(0);
+    });
+});
+
 const Q = 64; // fixture dimensions
 
 /** Quadrant sample points, away from edges so nearest-sampling is unambiguous. */

@@ -54,3 +54,42 @@ test("nested scopes pop LIFO — the innermost one captures", async () => {
 test("popping with no open scope rejects rather than throwing", async () => {
     await expect(device.popErrorScope()).rejects.toThrow(/no matching pushErrorScope/);
 });
+
+// ── the thread boundary ──────────────────────────────────────────────────────
+//
+// Everything above runs on the JS thread. Anything returning an `AsyncTask`
+// (`createRenderPipelineAsync`, `loadImageTexture`, `loadKtx2Texture`,
+// `saveTextureToFile`, `readTexturePixels`) does its GPU work on a libuv
+// worker, and since wgpu 30 error scopes are thread-local — so a scope opened
+// here *cannot* see it. Under wgpu 24 scopes were device-global and could.
+//
+// Rather than leave that as a silent hole, those operations bracket their own
+// GPU work and reject. The contract is therefore split, and both halves are
+// pinned below because getting it backwards is invisible: a scope that cannot
+// see an error returns `null`, which reads exactly like success.
+test("an async operation rejects on a GPU error instead of needing a scope", async () => {
+    const shader = device.createShaderModule({
+        code: "@vertex fn vs() -> @builtin(position) vec4<f32> { return vec4<f32>(0.0); }",
+    });
+    // No fragment state and no depth-stencil: wgpu rejects this at pipeline
+    // creation, on the worker thread.
+    const build = device.createRenderPipelineAsync({
+        layout: "auto",
+        vertex: { module: shader, entryPoint: "vs" },
+    });
+    await expect(build).rejects.toThrow(/createRenderPipelineAsync/);
+});
+
+test("a JS-thread scope stays clean across an async failure it cannot see", async () => {
+    const shader = device.createShaderModule({
+        code: "@vertex fn vs() -> @builtin(position) vec4<f32> { return vec4<f32>(0.0); }",
+    });
+    device.pushErrorScope("validation");
+    await device
+        .createRenderPipelineAsync({ layout: "auto", vertex: { module: shader, entryPoint: "vs" } })
+        .catch(() => {});
+    // Null because the worker-thread scope consumed it, not because nothing
+    // went wrong — the rejection above is where that error surfaced. This is
+    // pinned so the split contract is documented by a test rather than folklore.
+    expect(await device.popErrorScope()).toBeNull();
+});

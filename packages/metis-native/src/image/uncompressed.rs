@@ -9,6 +9,7 @@
 //! See [`super`] for the goals both loaders share.
 
 use super::{DEFAULT_TEXTURE_USAGE, generic_err, make_gpu_texture};
+use crate::gpu::error::with_validation_scope;
 use crate::gpu::{GpuDevice, GpuTexture};
 use napi::bindgen_prelude::AsyncTask;
 use napi::{Env, Task};
@@ -185,7 +186,13 @@ impl Task for LoadTextureTask {
 
     fn compute(&mut self) -> napi::Result<GpuTexture> {
         let img = decode_image(&self.path, self.srgb)?;
-        let inner = upload_texture(&self.device, &self.queue, &img, self.usage, self.label.as_deref());
+        // Decoding is done; from here wgpu is involved, on a libuv worker where
+        // the caller's error scope does not reach. See `with_validation_scope`.
+        let inner = with_validation_scope(
+            &self.device,
+            &format!("loadImageTexture('{}')", self.path),
+            || Ok(upload_texture(&self.device, &self.queue, &img, self.usage, self.label.as_deref())),
+        )?;
         Ok(make_gpu_texture(inner, img.width, img.height, 1, img.format, self.usage))
     }
 

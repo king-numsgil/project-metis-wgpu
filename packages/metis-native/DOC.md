@@ -39,6 +39,29 @@ if (err) throw new Error(`${err.type}: ${err.message}`);
 Always either wrap suspect work in an error scope, or run the script **without**
 piping stderr through `tail`/`head` and grep the output for `wgpu`.
 
+**Error scopes cover synchronous calls only — async ones reject instead.**
+Anything returning a promise from a background task (`loadImageTexture`,
+`loadKtx2Texture`, `createRenderPipelineAsync`, `createComputePipelineAsync`,
+`saveTextureToFile`, `readTexturePixels`) does its GPU work on a worker thread,
+and wgpu's error scopes are thread-local, so a scope you open will **not** see
+it and will resolve `null`. Those operations bracket their own work instead and
+**reject the promise**, with the operation named:
+
+```ts
+// Wrong — the scope cannot see a worker thread, so `err` is always null.
+device.pushErrorScope("validation");
+const tex = await loadKtx2Texture(device, "albedo.ktx2");
+const err = await device.popErrorScope();       // null, even on failure
+
+// Right — just await it.
+const tex = await loadKtx2Texture(device, "albedo.ktx2");
+// rejects: "loadKtx2Texture('albedo.ktx2'): Validation Error ..."
+```
+
+This is the one case where a validation error *does* reach you without an error
+scope, and it means an async load that returns has already been accepted by
+wgpu.
+
 ---
 
 ## 2. Device setup

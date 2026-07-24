@@ -3,6 +3,7 @@ use super::buffer::{GpuBuffer, GpuBufferDescriptor};
 use super::command_encoder::{GpuCommandEncoder, GpuCommandEncoderDescriptor};
 use super::convert;
 use super::pipeline::{GpuComputePipeline, GpuComputePipelineDescriptor, GpuRenderPipeline, GpuRenderPipelineDescriptor, OwnedComputeArgs, OwnedRenderArgs, build_compute_pipeline, build_render_pipeline, build_compute_from_args, build_render_from_args, extract_compute_args, extract_render_args};
+use super::error::with_validation_scope;
 use super::query_set::{GpuQuerySet, GpuQuerySetDescriptor};
 use super::queue::GpuQueue;
 use super::sampler::{GpuSampler, GpuSamplerDescriptor};
@@ -50,7 +51,11 @@ impl Task for ComputePipelineTask {
 
     fn compute(&mut self) -> napi::Result<GpuComputePipeline> {
         let args = self.args.take().expect("compute called twice");
-        Ok(build_compute_from_args(&self.device, args))
+        // Runs on a libuv worker, so the caller's error scope does not cover
+        // it — see `gpu::error::with_validation_scope`.
+        with_validation_scope(&self.device, "createComputePipelineAsync", || {
+            Ok(build_compute_from_args(&self.device, args))
+        })
     }
 
     fn resolve(&mut self, _env: Env, output: GpuComputePipeline) -> napi::Result<GpuComputePipeline> {
@@ -69,7 +74,9 @@ impl Task for RenderPipelineTask {
 
     fn compute(&mut self) -> napi::Result<GpuRenderPipeline> {
         let args = self.args.take().expect("compute called twice");
-        Ok(build_render_from_args(&self.device, args))
+        with_validation_scope(&self.device, "createRenderPipelineAsync", || {
+            Ok(build_render_from_args(&self.device, args))
+        })
     }
 
     fn resolve(&mut self, _env: Env, output: GpuRenderPipeline) -> napi::Result<GpuRenderPipeline> {

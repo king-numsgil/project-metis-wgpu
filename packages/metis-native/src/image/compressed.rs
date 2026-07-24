@@ -47,6 +47,7 @@
 //! ```
 
 use super::{DEFAULT_TEXTURE_USAGE, generic_err, make_gpu_texture};
+use crate::gpu::error::with_validation_scope;
 use crate::gpu::{GpuDevice, GpuTexture};
 use napi::bindgen_prelude::AsyncTask;
 use napi::{Env, Task};
@@ -397,7 +398,17 @@ impl Task for LoadKtx2Task {
             levels.push(data);
         }
 
-        let inner = upload_blocks(&self.device, &self.queue, &info, &levels, self.usage, self.label.as_deref());
+        // Everything above is pure CPU parsing and rejects bad input itself.
+        // From here on wgpu is involved, and this runs on a libuv worker where
+        // the caller's error scope does not reach — see `with_validation_scope`.
+        // A wrong `bytes_per_row` or copy extent is a validation error, not a
+        // panic, so without this it would hand back a plausible texture full of
+        // garbage.
+        let inner = with_validation_scope(
+            &self.device,
+            &format!("loadKtx2Texture('{}')", self.path),
+            || Ok(upload_blocks(&self.device, &self.queue, &info, &levels, self.usage, self.label.as_deref())),
+        )?;
         Ok(make_gpu_texture(inner, info.width, info.height, info.level_count, format, self.usage))
     }
 
