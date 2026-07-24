@@ -426,6 +426,39 @@ per frame must be expensive" is wrong by two orders of magnitude here.
 - VSync throttling happens in `getCurrentTexture()` (not `present()`) on DirectX backends. Use `presentMode: 'immediate'` to measure raw CPU costs.
 - **`configure()`'s default present mode is `Mailbox`** (fifo fallback if unsupported) — set in `surface.rs`. This is deliberate: `Fifo`/`AutoVsync` were found to stall `getCurrentTexture()` for a periodic ~50 ms burst on this machine's Vulkan driver when the app renders faster than refresh (a metronomic stutter, diagnosed via a per-phase frame profiler in `metis-game`). `Mailbox` is tear-free and doesn't exhibit it, but is uncapped — pair it with `metis-engine`'s `FrameLimiter` for a frame cap. Don't "restore" a fifo default without re-checking that stall.
 
+### OPEN — a swapchain-teardown abort seen once on Linux, unverified on Windows
+
+**Check this when next building on Windows.** Observed 2026-07-23 on the
+`wgpu-v30` branch, during one full `bun test` run on Linux/Vulkan:
+
+```
+thread '<unnamed>' panicked at wgpu-hal-30.0.0/src/vulkan/swapchain/native.rs:389:
+  Trying to destroy a SwapchainAcquireSemaphore that is still in use by a SurfaceTexture
+fatal runtime error: failed to initiate panic, error 5, aborting
+```
+
+It aborts the process — nothing JS can catch — and it **did not reproduce in
+nine subsequent runs** (three full suites, six targeted at the surface-heavy
+files). It could not be attributed to a specific test file; the suite has
+several surface users.
+
+The plausible mechanism is that presentation is asynchronous, so a frame
+presented moments earlier can still hold a swapchain acquire semaphore when the
+swapchain is torn down or reconfigured. `tests/surface-config.test.ts` now calls
+`device.poll("wait")` before destroying its surface, which is correct regardless
+— but **that is not a confirmed fix**, because the panic was never reproduced to
+confirm anything against.
+
+Why Windows specifically is worth checking: the section below is a worked
+example of a surface-lifetime bug that was **fatal on exactly one platform** and
+benign on the other, purely because of how the two backends tear surfaces down.
+A one-in-many-runs abort on Linux may be deterministic on Windows' Vulkan
+driver, or absent. Either answer is useful; assuming it is Linux-only is not.
+
+If it does reproduce, the thing to establish first is whether a
+`poll("wait")` before `configure()`/`destroy()` removes it — that distinguishes
+"we tear down too eagerly" from a wgpu-hal bug worth reporting upstream.
+
 ### A surface outliving its window is a segfault, not a leak
 
 `GpuSurface::destroy()` exists because **the surface must be released before the
