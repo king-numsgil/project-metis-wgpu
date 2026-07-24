@@ -424,7 +424,7 @@ impl Task for SavePixelsTask {
 /// Encoding is chosen from the extension (`.hdr` is rejected — 8-bit input
 /// carries no high-dynamic-range data). Parent directories are created as needed.
 ///
-/// Pair with [`read_texture_pixels`] when a caller wants both the pixels and a
+/// Pair with `readTexturePixels` when a caller wants both the pixels and a
 /// file from a single GPU readback.
 #[allow(private_interfaces)]
 #[napi(ts_return_type = "Promise<void>")]

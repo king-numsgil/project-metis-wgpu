@@ -23,6 +23,10 @@ pub struct GpuCompilationInfo {
     pub messages: Vec<GpuCompilationMessage>,
 }
 
+/// A compiled WGSL shader module created by `device.createShaderModule`,
+/// referenced as the `module` of a pipeline's vertex/fragment/compute stage.
+/// Compilation is deferred and never throws here — inspect diagnostics via
+/// `getCompilationInfo()` or wrap creation in an error scope.
 #[napi]
 pub struct GpuShaderModule {
     pub(crate) inner: Arc<wgpu::ShaderModule>,
@@ -36,6 +40,9 @@ impl GpuShaderModule {
 
 #[napi]
 impl GpuShaderModule {
+    /// Resolve with the compiler's diagnostics for this module — errors,
+    /// warnings and info messages, each with a source location. Empty on a clean
+    /// compile.
     #[napi]
     pub async fn get_compilation_info(&self) -> napi::Result<GpuCompilationInfo> {
         // wgpu 24 provides compilation info via the module

@@ -22,11 +22,12 @@ use std::sync::Arc;
 ///
 /// **Ignored for floating-point source formats** (Radiance HDR): those carry
 /// linear radiance by definition, so there is no sRGB transfer curve to undo and
-/// no `-srgb` float texture format to request. See [`decode_image`].
+/// no `-srgb` float texture format to request — an `.hdr` load always yields
+/// `rgba16float` regardless of this option.
 ///
 /// KTX2 has no equivalent option — a `.ktx2` file states its own format, so
-/// [`super::compressed`] reads the colour space out of the file rather than
-/// taking it from the caller.
+/// `loadKtx2Texture` reads the colour space out of the file rather than taking
+/// it from the caller.
 #[napi]
 pub enum ImageColorSpace {
     /// sRGB-encoded colour (albedo, emissive) — creates an `rgba8unorm-srgb`

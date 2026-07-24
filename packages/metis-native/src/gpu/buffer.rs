@@ -11,6 +11,13 @@ pub struct GpuBufferDescriptor {
     pub mapped_at_creation: Option<bool>,
 }
 
+/// A block of GPU memory created by `device.createBuffer`.
+///
+/// Fill it from the CPU via `queue.writeBuffer` (the usual path), or — for a
+/// buffer created `mappedAtCreation` or after `mapAsync` — through
+/// `getMappedRange` / `writeMappedRange`. Bind it to shaders as a vertex,
+/// index, uniform or storage buffer per its `usage` flags. Call `destroy()`
+/// when done to free the memory eagerly rather than waiting for GC.
 #[napi]
 pub struct GpuBuffer {
     pub(crate) inner: Arc<wgpu::Buffer>,
@@ -29,18 +36,31 @@ impl GpuBuffer {
 
 #[napi]
 impl GpuBuffer {
+    /// Size of the buffer in bytes (as requested at creation).
     #[napi(getter)]
     pub fn size(&self) -> f64 { self.size as f64 }
+    /// The `GPUBufferUsage` bitmask this buffer was created with.
     #[napi(getter)]
     pub fn usage(&self) -> u32 { self.usage }
+    /// The debug label passed at creation, or `null`.
     #[napi(getter)]
     pub fn label(&self) -> Option<String> { self.label.clone() }
 
+    /// Current map state: `"mapped"` or `"unmapped"`. (The transient
+    /// `"pending"` state the spec defines is not surfaced separately here.)
     #[napi(getter)]
     pub fn map_state(&self) -> String {
         if *self.mapped.lock().unwrap() { "mapped".into() } else { "unmapped".into() }
     }
 
+    /// Map the buffer for CPU access and resolve once the mapping is ready.
+    ///
+    /// `mode` is a `GPUMapMode` bitmask (`READ` or `WRITE`); the buffer must
+    /// have the matching `MAP_READ` / `MAP_WRITE` usage. `offset`/`size` bound
+    /// the mapped region (defaults: whole buffer from 0). This drives the
+    /// device poll internally, so the returned promise settling means the range
+    /// is ready for `getMappedRange` / `writeMappedRange`. Call `unmap()` before
+    /// using the buffer on the GPU again.
     #[napi]
     pub async fn map_async(&self, mode: u32, offset: Option<f64>, size: Option<f64>) -> napi::Result<()> {
         let offset = offset.unwrap_or(0.0) as u64;
@@ -78,6 +98,14 @@ impl GpuBuffer {
         Ok(())
     }
 
+    /// Copy the mapped range out as a fresh `Uint8Array`. The buffer must be
+    /// mapped (via `mapAsync` or `mappedAtCreation`). `offset`/`size` default to
+    /// the whole buffer.
+    ///
+    /// Unlike the browser spec — which returns a live `ArrayBuffer` view into
+    /// the mapping — this returns an owned **copy**, because the napi boundary
+    /// can't hand back a borrow of GPU memory. To write into a mapped buffer use
+    /// `writeMappedRange`.
     #[napi]
     pub fn get_mapped_range(&self, offset: Option<f64>, size: Option<f64>) -> napi::Result<Uint8Array> {
         if !*self.mapped.lock().unwrap() {
@@ -89,6 +117,12 @@ impl GpuBuffer {
         Ok(Uint8Array::new(view.to_vec()))
     }
 
+    /// Write `data` into the mapped buffer (this binding's replacement for
+    /// mutating the spec's live mapped `ArrayBuffer`, which the napi boundary
+    /// can't expose). The buffer must be mapped for writing.
+    ///
+    /// `bufferOffset` is where in the buffer to start (default 0);
+    /// `dataOffset`/`size` select a sub-slice of `data` (defaults: all of it).
     #[napi]
     pub fn write_mapped_range(
         &self,
@@ -110,6 +144,9 @@ impl GpuBuffer {
         Ok(())
     }
 
+    /// Unmap the buffer, flushing any `writeMappedRange` edits and making it
+    /// usable by the GPU again. Any array returned by `getMappedRange` is a copy
+    /// and stays valid, but must not be written back after this.
     #[napi]
     pub fn unmap(&self) -> napi::Result<()> {
         self.inner.unmap();
@@ -117,6 +154,8 @@ impl GpuBuffer {
         Ok(())
     }
 
+    /// Free the buffer's GPU memory now. Subsequent use is a validation error;
+    /// the handle itself becomes inert.
     #[napi]
     pub fn destroy(&self) { self.inner.destroy(); }
 }

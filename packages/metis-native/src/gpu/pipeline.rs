@@ -102,6 +102,9 @@ pub struct GpuComputePipelineDescriptor {
     pub compute: GpuProgrammableStage,
 }
 
+/// A compiled compute pipeline (shader + layout), created by
+/// `device.createComputePipeline(Async)`. Bind it in a compute pass with
+/// `pass.setPipeline`.
 #[napi]
 pub struct GpuComputePipeline {
     pub(crate) inner: Arc<wgpu::ComputePipeline>,
@@ -115,6 +118,9 @@ impl GpuComputePipeline {
 
 #[napi]
 impl GpuComputePipeline {
+    /// Get the auto-generated bind group layout for group `index`. Useful when
+    /// the pipeline was created with `layout: "auto"` and you need a layout to
+    /// build matching bind groups.
     #[napi]
     pub fn get_bind_group_layout(&self, index: u32) -> GpuBindGroupLayout {
         GpuBindGroupLayout::new(self.inner.get_bind_group_layout(index))
@@ -237,6 +243,9 @@ pub struct GpuRenderPipelineDescriptor {
     pub fragment: Option<GpuFragmentState>,
 }
 
+/// A compiled render pipeline — vertex + fragment state, primitive,
+/// depth/stencil, multisample and layout baked together. Created by
+/// `device.createRenderPipeline(Async)` and bound with `pass.setPipeline`.
 #[napi]
 pub struct GpuRenderPipeline {
     pub(crate) inner: Arc<wgpu::RenderPipeline>,
@@ -250,6 +259,8 @@ impl GpuRenderPipeline {
 
 #[napi]
 impl GpuRenderPipeline {
+    /// Get the auto-generated bind group layout for group `index` — chiefly for
+    /// pipelines created with `layout: "auto"`.
     #[napi]
     pub fn get_bind_group_layout(&self, index: u32) -> GpuBindGroupLayout {
         GpuBindGroupLayout::new(self.inner.get_bind_group_layout(index))

@@ -232,6 +232,7 @@ pub fn sdl_set_joystick_events_enabled(enabled: bool) {
     unsafe { SDL_SetJoystickEventsEnabled(enabled) };
 }
 
+/// Returns `true` if joystick events are currently delivered to the event queue.
 #[napi]
 pub fn sdl_joystick_events_enabled() -> bool {
     unsafe { SDL_JoystickEventsEnabled() }
@@ -249,6 +250,7 @@ pub fn sdl_lock_joysticks() {
     unsafe { SDL_LockJoysticks() };
 }
 
+/// Release the lock taken by `sdlLockJoysticks()`.
 #[napi]
 pub fn sdl_unlock_joysticks() {
     unsafe { SDL_UnlockJoysticks() };

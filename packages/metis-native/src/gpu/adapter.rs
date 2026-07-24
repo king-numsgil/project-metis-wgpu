@@ -171,6 +171,12 @@ fn required_limits_to_wgpu(r: &GpuRequiredLimits) -> wgpu::Limits {
     l
 }
 
+/// A handle to a physical GPU (or a software fallback), as chosen by
+/// `requestAdapter` / `requestAdapterForWindow` / `enumerateAdapters`.
+///
+/// Inspect `features`, `limits` and `info` to decide what to ask for, then call
+/// `requestDevice` to get the `GpuDevice` you actually render with. An adapter
+/// is cheap and read-only; the device is the object that owns resources.
 #[napi]
 pub struct GpuAdapter {
     pub(crate) inner: Arc<wgpu::Adapter>,
@@ -179,21 +185,32 @@ pub struct GpuAdapter {
 
 #[napi]
 impl GpuAdapter {
+    /// The optional features this adapter supports. Every name you list in
+    /// `requestDevice`'s `requiredFeatures` must appear here, or device
+    /// creation rejects — check with `adapter.features.has(name)` first.
     #[napi(getter)]
     pub fn features(&self) -> GpuSupportedFeatures {
         GpuSupportedFeatures::from_wgpu(self.inner.features())
     }
 
+    /// The maximum resource limits this adapter can grant. Any value requested
+    /// in `requestDevice`'s `requiredLimits` must fall within these.
     #[napi(getter)]
     pub fn limits(&self) -> GpuSupportedLimits {
         limits_to_js(&self.inner.limits())
     }
 
+    /// `true` if this is a CPU/software rasterizer rather than real hardware
+    /// (`info.deviceType === "cpu"`). Such adapters are conformant but slow —
+    /// worth surfacing when performance is inexplicably bad.
     #[napi(getter)]
     pub fn is_fallback_adapter(&self) -> bool {
         self.inner.get_info().device_type == wgpu::DeviceType::Cpu
     }
 
+    /// Vendor / device / backend identification for this adapter (name, driver
+    /// backend, device type, subgroup size range). Useful for logging which GPU
+    /// was selected and for telling a discrete GPU from an integrated one.
     #[napi(getter)]
     pub fn info(&self) -> GpuAdapterInfo {
         let i = self.inner.get_info();
@@ -211,6 +228,14 @@ impl GpuAdapter {
         }
     }
 
+    /// Create a logical `GpuDevice` and its default queue from this adapter.
+    ///
+    /// Pass `requiredFeatures` / `requiredLimits` in the descriptor to opt into
+    /// capabilities beyond the guaranteed baseline. The returned promise
+    /// **rejects** if the adapter can't meet a requested limit (the message
+    /// names every offender and the adapter) or an unknown/unsupported feature
+    /// is requested — mirroring the spec, which fails device creation rather
+    /// than handing back a device silently missing what you asked for.
     #[napi]
     pub async fn request_device(&self, descriptor: Option<GpuDeviceDescriptor>) -> napi::Result<GpuDevice> {
         let adapter = Arc::clone(&self.inner);

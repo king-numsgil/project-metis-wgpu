@@ -35,6 +35,13 @@ struct RawWindow(*mut SDL_Window);
 unsafe impl Send for RawWindow {}
 unsafe impl Sync for RawWindow {}
 
+/// An SDL3 OS window, created by `sdlCreateWindow`. Query and change its title,
+/// size, position, opacity and display/grab state, and drive its lifecycle
+/// (`show`/`hide`/`minimize`/`maximize`/`setFullscreen`).
+///
+/// Pass it to `requestAdapterForWindow` / `createSurface` to render into it. At
+/// shutdown release any `GpuSurface` (via `surface.destroy()`) **before**
+/// calling `window.destroy()`.
 #[napi]
 pub struct SdlWindow {
     raw: RawWindow,
@@ -264,6 +271,9 @@ pub struct MouseRect {
 
 // ── Factory function ──────────────────────────────────────────────────────────
 
+/// Create a window of `width` × `height` (logical pixels) with the given title.
+/// `flags` is a bitmask of `SdlWindowFlag` values (e.g. `Resizable | Hidden`),
+/// defaulting to none. Requires `sdlInit(SdlInitFlag.Video)` first.
 #[napi]
 pub fn sdl_create_window(title: String, width: u32, height: u32, flags: Option<u32>) -> napi::Result<SdlWindow> {
     let c = CString::new(title.as_str()).map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;

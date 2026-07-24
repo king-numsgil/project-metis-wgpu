@@ -94,6 +94,11 @@ fn entry_to_wgpu(e: &GpuBindGroupLayoutEntry) -> napi::Result<wgpu::BindGroupLay
     })
 }
 
+/// The declared shape of a bind group — which binding slots exist, their
+/// resource types and which shader stages see them. Created by
+/// `device.createBindGroupLayout` (or obtained from a pipeline via
+/// `getBindGroupLayout`), then referenced by both a pipeline layout and the
+/// bind groups validated against it.
 #[napi]
 pub struct GpuBindGroupLayout {
     pub(crate) inner: Arc<wgpu::BindGroupLayout>,
@@ -123,6 +128,10 @@ pub struct GpuPipelineLayoutDescriptor {
     pub immediate_size: Option<u32>,
 }
 
+/// The full resource interface of a pipeline: an ordered set of bind group
+/// layouts plus optional immediate-data size. Created by
+/// `device.createPipelineLayout` and passed as a pipeline's `layout` (the
+/// alternative to `"auto"`).
 #[napi]
 pub struct GpuPipelineLayout {
     pub(crate) inner: Arc<wgpu::PipelineLayout>,
@@ -158,6 +167,9 @@ pub struct GpuBindGroupDescriptor {
     pub entries: Vec<GpuBindGroupEntry>,
 }
 
+/// A concrete set of resources (buffers, samplers, texture views) bound to a
+/// `GpuBindGroupLayout`, created by `device.createBindGroup`. Attach it to a
+/// pass with `pass.setBindGroup(index, group)`.
 #[napi]
 pub struct GpuBindGroup {
     pub(crate) inner: Arc<wgpu::BindGroup>,

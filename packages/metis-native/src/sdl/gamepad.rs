@@ -272,16 +272,21 @@ pub fn sdl_open_gamepad(instance_id: u32) -> napi::Result<SdlGamepad> {
 
 // ── Global controls ───────────────────────────────────────────────────────────
 
+/// Enable or disable delivery of gamepad events to the event queue. When
+/// disabled you must call `sdlUpdateGamepads()` yourself to refresh state.
 #[napi]
 pub fn sdl_set_gamepad_events_enabled(enabled: bool) {
     unsafe { SDL_SetGamepadEventsEnabled(enabled) };
 }
 
+/// Returns `true` if gamepad events are currently delivered to the event queue.
 #[napi]
 pub fn sdl_gamepad_events_enabled() -> bool {
     unsafe { SDL_GamepadEventsEnabled() }
 }
 
+/// Manually refresh gamepad state. Not needed while gamepad events are enabled
+/// and you call `sdlPollEvents()`; use it when polling gamepads with events off.
 #[napi]
 pub fn sdl_update_gamepads() {
     unsafe { SDL_UpdateGamepads() };

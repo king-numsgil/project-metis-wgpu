@@ -111,6 +111,15 @@ pub struct GpuUncapturedErrorEvent {
 pub(crate) type UncapturedErrorTsfn =
 ThreadsafeFunction<GpuUncapturedErrorEvent, (), GpuUncapturedErrorEvent>;
 
+/// The logical GPU device — the root object you create resources from and the
+/// owner of the default `queue`. Obtained via `adapter.requestDevice`.
+///
+/// Every `createX` method here builds a GPU resource (buffers, textures,
+/// samplers, bind groups, pipelines, shader modules, query sets, command
+/// encoders). Errors from GPU work are surfaced through `pushErrorScope` /
+/// `popErrorScope` or the `onuncapturederror` handler rather than as thrown
+/// exceptions. Call `destroy()` at shutdown; `lost` resolves when the device
+/// goes away.
 #[napi]
 pub struct GpuDevice {
     pub(crate) inner: Arc<wgpu::Device>,
@@ -149,21 +158,29 @@ impl GpuDevice {
 
 #[napi]
 impl GpuDevice {
+    /// The debug label passed in `requestDevice`, or `null`.
     #[napi(getter)]
     pub fn label(&self) -> Option<String> {
         self.label.clone()
     }
 
+    /// The features actually enabled on this device — a subset of what was
+    /// requested. Check with `device.features.has(name)` before using a
+    /// feature-gated code path.
     #[napi(getter)]
     pub fn features(&self) -> GpuSupportedFeatures {
         GpuSupportedFeatures::from_wgpu(self.inner.features())
     }
 
+    /// The limits granted to this device (the requested values, or the adapter
+    /// defaults where none were requested).
     #[napi(getter)]
     pub fn limits(&self) -> crate::gpu::adapter::GpuSupportedLimits {
         crate::gpu::adapter::limits_to_js(&self.inner.limits())
     }
 
+    /// Identification of the adapter this device was created from — the same
+    /// shape as `adapter.info`, kept accessible once you only hold the device.
     #[napi(getter)]
     pub fn adapter_info(&self) -> crate::gpu::adapter::GpuAdapterInfo {
         let i = &self.raw_adapter_info;
@@ -180,6 +197,9 @@ impl GpuDevice {
         }
     }
 
+    /// The device's default queue — where you `submit` command buffers and call
+    /// `writeBuffer` / `writeTexture`. Returns a fresh handle to the same
+    /// underlying queue each time.
     #[napi(getter)]
     pub fn queue(&self) -> GpuQueue {
         GpuQueue {
@@ -216,8 +236,9 @@ impl GpuDevice {
 
     // ── onuncapturederror ─────────────────────────────────────────────────────
 
-    /// Getter returns `undefined` (we cannot round-trip the JS function after
-    /// converting it to a ThreadsafeFunction).
+    /// Always `undefined`: this handler is write-only. A callback registered via
+    /// the setter can't be read back out, so reading the property returns
+    /// nothing rather than the function you set.
     #[napi(getter)]
     pub fn get_onuncapturederror(&self) {}
 
@@ -238,6 +259,8 @@ impl GpuDevice {
 
     // ── resource factories ────────────────────────────────────────────────────
 
+    /// Allocate a `GpuBuffer` of `descriptor.size` bytes with the given `usage`
+    /// flags. Set `mappedAtCreation` to fill it from the CPU before first use.
     #[napi]
     pub fn create_buffer(&self, descriptor: GpuBufferDescriptor) -> napi::Result<GpuBuffer> {
         let size = descriptor.size as u64;
@@ -252,6 +275,9 @@ impl GpuDevice {
         Ok(GpuBuffer::new(buf, Arc::clone(&self.inner), size, descriptor.usage, descriptor.label, mapped_at_creation))
     }
 
+    /// Create a `GpuTexture` with the given size, `format`, mip/sample counts
+    /// and `usage` flags. For loading image or KTX2 files into a texture, prefer
+    /// `loadImageTexture` / `loadKtx2Texture`.
     #[napi]
     pub fn create_texture(&self, descriptor: GpuTextureDescriptor) -> napi::Result<GpuTexture> {
         let format = convert::texture_format(&descriptor.format)?;
@@ -282,6 +308,8 @@ impl GpuDevice {
         Ok(GpuTexture::from_desc(tex, &wgpu_desc, descriptor.usage))
     }
 
+    /// Create a `GpuSampler` describing how shaders filter and address a texture.
+    /// Omitting the descriptor gives nearest-filtering, clamp-to-edge defaults.
     #[napi]
     pub fn create_sampler(&self, descriptor: Option<GpuSamplerDescriptor>) -> napi::Result<GpuSampler> {
         let sampler = if let Some(ref d) = descriptor {
@@ -293,11 +321,17 @@ impl GpuDevice {
         Ok(GpuSampler::new(sampler))
     }
 
+    /// Create a `GpuBindGroupLayout`: the shape (binding indices, types and
+    /// stage visibility) that both a pipeline layout and a matching bind group
+    /// are validated against.
     #[napi]
     pub fn create_bind_group_layout(&self, descriptor: GpuBindGroupLayoutDescriptor) -> napi::Result<GpuBindGroupLayout> {
         GpuBindGroupLayout::from_desc(&self.inner, &descriptor)
     }
 
+    /// Create a `GpuPipelineLayout` from an ordered list of bind group layouts
+    /// (plus an optional immediate-data size), defining the resource interface a
+    /// pipeline expects.
     #[napi]
     pub fn create_pipeline_layout(&self, descriptor: GpuPipelineLayoutDescriptor) -> napi::Result<GpuPipelineLayout> {
         // `Option` entries here are `null` bind group layouts — an unused group
@@ -318,11 +352,15 @@ impl GpuDevice {
         Ok(GpuPipelineLayout::new(layout))
     }
 
+    /// Create a `GpuBindGroup`: the concrete resources (buffers, samplers,
+    /// texture views) bound to a `GpuBindGroupLayout`, ready to bind in a pass.
     #[napi]
     pub fn create_bind_group(&self, descriptor: GpuBindGroupDescriptor) -> napi::Result<GpuBindGroup> {
         GpuBindGroup::from_desc(&self.inner, &descriptor)
     }
 
+    /// Compile a WGSL shader module from `descriptor.code`. Compilation errors
+    /// surface via `getCompilationInfo()` / error scopes, not as a throw.
     #[napi]
     pub fn create_shader_module(&self, descriptor: GpuShaderModuleDescriptor) -> GpuShaderModule {
         let module = self.inner.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -332,11 +370,18 @@ impl GpuDevice {
         GpuShaderModule::new(module)
     }
 
+    /// Create a compute pipeline synchronously. This blocks while the driver
+    /// compiles the shader; use `createComputePipelineAsync` on a hot path to
+    /// keep it off the JS thread.
     #[napi]
     pub fn create_compute_pipeline(&self, descriptor: GpuComputePipelineDescriptor) -> napi::Result<GpuComputePipeline> {
         build_compute_pipeline(&self.inner, &descriptor)
     }
 
+    /// Create a compute pipeline off the JS thread. The returned promise
+    /// **rejects** with any validation error from compilation (an async task's
+    /// GPU work is outside a caller's `pushErrorScope`, so it reports errors
+    /// itself).
     #[allow(private_interfaces)]
     #[napi(ts_return_type = "Promise<GpuComputePipeline>")]
     pub fn create_compute_pipeline_async(&self, descriptor: GpuComputePipelineDescriptor) -> napi::Result<AsyncTask<ComputePipelineTask>> {
@@ -345,11 +390,17 @@ impl GpuDevice {
         Ok(AsyncTask::new(ComputePipelineTask { device, args: Some(args) }))
     }
 
+    /// Create a render pipeline synchronously. This blocks while the driver
+    /// compiles the shaders; use `createRenderPipelineAsync` on a hot path to
+    /// keep it off the JS thread.
     #[napi]
     pub fn create_render_pipeline(&self, descriptor: GpuRenderPipelineDescriptor) -> napi::Result<GpuRenderPipeline> {
         build_render_pipeline(&self.inner, &descriptor)
     }
 
+    /// Create a render pipeline off the JS thread. The returned promise
+    /// **rejects** with any validation error from compilation (the same async
+    /// error-reporting contract as `createComputePipelineAsync`).
     #[allow(private_interfaces)]
     #[napi(ts_return_type = "Promise<GpuRenderPipeline>")]
     pub fn create_render_pipeline_async(&self, descriptor: GpuRenderPipelineDescriptor) -> napi::Result<AsyncTask<RenderPipelineTask>> {
@@ -358,6 +409,8 @@ impl GpuDevice {
         Ok(AsyncTask::new(RenderPipelineTask { device, args: Some(args) }))
     }
 
+    /// Create a `GpuCommandEncoder` to record a batch of GPU commands (passes,
+    /// copies) for later `queue.submit`.
     #[napi]
     pub fn create_command_encoder(&self, descriptor: Option<GpuCommandEncoderDescriptor>) -> GpuCommandEncoder {
         let label = descriptor.as_ref().and_then(|d| d.label.clone());
@@ -367,6 +420,9 @@ impl GpuDevice {
         GpuCommandEncoder::new(encoder, label)
     }
 
+    /// Create a `GpuQuerySet` of `count` slots for `"occlusion"` or
+    /// `"timestamp"` queries. Timestamp queries need the `timestamp-query`
+    /// feature.
     #[napi]
     pub fn create_query_set(&self, descriptor: GpuQuerySetDescriptor) -> napi::Result<GpuQuerySet> {
         let qt = convert::query_type(&descriptor.r#type)?;
@@ -450,7 +506,10 @@ impl GpuDevice {
         })
     }
 
-    /// Poll device for completion. Returns true if queue is empty.
+    /// Process the device's internal queues (running map/submit callbacks) and
+    /// return `true` once the queue is empty. Pass `"wait"` to block until all
+    /// submitted work completes; omit (or anything else) for a non-blocking
+    /// poll. Handy before reading back a resource in a test or teardown path.
     #[napi]
     pub fn poll(&self, maintain: Option<String>) -> bool {
         let m = match maintain.as_deref() {
@@ -460,6 +519,9 @@ impl GpuDevice {
         matches!(self.inner.poll(m), Ok(wgpu::PollStatus::QueueEmpty))
     }
 
+    /// Destroy the device, freeing its resources and causing `lost` to resolve
+    /// with reason `"destroyed"`. Subsequent GPU calls become invalid. Release
+    /// any `GpuSurface` (via `surface.destroy()`) before tearing down here.
     #[napi]
     pub fn destroy(&self) {
         self.inner.destroy();

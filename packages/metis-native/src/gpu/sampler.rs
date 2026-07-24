@@ -24,6 +24,10 @@ pub struct GpuSamplerDescriptor {
     pub max_anisotropy: Option<u16>,
 }
 
+/// Describes how a shader filters and addresses a texture when sampling
+/// (min/mag/mip filters, address modes, LOD clamps, anisotropy, optional
+/// comparison for shadow sampling). Created by `device.createSampler` and bound
+/// through a bind group.
 #[napi]
 pub struct GpuSampler {
     pub(crate) inner: Arc<wgpu::Sampler>,

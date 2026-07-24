@@ -69,6 +69,11 @@ pub struct GpuImageDataLayout {
     pub rows_per_image: Option<u32>,
 }
 
+/// A GPU texture (image) created by `device.createTexture`, `loadImageTexture`
+/// or `loadKtx2Texture`. Bind it to shaders through a `GpuTextureView` (from
+/// `createView`) or use it as a render attachment. The size/format/mip getters
+/// report what it was created with — read `format` rather than assuming, since
+/// the loaders pick it from the source.
 #[napi]
 pub struct GpuTexture {
     pub(crate) inner: Arc<wgpu::Texture>,
@@ -100,6 +105,9 @@ impl GpuTexture {
 
 #[napi]
 impl GpuTexture {
+    /// Create a `GpuTextureView` for binding or as a render attachment. The
+    /// descriptor can narrow to a single mip level, array layer or aspect, or
+    /// reinterpret the format — omit it for a default view of the whole texture.
     #[napi]
     pub fn create_view(&self, descriptor: Option<GpuTextureViewDescriptor>) -> napi::Result<GpuTextureView> {
         // Hoist owned data out so references live long enough
@@ -160,9 +168,13 @@ impl GpuTexture {
     pub fn dimension(&self) -> String { convert::texture_dimension_to_str(self.dimension).to_string() }
     #[napi(getter, ts_return_type = "GPUTextureFormat")]
     pub fn format(&self) -> String { convert::texture_format_to_str(self.format).to_string() }
+    /// The `GPUTextureUsage` bitmask this texture was created with.
     #[napi(getter)]
     pub fn usage(&self) -> u32 { self.usage }
 
+    /// The view dimension a default `createView()` would produce for this
+    /// texture — `"2d"`, `"2d-array"`, `"3d"` or `"1d"`, inferred from the
+    /// texture's dimension and layer count.
     #[napi(getter, ts_return_type = "GPUTextureViewDimension")]
     pub fn texture_binding_view_dimension(&self) -> String {
         let view_dim = match self.dimension {
@@ -179,10 +191,15 @@ impl GpuTexture {
         convert::texture_view_dimension_to_str(view_dim).to_string()
     }
 
+    /// Free the texture's GPU memory now. Any views created from it, and any use
+    /// of it afterwards, become invalid.
     #[napi]
     pub fn destroy(&self) { self.inner.destroy(); }
 }
 
+/// A view onto a `GpuTexture` (a mip/layer/aspect subset, possibly with a
+/// reinterpreted format), created by `texture.createView`. This is what you
+/// actually put in a bind group entry or use as a render-pass attachment.
 #[napi]
 pub struct GpuTextureView {
     pub(crate) inner: Arc<wgpu::TextureView>,

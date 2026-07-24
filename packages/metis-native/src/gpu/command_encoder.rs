@@ -16,6 +16,10 @@ pub(crate) struct EncoderState {
 
 // ── Command buffer ────────────────────────────────────────────────────────────
 
+/// An opaque, recorded list of GPU commands produced by
+/// `commandEncoder.finish()`. Hand it to `queue.submit([...])` to execute it.
+/// A command buffer can only be submitted **once** — submitting again is an
+/// error.
 #[napi]
 pub struct GpuCommandBuffer {
     pub(crate) inner: Mutex<Option<wgpu::CommandBuffer>>,
@@ -120,6 +124,15 @@ impl GpuRenderPassEncoder {
     }
 }
 
+/// Records the draw commands of a single render pass. Created by
+/// `commandEncoder.beginRenderPass(descriptor)`, which binds the pass's colour
+/// and depth/stencil attachments.
+///
+/// Set pipeline, bind groups and vertex/index buffers, then issue `draw*`
+/// calls; `setViewport` / `setScissorRect` and the debug-marker calls apply to
+/// this pass only. Call `end()` to finish — after which the parent
+/// `GpuCommandEncoder` is usable again and no further calls on this pass are
+/// valid.
 #[napi]
 pub struct GpuRenderPassEncoder {
     // SAFETY: lifetime erased to 'static. Invariants:
@@ -133,6 +146,7 @@ pub struct GpuRenderPassEncoder {
 
 #[napi]
 impl GpuRenderPassEncoder {
+    /// Set the render pipeline used by subsequent `draw*` calls.
     #[napi]
     pub fn set_pipeline(&self, pipeline: &GpuRenderPipeline) -> napi::Result<()> {
         self.pass.lock().unwrap().as_mut()
@@ -141,6 +155,9 @@ impl GpuRenderPassEncoder {
         Ok(())
     }
 
+    /// Bind a `GpuBindGroup` (or `null` to clear the slot) at group `index`.
+    /// `dynamicOffsets` supplies one byte offset per dynamic-offset binding in
+    /// the group, in binding order.
     #[napi]
     pub fn set_bind_group(&self, index: u32, bind_group: Option<&GpuBindGroup>, dynamic_offsets: Option<Vec<u32>>) -> napi::Result<()> {
         let mut g = self.pass.lock().unwrap();
@@ -153,6 +170,9 @@ impl GpuRenderPassEncoder {
         Ok(())
     }
 
+    /// Bind `buffer` as the vertex buffer for `slot` (matching a
+    /// `vertex.buffers` layout entry). `offset`/`size` select a sub-range
+    /// (defaults: from 0 to the end of the buffer).
     #[napi]
     pub fn set_vertex_buffer(&self, slot: u32, buffer: &GpuBuffer, offset: Option<f64>, size: Option<f64>) -> napi::Result<()> {
         let mut g = self.pass.lock().unwrap();
@@ -163,6 +183,9 @@ impl GpuRenderPassEncoder {
         Ok(())
     }
 
+    /// Bind the index buffer used by `drawIndexed` / `drawIndexedIndirect`.
+    /// `indexFormat` is `"uint16"` or `"uint32"`; `offset`/`size` select a
+    /// sub-range (defaults: the whole buffer).
     #[napi]
     pub fn set_index_buffer(&self, buffer: &GpuBuffer, #[napi(
         ts_arg_type = "GPUIndexFormat"
@@ -176,6 +199,9 @@ impl GpuRenderPassEncoder {
         Ok(())
     }
 
+    /// Draw `vertexCount` vertices from the bound vertex buffers, in
+    /// `instanceCount` instances (default 1), starting at `firstVertex` /
+    /// `firstInstance` (default 0).
     #[napi]
     pub fn draw(&self, vertex_count: u32, instance_count: Option<u32>, first_vertex: Option<u32>, first_instance: Option<u32>) -> napi::Result<()> {
         let fv = first_vertex.unwrap_or(0);
@@ -187,6 +213,10 @@ impl GpuRenderPassEncoder {
         Ok(())
     }
 
+    /// Draw using the bound index buffer: `indexCount` indices in
+    /// `instanceCount` instances (default 1), starting at `firstIndex`
+    /// (default 0). `baseVertex` is added to each index; `firstInstance`
+    /// offsets the instance range.
     #[napi]
     pub fn draw_indexed(&self, index_count: u32, instance_count: Option<u32>, first_index: Option<u32>, base_vertex: Option<i32>, first_instance: Option<u32>) -> napi::Result<()> {
         let fi = first_index.unwrap_or(0);
@@ -198,6 +228,9 @@ impl GpuRenderPassEncoder {
         Ok(())
     }
 
+    /// Like `draw`, but with the parameters (vertex/instance counts and first
+    /// indices, packed as four `u32`s) read from `indirectBuffer` at
+    /// `indirectOffset`. The buffer needs `INDIRECT` usage.
     #[napi]
     pub fn draw_indirect(&self, indirect_buffer: &GpuBuffer, indirect_offset: f64) -> napi::Result<()> {
         let mut g = self.pass.lock().unwrap();
@@ -206,6 +239,8 @@ impl GpuRenderPassEncoder {
         Ok(())
     }
 
+    /// Like `drawIndexed`, but with the parameters (five `u32`s) read from
+    /// `indirectBuffer` at `indirectOffset`. The buffer needs `INDIRECT` usage.
     #[napi]
     pub fn draw_indexed_indirect(&self, indirect_buffer: &GpuBuffer, indirect_offset: f64) -> napi::Result<()> {
         let mut g = self.pass.lock().unwrap();
@@ -214,6 +249,8 @@ impl GpuRenderPassEncoder {
         Ok(())
     }
 
+    /// Set the viewport rectangle (pixels) and depth range that NDC coordinates
+    /// map into. Defaults to the full attachment with depth `0..1`.
     #[napi]
     pub fn set_viewport(&self, x: f64, y: f64, width: f64, height: f64, min_depth: f64, max_depth: f64) -> napi::Result<()> {
         let mut g = self.pass.lock().unwrap();
@@ -222,6 +259,8 @@ impl GpuRenderPassEncoder {
         Ok(())
     }
 
+    /// Restrict rendering to the given pixel rectangle; fragments outside it are
+    /// discarded. Defaults to the full attachment.
     #[napi]
     pub fn set_scissor_rect(&self, x: u32, y: u32, width: u32, height: u32) -> napi::Result<()> {
         let mut g = self.pass.lock().unwrap();
@@ -230,6 +269,8 @@ impl GpuRenderPassEncoder {
         Ok(())
     }
 
+    /// Set the constant colour used by the `constant` / `one-minus-constant`
+    /// blend factors.
     #[napi]
     pub fn set_blend_constant(&self, color: GpuColor) -> napi::Result<()> {
         let mut g = self.pass.lock().unwrap();
@@ -238,6 +279,8 @@ impl GpuRenderPassEncoder {
         Ok(())
     }
 
+    /// Set the reference value compared against in stencil tests (for the
+    /// `replace` op and comparisons).
     #[napi]
     pub fn set_stencil_reference(&self, reference: u32) -> napi::Result<()> {
         let mut g = self.pass.lock().unwrap();
@@ -246,6 +289,8 @@ impl GpuRenderPassEncoder {
         Ok(())
     }
 
+    /// Open a labelled debug group, shown as a nested scope in RenderDoc / PIX /
+    /// Nsight. Must be balanced with `popDebugGroup()`.
     #[napi]
     pub fn push_debug_group(&self, group_label: String) -> napi::Result<()> {
         let mut g = self.pass.lock().unwrap();
@@ -254,6 +299,7 @@ impl GpuRenderPassEncoder {
         Ok(())
     }
 
+    /// Close the most recent `pushDebugGroup()`.
     #[napi]
     pub fn pop_debug_group(&self) -> napi::Result<()> {
         let mut g = self.pass.lock().unwrap();
@@ -262,6 +308,8 @@ impl GpuRenderPassEncoder {
         Ok(())
     }
 
+    /// Insert a single labelled marker at this point in the pass, visible in GPU
+    /// debuggers.
     #[napi]
     pub fn insert_debug_marker(&self, marker_label: String) -> napi::Result<()> {
         let mut g = self.pass.lock().unwrap();
@@ -270,6 +318,9 @@ impl GpuRenderPassEncoder {
         Ok(())
     }
 
+    /// Begin an occlusion query writing into slot `queryIndex` of the pass's
+    /// `occlusionQuerySet`. Draws until `endOcclusionQuery()` contribute to the
+    /// sample count. Queries must not be nested.
     #[napi]
     pub fn begin_occlusion_query(&self, query_index: u32) -> napi::Result<()> {
         let mut g = self.pass.lock().unwrap();
@@ -278,6 +329,7 @@ impl GpuRenderPassEncoder {
         Ok(())
     }
 
+    /// End the occlusion query opened by `beginOcclusionQuery()`.
     #[napi]
     pub fn end_occlusion_query(&self) -> napi::Result<()> {
         let mut g = self.pass.lock().unwrap();
@@ -286,6 +338,9 @@ impl GpuRenderPassEncoder {
         Ok(())
     }
 
+    /// Upload immediate (push-constant) data at byte `offset`, visible to shader
+    /// stages that declare an immediates block. Requires the `immediates`
+    /// feature and a non-zero `maxImmediateSize` limit.
     #[napi]
     pub fn set_immediates(&self, offset: u32, data: napi::bindgen_prelude::Uint8Array) -> napi::Result<()> {
         let mut g = self.pass.lock().unwrap();
@@ -310,6 +365,8 @@ impl GpuRenderPassEncoder {
         Ok(())
     }
 
+    /// Finish the render pass and release the parent `GpuCommandEncoder` for
+    /// further recording. No other method on this pass may be called afterwards.
     #[napi]
     pub fn end(&self) -> napi::Result<()> {
         // Drop pass first to release the mutable borrow of the encoder
@@ -323,6 +380,11 @@ impl GpuRenderPassEncoder {
 
 // ── Compute pass encoder ──────────────────────────────────────────────────────
 
+/// Records the dispatches of a single compute pass. Created by
+/// `commandEncoder.beginComputePass(descriptor?)`.
+///
+/// Set a compute pipeline and bind groups, then `dispatchWorkgroups`. Call
+/// `end()` to finish and re-enable the parent encoder.
 #[napi]
 pub struct GpuComputePassEncoder {
     // Same SAFETY invariants as GpuRenderPassEncoder
@@ -333,6 +395,7 @@ pub struct GpuComputePassEncoder {
 
 #[napi]
 impl GpuComputePassEncoder {
+    /// Set the compute pipeline used by subsequent `dispatchWorkgroups` calls.
     #[napi]
     pub fn set_pipeline(&self, pipeline: &GpuComputePipeline) -> napi::Result<()> {
         let mut g = self.pass.lock().unwrap();
@@ -341,6 +404,8 @@ impl GpuComputePassEncoder {
         Ok(())
     }
 
+    /// Bind a `GpuBindGroup` (or `null` to clear the slot) at group `index`,
+    /// with one `dynamicOffsets` entry per dynamic-offset binding.
     #[napi]
     pub fn set_bind_group(&self, index: u32, bind_group: Option<&GpuBindGroup>, dynamic_offsets: Option<Vec<u32>>) -> napi::Result<()> {
         let mut g = self.pass.lock().unwrap();
@@ -353,6 +418,8 @@ impl GpuComputePassEncoder {
         Ok(())
     }
 
+    /// Dispatch a grid of `x × y × z` workgroups (y, z default to 1) of the
+    /// bound compute pipeline.
     #[napi]
     pub fn dispatch_workgroups(&self, x: u32, y: Option<u32>, z: Option<u32>) -> napi::Result<()> {
         let mut g = self.pass.lock().unwrap();
@@ -361,6 +428,8 @@ impl GpuComputePassEncoder {
         Ok(())
     }
 
+    /// Open a labelled debug group in GPU debuggers. Balance with
+    /// `popDebugGroup()`.
     #[napi]
     pub fn push_debug_group(&self, group_label: String) -> napi::Result<()> {
         let mut g = self.pass.lock().unwrap();
@@ -369,6 +438,7 @@ impl GpuComputePassEncoder {
         Ok(())
     }
 
+    /// Close the most recent `pushDebugGroup()`.
     #[napi]
     pub fn pop_debug_group(&self) -> napi::Result<()> {
         let mut g = self.pass.lock().unwrap();
@@ -377,6 +447,7 @@ impl GpuComputePassEncoder {
         Ok(())
     }
 
+    /// Insert a single labelled marker at this point in the pass.
     #[napi]
     pub fn insert_debug_marker(&self, marker_label: String) -> napi::Result<()> {
         let mut g = self.pass.lock().unwrap();
@@ -385,6 +456,9 @@ impl GpuComputePassEncoder {
         Ok(())
     }
 
+    /// Like `dispatchWorkgroups`, but with the `[x, y, z]` counts read as three
+    /// `u32`s from `indirectBuffer` at `indirectOffset`. The buffer needs
+    /// `INDIRECT` usage.
     #[napi]
     pub fn dispatch_workgroups_indirect(&self, indirect_buffer: &GpuBuffer, indirect_offset: f64) -> napi::Result<()> {
         let mut g = self.pass.lock().unwrap();
@@ -393,6 +467,9 @@ impl GpuComputePassEncoder {
         Ok(())
     }
 
+    /// Upload immediate (push-constant) data at byte `offset` for the compute
+    /// stage. Requires the `immediates` feature and a non-zero
+    /// `maxImmediateSize` limit.
     #[napi]
     pub fn set_immediates(&self, offset: u32, data: napi::bindgen_prelude::Uint8Array) -> napi::Result<()> {
         let mut g = self.pass.lock().unwrap();
@@ -417,6 +494,8 @@ impl GpuComputePassEncoder {
         Ok(())
     }
 
+    /// Finish the compute pass and re-enable the parent `GpuCommandEncoder`. No
+    /// other method on this pass may be called afterwards.
     #[napi]
     pub fn end(&self) -> napi::Result<()> {
         { drop(self.pass.lock().unwrap().take()); }
@@ -429,6 +508,14 @@ impl GpuComputePassEncoder {
 
 // ── Command encoder ───────────────────────────────────────────────────────────
 
+/// Records GPU commands into a command buffer. Created by
+/// `device.createCommandEncoder`.
+///
+/// Use it to open render/compute passes (`beginRenderPass` /
+/// `beginComputePass`) and to record buffer/texture copies and query resolves
+/// between them. While a pass is open the encoder is locked; it unlocks when
+/// the pass `end()`s. Call `finish()` to produce the `GpuCommandBuffer` for
+/// `queue.submit`.
 #[napi]
 pub struct GpuCommandEncoder {
     state: Arc<Mutex<EncoderState>>,
@@ -454,9 +541,12 @@ impl GpuCommandEncoder {
 
 #[napi]
 impl GpuCommandEncoder {
+    /// The debug label passed at creation, or `null`.
     #[napi(getter)]
     pub fn label(&self) -> Option<String> { self.label.clone() }
 
+    /// Begin a render pass with the given attachments and return its encoder.
+    /// The command encoder is locked until the returned pass `end()`s.
     #[napi]
     pub fn begin_render_pass(&self, descriptor: GpuRenderPassDescriptor) -> napi::Result<GpuRenderPassEncoder> {
         // Build color attachments — borrows from descriptor items (all Reference<T> are 'static)
@@ -552,6 +642,8 @@ impl GpuCommandEncoder {
         })
     }
 
+    /// Begin a compute pass and return its encoder. The command encoder is
+    /// locked until the returned pass `end()`s.
     #[napi]
     pub fn begin_compute_pass(&self, descriptor: Option<GpuComputePassDescriptor>) -> napi::Result<GpuComputePassEncoder> {
         // Borrow, don't clone: `descriptor` is owned by this call and outlives
@@ -599,6 +691,9 @@ impl GpuCommandEncoder {
         })
     }
 
+    /// Record a buffer-to-buffer copy of `size` bytes. `source` needs
+    /// `COPY_SRC`, `destination` needs `COPY_DST`; offsets and size must be
+    /// 4-byte aligned.
     #[napi]
     pub fn copy_buffer_to_buffer(
         &self,
@@ -620,6 +715,9 @@ impl GpuCommandEncoder {
         })
     }
 
+    /// Record a copy from a buffer's packed pixel data into a texture region.
+    /// `source.bytesPerRow` must satisfy the 256-byte alignment rule; the buffer
+    /// needs `COPY_SRC` and the texture `COPY_DST`.
     #[napi]
     pub fn copy_buffer_to_texture(
         &self,
@@ -657,6 +755,9 @@ impl GpuCommandEncoder {
         })
     }
 
+    /// Record a copy from a texture region into a buffer. `destination.bytesPerRow`
+    /// must be 256-byte aligned; the texture needs `COPY_SRC` and the buffer
+    /// `COPY_DST`. (For a convenient CPU readback, prefer `readTexturePixels`.)
     #[napi]
     pub fn copy_texture_to_buffer(
         &self,
@@ -694,6 +795,9 @@ impl GpuCommandEncoder {
         })
     }
 
+    /// Record a texture-to-texture copy of `copySize`. The two textures must
+    /// have compatible formats; `source` needs `COPY_SRC` and `destination`
+    /// `COPY_DST`.
     #[napi]
     pub fn copy_texture_to_texture(
         &self,
@@ -734,6 +838,8 @@ impl GpuCommandEncoder {
         })
     }
 
+    /// Record a command that zero-fills a range of `buffer` (default: the whole
+    /// buffer). Offset and size must be 4-byte aligned.
     #[napi]
     pub fn clear_buffer(&self, buffer: &GpuBuffer, offset: Option<f64>, size: Option<f64>) -> napi::Result<()> {
         self.with_encoder(|enc| {
@@ -758,6 +864,10 @@ impl GpuCommandEncoder {
         })
     }
 
+    /// Copy `queryCount` resolved query results (starting at `firstQuery`) into
+    /// `destination` at `destinationOffset` as `u64`s. For timestamp queries,
+    /// multiply the deltas by `queue.getTimestampPeriod()` to get nanoseconds.
+    /// The destination buffer needs `QUERY_RESOLVE` usage.
     #[napi]
     pub fn resolve_query_set(
         &self,
@@ -778,6 +888,9 @@ impl GpuCommandEncoder {
         })
     }
 
+    /// Open a labelled debug group spanning subsequent encoder commands (and any
+    /// passes recorded within it), visible in GPU debuggers. Balance with
+    /// `popDebugGroup()`.
     #[napi]
     pub fn push_debug_group(&self, group_label: String) -> napi::Result<()> {
         self.with_encoder(|enc| {
@@ -786,6 +899,7 @@ impl GpuCommandEncoder {
         })
     }
 
+    /// Close the most recent `pushDebugGroup()`.
     #[napi]
     pub fn pop_debug_group(&self) -> napi::Result<()> {
         self.with_encoder(|enc| {
@@ -794,6 +908,7 @@ impl GpuCommandEncoder {
         })
     }
 
+    /// Insert a single labelled marker at this point in the command stream.
     #[napi]
     pub fn insert_debug_marker(&self, marker_label: String) -> napi::Result<()> {
         self.with_encoder(|enc| {
@@ -802,6 +917,9 @@ impl GpuCommandEncoder {
         })
     }
 
+    /// Finish recording and produce a `GpuCommandBuffer` for `queue.submit`.
+    /// The encoder is consumed — no further commands may be recorded, and any
+    /// open pass must have `end()`ed first.
     #[napi]
     pub fn finish(&self, _descriptor: Option<GpuCommandEncoderDescriptor>) -> napi::Result<GpuCommandBuffer> {
         let mut state = self.state.lock().unwrap();

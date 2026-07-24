@@ -7,6 +7,9 @@ use super::error::map_err_display;
 use napi_derive::napi;
 use std::sync::Arc;
 
+/// The device's command queue, reached via `device.queue`. Submit recorded
+/// command buffers here, and upload data straight to buffers/textures with
+/// `writeBuffer` / `writeTexture`.
 #[napi]
 pub struct GpuQueue {
     pub(crate) inner: Arc<wgpu::Queue>,
@@ -16,6 +19,7 @@ pub struct GpuQueue {
 
 #[napi]
 impl GpuQueue {
+    /// The queue's debug label, or `null`.
     #[napi(getter)]
     pub fn label(&self) -> Option<String> {
         self.label.clone()
@@ -33,6 +37,8 @@ impl GpuQueue {
         self.inner.get_timestamp_period() as f64
     }
 
+    /// Submit command buffers for execution, in order. Each `GpuCommandBuffer`
+    /// is consumed — it cannot be submitted twice.
     #[napi]
     pub fn submit(&self, command_buffers: Vec<Reference<GpuCommandBuffer>>) -> napi::Result<()> {
         let mut bufs: Vec<wgpu::CommandBuffer> = Vec::with_capacity(command_buffers.len());
@@ -46,6 +52,10 @@ impl GpuQueue {
         Ok(())
     }
 
+    /// Upload `data` into `buffer` at `bufferOffset` (the common way to fill a
+    /// buffer without mapping it). `dataOffset`/`size` select a sub-slice of
+    /// `data`. The buffer needs `COPY_DST`. The write is staged and takes effect
+    /// at the next `submit`.
     #[napi]
     pub fn write_buffer(
         &self,
@@ -66,6 +76,10 @@ impl GpuQueue {
         Ok(())
     }
 
+    /// Upload `data` into a texture region. `dataLayout` describes how the
+    /// source bytes are packed (`bytesPerRow` / `rowsPerImage`); the texture
+    /// needs `COPY_DST`. Unlike `commandEncoder.copyBufferToTexture`, there is
+    /// no 256-byte row-alignment requirement here.
     #[napi]
     pub fn write_texture(
         &self,
@@ -98,6 +112,9 @@ impl GpuQueue {
         Ok(())
     }
 
+    /// Resolve once all work submitted to this queue so far has finished on the
+    /// GPU. Flushes any pending `writeBuffer` / `writeTexture` staging first, so
+    /// awaiting it guarantees earlier uploads have executed.
     #[napi]
     pub async fn on_submitted_work_done(&self) -> napi::Result<()> {
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
