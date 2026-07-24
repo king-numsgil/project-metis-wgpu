@@ -179,12 +179,14 @@ fn readback(
         let _ = tx.send(r);
     });
     // Blocking wait is correct here: this runs on a libuv worker thread.
-    device.poll(wgpu::Maintain::Wait);
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
     rx.recv()
         .map_err(|_| generic_err("readback mapping was dropped before completing".to_string()))?
         .map_err(|e| generic_err(format!("failed to map readback buffer: {:?}", e)))?;
 
-    let mapped = slice.get_mapped_range();
+    let mapped = slice
+        .get_mapped_range()
+        .map_err(|e| generic_err(format!("mapping staging buffer for readback: {e}")))?;
     let mut tight = vec![0u8; tight_row * height as usize];
     for y in 0..height as usize {
         let src = y * padded_row;

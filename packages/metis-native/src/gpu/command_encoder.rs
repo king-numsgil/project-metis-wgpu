@@ -46,6 +46,9 @@ pub struct GpuRenderPassColorAttachment {
     pub load_op: String,
     #[napi(ts_type = "GPUStoreOp")]
     pub store_op: String,
+    /// Which z-slice of a 3D texture view this attachment renders into.
+    /// Required when `view` is a `"3d"` view, and must be omitted otherwise.
+    pub depth_slice: Option<u32>,
 }
 
 #[napi(object)]
@@ -287,7 +290,7 @@ impl GpuRenderPassEncoder {
     pub fn set_immediates(&self, offset: u32, data: napi::bindgen_prelude::Uint8Array) -> napi::Result<()> {
         let mut g = self.pass.lock().unwrap();
         g.as_mut().ok_or_else(|| napi::Error::new(napi::Status::GenericFailure, "RenderPass already ended"))?
-            .set_push_constants(wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT, offset, &data);
+            .set_immediates(offset, &data);
         Ok(())
     }
 
@@ -394,7 +397,7 @@ impl GpuComputePassEncoder {
     pub fn set_immediates(&self, offset: u32, data: napi::bindgen_prelude::Uint8Array) -> napi::Result<()> {
         let mut g = self.pass.lock().unwrap();
         g.as_mut().ok_or_else(|| napi::Error::new(napi::Status::GenericFailure, "ComputePass already ended"))?
-            .set_push_constants(offset, &data);
+            .set_immediates(offset, &data);
         Ok(())
     }
 
@@ -466,6 +469,7 @@ impl GpuCommandEncoder {
                 ops.store = convert::store_op(&att.store_op)?;
                 color_attachments.push(Some(wgpu::RenderPassColorAttachment {
                     view: att.view.inner.as_ref(),
+                    depth_slice: att.depth_slice,
                     resolve_target: att.resolve_target.as_ref().map(|rv| rv.inner.as_ref()),
                     ops,
                 }));
@@ -533,6 +537,9 @@ impl GpuCommandEncoder {
                 depth_stencil_attachment: ds_attachment,
                 timestamp_writes: ts_attachment,
                 occlusion_query_set: occlusion_qs,
+                // Multiview moved off the pipeline and onto the pass in wgpu 30.
+                // Nothing here requests the MULTIVIEW feature, so no mask.
+                multiview_mask: None,
             });
             std::mem::transmute::<wgpu::RenderPass<'_>, wgpu::RenderPass<'static>>(pass)
         };

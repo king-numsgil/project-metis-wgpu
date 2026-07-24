@@ -15,7 +15,7 @@ const NEEDED: Array<[string, number, string]> = [
     ["maxTextureDimension2D", 2048, "SHADOW_MAP_SIZE"],
 ];
 
-const all = enumerateAdapters();
+const all = await enumerateAdapters();
 console.log(`${all.length} adapter(s) visible:\n`);
 
 for (const [i, a] of all.entries()) {

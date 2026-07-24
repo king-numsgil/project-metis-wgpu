@@ -1,3 +1,4 @@
+use super::error::map_err_display;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use std::sync::{Arc, Mutex};
@@ -59,9 +60,13 @@ impl GpuBuffer {
         });
 
         let device = Arc::clone(&self.device);
-        tokio::task::spawn_blocking(move || device.poll(wgpu::Maintain::Wait))
+        // `poll` returns a Result as of wgpu 25. Dropping it would turn a lost
+        // device or a timed-out wait into a hang on the channel below, or a
+        // bare "channel closed" that names neither cause.
+        tokio::task::spawn_blocking(move || device.poll(wgpu::PollType::wait_indefinitely()))
             .await
-            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
+            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?
+            .map_err(map_err_display)?;
 
         let map_result: std::result::Result<(), String> = rx.await
             .map_err(|_| napi::Error::new(napi::Status::GenericFailure, "mapping channel closed"))?;
@@ -80,7 +85,7 @@ impl GpuBuffer {
         }
         let offset = offset.unwrap_or(0.0) as u64;
         let end = size.map_or(self.size, |s| offset + s as u64);
-        let view = self.inner.slice(offset..end).get_mapped_range();
+        let view = self.inner.slice(offset..end).get_mapped_range().map_err(map_err_display)?;
         Ok(Uint8Array::new(view.to_vec()))
     }
 
@@ -100,7 +105,7 @@ impl GpuBuffer {
         let dat_end = size.map_or(data.len(), |s| dat_off + s as usize);
         let src = &data[dat_off..dat_end];
         let end = buf_off + src.len() as u64;
-        let mut view = self.inner.slice(buf_off..end).get_mapped_range_mut();
+        let mut view = self.inner.slice(buf_off..end).get_mapped_range_mut().map_err(map_err_display)?;
         view.copy_from_slice(src);
         Ok(())
     }

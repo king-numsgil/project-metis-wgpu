@@ -1,6 +1,6 @@
 # metis-native — API reference
 
-Practical usage guide for the napi-rs binding that exposes **WebGPU (wgpu 24)**
+Practical usage guide for the napi-rs binding that exposes **WebGPU (wgpu 30)**
 and **SDL3** to Bun. `CLAUDE.md` (this package) covers the Rust-side build rules,
 napi constraints, and internals. This file covers *calling it from TypeScript*.
 
@@ -119,8 +119,11 @@ for you.
 |---|---|
 | `timestamp-query-inside-encoders` | `encoder.writeTimestamp()` — timing between passes |
 | `timestamp-query-inside-passes` | `pass.writeTimestamp()` — timing individual draws |
-| `multi-draw-indirect` | batched indirect draws from a GPU buffer |
-| `push-constants` | `setImmediates()`; **also needs `maxPushConstantSize`** (below) |
+
+Two names left this table in the wgpu 30 upgrade and are now a `TypeError`:
+`multi-draw-indirect` (no longer gated — multi-draw is unconditional) and
+`push-constants`, which became the **spec** feature `immediates` and so moved
+into `GPUFeatureName`. It still needs `maxImmediateSize` raised; see below.
 
 **Every feature is opt-in, and requesting an unsupported one fails
 `requestDevice` outright.** So always filter by the adapter:
@@ -137,19 +140,19 @@ silently dropped — a typo fails at `requestDevice`, not later at the first use
 ### Limits
 
 `requiredLimits` accepts a subset of the spec limits. One trap:
-**`maxPushConstantSize` defaults to 0**, so requesting the `push-constants`
-feature *alone* yields a device that accepts no push constants:
+**`maxImmediateSize` defaults to 0**, so requesting the `immediates` feature
+*alone* yields a device that accepts no immediate data at all:
 
 ```ts
 const device = await adapter.requestDevice({
-  requiredFeatures: ["push-constants"],
-  requiredLimits: { maxPushConstantSize: 128 },   // without this, immediates are unusable
+  requiredFeatures: ["immediates"],
+  requiredLimits: { maxImmediateSize: 128 },   // without this, setImmediates() is unusable
 });
 ```
 
-It's reported back on `limits` as **`maxImmediateSize`** — wgpu's
-`max_push_constant_size`, which the spec later renamed "immediate size". Same
-limit, two names.
+Request and report now use the same name. Before wgpu 30 this limit was asked
+for as `maxPushConstantSize` and reported back as `maxImmediateSize`; if you
+hit the old name in existing code, that is what it became.
 
 ---
 
@@ -176,12 +179,36 @@ device.queue.submit([encoder.finish()]);
 frame.present();                                // AFTER submit
 ```
 
-`SurfaceConfiguration`: `{ width, height, format?, presentMode?, alphaMode? }`.
+`SurfaceConfiguration`: `{ width, height, format?, presentMode?, alphaMode?,
+colorSpace? }`.
 `presentMode`: `"fifo"` | `"mailbox"` | `"immediate"` | `"auto-vsync"` |
 `"auto-no-vsync"`. **Omitting it defaults to `"mailbox"`** (falling back to
 `"fifo"` only if the surface lacks mailbox support). `mailbox` is tear-free and
 low-latency but does *not* cap the frame rate — pair it with a software frame
 limiter (see `metis-engine`'s `FrameLimiter`) if you want a cap.
+
+**`getCurrentTexture()` throws on the frames it cannot give you.** It returns a
+texture in two cases — a clean acquire, and a *suboptimal* one, where the frame
+is usable but the swapchain wants reconfiguring (that is what `frame.suboptimal`
+reports, and it is the normal signal after a resize). Everything else throws,
+and the message names which case it was, because the right response differs:
+
+| Message contains | Meaning | What to do |
+|---|---|---|
+| `surface outdated` | config no longer matches the window | `configure()` again, retry |
+| `surface lost` | swapchain is gone | recreate the surface, then `configure()` |
+| `surface timeout` | acquire timed out | skip this frame |
+| `surface occluded` | window hidden/minimized | skip this frame |
+| `surface validation` | a validation error was raised | check an error scope (§1) |
+
+A frame loop that only handles `frame.suboptimal` is fine on the common path;
+wrap the acquire if you want to survive a lost surface.
+
+**`colorSpace` selects SDR vs HDR output.** Omit it (or pass `"auto"`) for the
+platform default — sRGB, standard dynamic range. `"extended-srgb"` and
+`"extended-srgb-linear"` request an HDR swapchain and are only valid for formats
+that advertise them; an unsupported pairing is rejected by `configure()` with an
+error naming the format, rather than being silently downgraded.
 
 **An unsupported present mode falls back rather than failing.** Some surfaces
 offer only `fifo` — notably software rasterizers and translation layers. Asking

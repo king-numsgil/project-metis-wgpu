@@ -3,6 +3,7 @@ use super::command_encoder::GpuCommandBuffer;
 use super::convert;
 use super::texture::{GpuExtent3D, GpuImageCopyTexture, GpuImageDataLayout};
 use napi::bindgen_prelude::{Reference, Uint8Array};
+use super::error::map_err_display;
 use napi_derive::napi;
 use std::sync::Arc;
 
@@ -106,9 +107,13 @@ impl GpuQueue {
             let _ = tx.send(());
         });
         let device = Arc::clone(&self.device);
-        tokio::task::spawn_blocking(move || device.poll(wgpu::Maintain::Wait))
+        // `poll` returns a Result as of wgpu 25. Dropping it would turn a lost
+        // device or a timed-out wait into a hang on the channel below, or a
+        // bare "channel closed" that names neither cause.
+        tokio::task::spawn_blocking(move || device.poll(wgpu::PollType::wait_indefinitely()))
             .await
-            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
+            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?
+            .map_err(map_err_display)?;
         rx.await.map_err(|_| napi::Error::new(napi::Status::GenericFailure, "queue channel closed"))?;
         Ok(())
     }

@@ -54,7 +54,7 @@ pub(crate) fn limits_to_js(l: &wgpu::Limits) -> GpuSupportedLimits {
         max_texture_dimension_3d: l.max_texture_dimension_3d,
         max_texture_array_layers: l.max_texture_array_layers,
         max_bind_groups: l.max_bind_groups,
-        max_bind_groups_plus_vertex_buffers: l.max_bind_groups + l.max_vertex_buffers,
+        max_bind_groups_plus_vertex_buffers: l.max_bind_groups_plus_vertex_buffers,
         max_bindings_per_bind_group: l.max_bindings_per_bind_group,
         max_dynamic_uniform_buffers_per_pipeline_layout: l.max_dynamic_uniform_buffers_per_pipeline_layout,
         max_dynamic_storage_buffers_per_pipeline_layout: l.max_dynamic_storage_buffers_per_pipeline_layout,
@@ -71,7 +71,7 @@ pub(crate) fn limits_to_js(l: &wgpu::Limits) -> GpuSupportedLimits {
         max_buffer_size: l.max_buffer_size as f64,
         max_vertex_attributes: l.max_vertex_attributes,
         max_vertex_buffer_array_stride: l.max_vertex_buffer_array_stride,
-        max_inter_stage_shader_variables: l.max_inter_stage_shader_components,
+        max_inter_stage_shader_variables: l.max_inter_stage_shader_variables,
         max_color_attachments: l.max_color_attachments,
         max_color_attachment_bytes_per_sample: l.max_color_attachment_bytes_per_sample,
         max_compute_workgroup_storage_size: l.max_compute_workgroup_storage_size,
@@ -80,7 +80,7 @@ pub(crate) fn limits_to_js(l: &wgpu::Limits) -> GpuSupportedLimits {
         max_compute_workgroup_size_y: l.max_compute_workgroup_size_y,
         max_compute_workgroup_size_z: l.max_compute_workgroup_size_z,
         max_compute_workgroups_per_dimension: l.max_compute_workgroups_per_dimension,
-        max_immediate_size: l.max_push_constant_size,
+        max_immediate_size: l.max_immediate_size,
         max_storage_buffers_in_vertex_stage: l.max_storage_buffers_per_shader_stage,
         max_storage_buffers_in_fragment_stage: l.max_storage_buffers_per_shader_stage,
         max_storage_textures_in_vertex_stage: l.max_storage_textures_per_shader_stage,
@@ -131,14 +131,11 @@ pub struct GpuRequiredLimits {
     pub max_compute_workgroup_size_y: Option<u32>,
     pub max_compute_workgroup_size_z: Option<u32>,
     pub max_compute_workgroups_per_dimension: Option<u32>,
-    /// Bytes of push-constant data a pipeline layout may declare. Defaults to
-    /// **0**, so requesting the `push-constants` feature without also raising
-    /// this yields a device that accepts no push constants at all — set both.
-    ///
-    /// Reported back on `limits` as `maxImmediateSize`: this is wgpu's
-    /// `max_push_constant_size`, which the WebGPU spec later renamed to
-    /// "immediate size". Same limit, two names.
-    pub max_push_constant_size: Option<u32>,
+    /// Bytes of immediate data a pipeline layout may declare (what earlier
+    /// versions of this API, and wgpu before 30, called push constants).
+    /// Defaults to **0**, so requesting the `immediates` feature without also
+    /// raising this yields a device that accepts no immediates at all — set both.
+    pub max_immediate_size: Option<u32>,
 }
 
 fn required_limits_to_wgpu(r: &GpuRequiredLimits) -> wgpu::Limits {
@@ -156,8 +153,8 @@ fn required_limits_to_wgpu(r: &GpuRequiredLimits) -> wgpu::Limits {
     if let Some(v) = r.max_storage_buffers_per_shader_stage { l.max_storage_buffers_per_shader_stage = v; }
     if let Some(v) = r.max_storage_textures_per_shader_stage { l.max_storage_textures_per_shader_stage = v; }
     if let Some(v) = r.max_uniform_buffers_per_shader_stage { l.max_uniform_buffers_per_shader_stage = v; }
-    if let Some(v) = r.max_uniform_buffer_binding_size { l.max_uniform_buffer_binding_size = v as u32; }
-    if let Some(v) = r.max_storage_buffer_binding_size { l.max_storage_buffer_binding_size = v as u32; }
+    if let Some(v) = r.max_uniform_buffer_binding_size { l.max_uniform_buffer_binding_size = v as u64; }
+    if let Some(v) = r.max_storage_buffer_binding_size { l.max_storage_buffer_binding_size = v as u64; }
     if let Some(v) = r.min_uniform_buffer_offset_alignment { l.min_uniform_buffer_offset_alignment = v; }
     if let Some(v) = r.min_storage_buffer_offset_alignment { l.min_storage_buffer_offset_alignment = v; }
     if let Some(v) = r.max_vertex_buffers { l.max_vertex_buffers = v; }
@@ -170,7 +167,7 @@ fn required_limits_to_wgpu(r: &GpuRequiredLimits) -> wgpu::Limits {
     if let Some(v) = r.max_compute_workgroup_size_y { l.max_compute_workgroup_size_y = v; }
     if let Some(v) = r.max_compute_workgroup_size_z { l.max_compute_workgroup_size_z = v; }
     if let Some(v) = r.max_compute_workgroups_per_dimension { l.max_compute_workgroups_per_dimension = v; }
-    if let Some(v) = r.max_push_constant_size { l.max_push_constant_size = v; }
+    if let Some(v) = r.max_immediate_size { l.max_immediate_size = v; }
     l
 }
 
@@ -200,7 +197,6 @@ impl GpuAdapter {
     #[napi(getter)]
     pub fn info(&self) -> GpuAdapterInfo {
         let i = self.inner.get_info();
-        let lim = self.inner.limits();
         let name = i.name;
         GpuAdapterInfo {
             vendor: i.vendor.to_string(),
@@ -210,8 +206,8 @@ impl GpuAdapter {
             backend_type: convert::backend_to_str(i.backend).to_string(),
             device_type: convert::device_type_to_str(i.device_type).to_string(),
             is_fallback_adapter: i.device_type == wgpu::DeviceType::Cpu,
-            subgroup_min_size: lim.min_subgroup_size,
-            subgroup_max_size: lim.max_subgroup_size,
+            subgroup_min_size: i.subgroup_min_size,
+            subgroup_max_size: i.subgroup_max_size,
         }
     }
 
@@ -281,15 +277,20 @@ impl GpuAdapter {
         }
 
         let (device, queue) = adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    label: label.as_deref(),
-                    required_features,
-                    required_limits,
-                    memory_hints: wgpu::MemoryHints::default(),
-                },
-                None,
-            )
+            .request_device(&wgpu::DeviceDescriptor {
+                label: label.as_deref(),
+                required_features,
+                required_limits,
+                // No `EXPERIMENTAL_*` feature is in the `FEATURES` table, so the
+                // unsafe token has nothing to unlock and would only turn a
+                // validation error into UB if one were added later.
+                experimental_features: wgpu::ExperimentalFeatures::disabled(),
+                memory_hints: wgpu::MemoryHints::default(),
+                // wgpu 30 moved the trace path from a positional argument into
+                // the descriptor. Recording needs wgpu's own `trace` feature
+                // compiled in, which this crate does not enable.
+                trace: wgpu::Trace::Off,
+            })
             .await
             .map_err(map_err_display)?;
 
@@ -298,7 +299,7 @@ impl GpuAdapter {
             Arc::new(Mutex::new(None));
         let tsfn_ref = Arc::clone(&uncaptured_error_tsfn);
 
-        device.on_uncaptured_error(Box::new(move |e| {
+        device.on_uncaptured_error(Arc::new(move |e| {
             let guard = tsfn_ref.lock().expect("uncaptured_error_tsfn lock");
             if let Some(tsfn) = guard.as_ref() {
                 let r#type = match &e {

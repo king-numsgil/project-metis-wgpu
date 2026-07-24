@@ -274,7 +274,7 @@ export class RenderContext {
         if (!preferred) {
             throw new Error("metis-engine: no GPU adapter available");
         }
-        const adapter = selectUsableAdapter(preferred, enumerateAdapters());
+        const adapter = selectUsableAdapter(preferred, await enumerateAdapters());
         warnIfSoftwareAdapter(adapter);
         const device = await adapter.requestDevice({
             label: options.label ?? "metis-engine-offscreen",
@@ -306,7 +306,7 @@ export class RenderContext {
         // when the compatible adapter genuinely cannot run the renderer, i.e.
         // when the alternative is failing outright — `configure()` will say so
         // if the fallback can't present either.
-        const adapter = selectUsableAdapter(preferred, enumerateAdapters());
+        const adapter = selectUsableAdapter(preferred, await enumerateAdapters());
         warnIfSoftwareAdapter(adapter);
         const device = await adapter.requestDevice({
             label: options.label ?? "metis-engine-windowed",

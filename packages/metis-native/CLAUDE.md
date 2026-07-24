@@ -3,7 +3,7 @@
 ## What this project is
 
 A Bun/TypeScript game-engine foundation built on a Rust napi-rs library that exposes:
-- **WebGPU** (wgpu 24) — close to the real WebGPU spec so tutorials work
+- **WebGPU** (wgpu 30) — close to the real WebGPU spec so tutorials work
 - **SDL3** — windowing, input, timing, cursor, joystick, gamepad
 
 The Rust crate is at the repo root; the generated JS binding is `index.js` / `index.d.ts` (written directly by `napi build`).
@@ -118,7 +118,7 @@ once it does, rather than assuming either answer.
 - **SDL3**: built from source via `sdl3-sys = { version = "0.6.7", features = ["build-from-source-static"] }` (bundles SDL 3.4.12)
 - **Image decoding**: `image = { version = "0.25", default-features = false, features = ["png", "jpeg", "tga", "hdr"] }` — pure Rust, no C decoder. Plus `half` for the f32→f16 conversion HDR needs. (SDL3_image was removed; see "Why SDL3_image is gone" below.)
 - **Compressed textures**: `ktx2` (container parsing, zero transitive deps) and `ruzstd` (zstd supercompression). Both pure Rust — deliberately *not* the `zstd` crate, which is C bindings, nor any Basis transcoder. Same rule as the decoder above.
-- **wgpu**: 24.0.5 with WGSL feature
+- **wgpu**: 30.0.0 with WGSL feature
 
 Cargo cache / sdl3-sys source:
 `C:\Users\DarkF\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sdl3-sys-0.6.7+SDL-3.4.12\src\generated\`
@@ -187,12 +187,19 @@ and `features_to_vec` (report) read. It used to be two duplicated lists — a na
 could become requestable but unreportable. Don't split it again.
 
 The table's second block is this crate's **first intentional break from the
-WebGPU spec**: `timestamp-query-inside-encoders`, `timestamp-query-inside-passes`,
-`multi-draw-indirect`, `push-constants`. They're wgpu extensions with no spec
+WebGPU spec**: `timestamp-query-inside-encoders` and
+`timestamp-query-inside-passes`. They're wgpu extensions with no spec
 equivalent, so they're typed as a separate `GPUNativeFeatureName` union (in
 `dts-header.ts`) rather than folded into `GPUFeatureName` — the type is the
 documentation that using one is a native-only decision. Keep that split when
 adding more.
+
+The block **shrank** in the wgpu 30 upgrade, and both departures are worth
+knowing because neither was a rename this crate chose. `multi-draw-indirect`
+stopped being a feature at all (wgpu made multi-draw unconditional), and
+`push-constants` became the *spec* feature `immediates` — so it moved out of
+the native block and into `GPUFeatureName`, which is the direction this split
+is supposed to move in. Requesting either old name is now a `TypeError`.
 
 `feature_to_wgpu` **errors** on an unknown name rather than dropping it. The old
 `if let Some(wf) = … {}` silently ignored typos, handing back a device missing
@@ -202,10 +209,48 @@ reject for exactly this reason.
 **`requestDevice` used to unconditionally OR in `PUSH_CONSTANTS`** regardless of
 what the caller asked for — which would fail device creation outright on any
 adapter lacking it, with no opt-out. It had no consumers anywhere in the repo.
-It's gone; `push-constants` is now a normal opt-in feature. Note it's inert
-without also raising the `maxPushConstantSize` limit (wgpu defaults it to 0), and
-that the *reported* limit is called `maxImmediateSize` (wgpu's
-`max_push_constant_size` under the spec's newer name).
+It's gone; the capability is now the normal opt-in feature `immediates`. It is
+still inert without also raising `maxImmediateSize` (wgpu defaults it to 0).
+
+The request/report **asymmetry this note used to warn about is gone**: the limit
+was previously requested as `maxPushConstantSize` and reported back as
+`maxImmediateSize`, because wgpu and the spec disagreed on the name. wgpu 30
+adopted the spec name, so both directions now say `maxImmediateSize`.
+
+### Error scopes are guard-based in wgpu 30, and the guard cannot be stored
+
+`pushErrorScope`/`popErrorScope` are two independent JS calls, but wgpu 30
+returns an **`ErrorScopeGuard`** from the push, and the guard is `!Send`,
+`!Sync`, and lives on a stack that is **thread-local inside wgpu itself**. It
+therefore cannot be parked on `GpuDevice`, which napi requires to be `Send`.
+
+The resolution is the `ERROR_SCOPES` thread-local in `device.rs`: a
+`HashMap<device_ptr, Vec<ErrorScopeGuard>>`. Three things about it are
+load-bearing:
+
+- **It is keyed by device, not one flat stack.** Two devices with interleaved
+  scopes on the same thread would otherwise pop each other's guards.
+- **`popErrorScope` is deliberately not an `async fn`.** napi runs an `async fn`
+  body on a tokio worker, where the thread-local is empty. So the guard is taken
+  and `.pop()`ed *synchronously* on the JS thread, and only the resulting future
+  — which is `Send` — goes to `env.spawn_future`. This is the whole reason the
+  signature is `fn(&self, &Env) -> PromiseRaw<'_, _>` instead of `async fn`.
+- **An empty stack rejects the promise rather than throwing.** The spec has
+  `popErrorScope()` reject, and a synchronous throw is not something a `.catch()`
+  on the returned promise can ever observe.
+
+Soundness rests on one property: every GPU call this crate exposes is a
+synchronous napi method running on the JS thread, so a scope is opened, filled,
+and closed all on one thread. **If a GPU operation is ever moved onto a worker
+thread, error scopes stop capturing it** — silently, because an uncaptured error
+just goes to the `onuncapturederror` path instead.
+
+`tests/error-scope.test.ts` pins this, and exists because of a specific blind
+spot: every *other* test that uses an error scope asserts the result is `null`
+(they use it to prove an operation was clean). An implementation that lost the
+guard entirely would return `null` from every pop and **keep the whole suite
+green**. The first test there provokes a validation error on purpose and
+requires it to come back; that is the one that fails if this plumbing breaks.
 
 ### VectorContext: lyon panics, and the one rule behind all of them
 
