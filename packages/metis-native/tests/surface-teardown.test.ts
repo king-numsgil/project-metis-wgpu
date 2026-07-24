@@ -13,10 +13,15 @@
 // same reason, same shape.
 import { describe, expect, it } from "bun:test";
 
+// The import below uses `.href` (a `file://` URL), not the `.pathname.replace(...)`
+// idiom the rest of the repo uses to strip Windows' leading slash. That idiom is for
+// paths passed to a function at runtime; this one is interpolated into a **string
+// literal in generated source**, where a Windows path's backslashes would be eaten as
+// escapes (`"F:\Programming"` → `F:Programming`). A URL needs no escaping either way.
 const PRELUDE = /* ts */ `
 import {
     createSurface, requestAdapterForWindow, sdlCreateWindow, sdlInit, SdlInitFlag, sdlQuit,
-} from "${new URL("../index.js", import.meta.url).pathname}";
+} from "${new URL("../index.js", import.meta.url).href}";
 
 sdlInit(SdlInitFlag.Video);
 const wnd = sdlCreateWindow("surface-teardown", 320, 240);

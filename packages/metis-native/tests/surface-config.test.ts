@@ -47,6 +47,17 @@ beforeAll(async () => {
     format = surface.getPreferredFormat();
 });
 
+// The timeout is not padding for slow GPU teardown — that part is sub-millisecond
+// (measured: poll+destroy ≈ 0.5 ms). It is for `sdlQuit()`, whose cost is set by
+// the machine's HID devices, not by this suite. `sdlInit(Video)` starts SDL's
+// device-hotplug thread, which enumerates every raw-input keyboard and mouse and
+// reads each one's product string; `sdlQuit()` joins that thread, so it blocks
+// until the pass finishes. A HID device that never answers costs a **5 s driver
+// timeout each**, and they add up — on this machine a wedged Corsair mouse makes
+// `sdlQuit()` take a flat 10 s, over Bun's 5 s default, failing the hook while
+// every assertion passes. Nothing here can bound that, so the hook is given room.
+const TEARDOWN_TIMEOUT_MS = 60_000;
+
 afterAll(() => {
     // Retire anything still in flight before tearing the swapchain down.
     // Presentation is asynchronous, so a frame presented moments ago can still
@@ -59,7 +70,7 @@ afterAll(() => {
     surface?.destroy();
     window?.destroy();
     sdlQuit();
-});
+}, TEARDOWN_TIMEOUT_MS);
 
 describe("configure({ colorSpace })", () => {
     it("defaults to auto when omitted", () => {

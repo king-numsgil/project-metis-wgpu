@@ -99,6 +99,35 @@ the `.node` the JS side loads, and it doesn't regenerate `index.d.ts` or run the
 `prepend-dts-header` postbuild. `cargo check`/`cargo clippy` are fine (they
 don't link), but anything that produces a loadable artifact goes through napi.
 
+### A stale `Cargo.lock` can break the dx12 build with errors inside wgpu-hal
+
+The first Windows build of the wgpu 30 branch failed to compile **wgpu-hal**,
+with type mismatches in `dx12/suballocation.rs` — `&ID3D12Heap` not satisfying
+`Param<ID3D12Heap>`, and diagnostics naming *two* versions of `windows` /
+`windows-core`. None of it was this crate's code, and there was nothing to fix
+in `src/`.
+
+Cause: `gpu-allocator` (wgpu-hal's dx12 allocator) declares its `windows`
+dependency as an **open range**, so the lock is free to hold it at an old
+version. Ours still pinned the version wgpu 24 had used, while wgpu-hal 30 moved
+to a newer one. The two are semver-incompatible, so cargo kept **both**, and the
+`ID3D12Heap` handed over by the allocator was a different type from the one
+wgpu-hal's device expected.
+
+Fix is a lockfile dedupe, not a code change — bump the stale pin onto the
+version wgpu-hal already uses and the duplicate tree collapses:
+
+```powershell
+cargo update -p windows@<old-version> --precise <version wgpu-hal uses>
+```
+
+**Why it took a Windows build to find:** dx12 is the only backend that compiles
+this path, so the whole dependency conflict is invisible on Linux — the branch
+was developed and tested there and built clean throughout. The general shape is
+worth remembering: after a major wgpu upgrade, a *lockfile* left over from the
+old version can produce compile errors that appear to be upstream bugs. Check
+for duplicate versions of a shared dependency before believing them.
+
 **Any edit to `Cargo.toml` or `.cargo/config.toml` invalidates everything.**
 Changing rustflags forces a full rebuild of all dependencies (~2 min debug,
 ~4 min release). If builds suddenly feel slow, check whether you've been
@@ -437,10 +466,18 @@ per frame must be expensive" is wrong by two orders of magnitude here.
 - VSync throttling happens in `getCurrentTexture()` (not `present()`) on DirectX backends. Use `presentMode: 'immediate'` to measure raw CPU costs.
 - **`configure()`'s default present mode is `Mailbox`** (fifo fallback if unsupported) — set in `surface.rs`. This is deliberate: `Fifo`/`AutoVsync` were found to stall `getCurrentTexture()` for a periodic ~50 ms burst on this machine's Vulkan driver when the app renders faster than refresh (a metronomic stutter, diagnosed via a per-phase frame profiler in `metis-game`). `Mailbox` is tear-free and doesn't exhibit it, but is uncapped — pair it with `metis-engine`'s `FrameLimiter` for a frame cap. Don't "restore" a fifo default without re-checking that stall.
 
-### OPEN — a swapchain-teardown abort seen once on Linux, unverified on Windows
+### OPEN — a swapchain-teardown abort seen once on Linux, not seen on Windows
 
-**Check this when next building on Windows.** Observed 2026-07-23 on the
-`wgpu-v30` branch, during one full `bun test` run on Linux/Vulkan:
+**Windows result (2026-07-24): did not reproduce.** The branch's first Windows
+build ran the full suite green, including `surface-teardown` and
+`surface-config`, with no abort. So the "deterministic on Windows' driver"
+hypothesis below is **answered no** — but that is weak evidence, not a
+clearance: the original was a one-in-ten occurrence on Linux, and a single clean
+Windows run cannot distinguish "absent" from "also rare here". It stays open,
+and it remains a Linux-first thing to chase.
+
+Originally observed 2026-07-23 on the `wgpu-v30` branch, during one full
+`bun test` run on Linux/Vulkan:
 
 ```
 thread '<unnamed>' panicked at wgpu-hal-30.0.0/src/vulkan/swapchain/native.rs:389:
@@ -958,3 +995,29 @@ const us = (sdlGetPerformanceCounter() - t0) / freq * 1e6
 | napi build fails — cmake not found | CMake not in PATH | Install CMake globally (already done on this machine) |
 | `SDL_GetJoysticks` leak | Forgot to SDL_free the returned array | Copy to Vec, then call `SDL_free(ptr)` |
 | Drop event text is garbage | Pointer copied after PollEvent loop | `copy_cstr` immediately inside `convert()` — already handled |
+| `sdlQuit()` blocks for seconds on Windows; a test hook times out | A HID device that never answers a product-string query — see below | Not a code bug; give the hook room, or unplug/disable the device |
+
+### `sdlQuit()` can block for seconds, and it is the machine, not the code
+
+On Windows, `sdlInit(Video)` starts SDL's device-hotplug thread, which
+enumerates every raw-input keyboard and mouse and reads each one's product
+string. `sdlQuit()` **joins that thread**, so it blocks until the pass finishes.
+A HID device whose driver never answers costs a multi-second timeout *each*.
+
+This is worth knowing because it looks like a GPU-teardown hang and isn't: GPU
+teardown here is sub-millisecond, and the stall reproduces with **no window and
+no GPU at all** — plain `sdlInit(Video)` then `sdlQuit()`. It is also not
+something the binding can fix; SDL offers no hint to skip the enumeration.
+
+**How to re-measure**, since the cost is per-machine and changes when hardware
+does: time `sdlInit`/`sdlQuit` with a sleep of varying length between them. If
+`init + sleep + quit` stays constant as the sleep grows, the work is a
+fixed-length pass started at init and merely *waited on* by quit — and once the
+sleep exceeds it, quit drops to ~free. To find the offending device, time
+`CreateFile` + `HidD_GetProductString` per HID device; a wedged one stands out
+by orders of magnitude, and the open is instant while the *string read* hangs.
+
+The practical consequence for tests: any hook calling `sdlQuit()` has a cost set
+by the developer's hardware, so it must not sit under Bun's default hook
+timeout. `tests/surface-config.test.ts` sets an explicit generous one and
+explains why.
