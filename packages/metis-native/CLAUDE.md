@@ -995,7 +995,7 @@ const us = (sdlGetPerformanceCounter() - t0) / freq * 1e6
 | napi build fails — cmake not found | CMake not in PATH | Install CMake globally (already done on this machine) |
 | `SDL_GetJoysticks` leak | Forgot to SDL_free the returned array | Copy to Vec, then call `SDL_free(ptr)` |
 | Drop event text is garbage | Pointer copied after PollEvent loop | `copy_cstr` immediately inside `convert()` — already handled |
-| `sdlQuit()` blocks for seconds on Windows; a test hook times out | A HID device that never answers a product-string query — see below | Not a code bug; give the hook room, or unplug/disable the device |
+| `sdlQuit()` blocks for seconds on Windows; a test hook times out | A HID device not answering a product-string query — often transient; see below | Not a code bug. Reboot and re-measure first; remove drivers for detached hardware |
 
 ### `sdlQuit()` can block for seconds, and it is the machine, not the code
 
@@ -1003,6 +1003,19 @@ On Windows, `sdlInit(Video)` starts SDL's device-hotplug thread, which
 enumerates every raw-input keyboard and mouse and reads each one's product
 string. `sdlQuit()` **joins that thread**, so it blocks until the pass finishes.
 A HID device whose driver never answers costs a multi-second timeout *each*.
+
+**Seen once, 2026-07-24, and it was transient** — worth knowing precisely
+because the obvious conclusion was the wrong one. A mouse that was working fine
+had stopped answering product-string queries, which made every `sdlQuit()` block
+for seconds; it looked like a permanently bad device. It wasn't. The machine had
+been up for about a week with a stale driver installed for a HOTAS that was no
+longer plugged in, and the flakiness had spread to unrelated HID devices.
+Removing the orphaned driver and rebooting returned every device to
+low-single-digit milliseconds.
+
+So the first move on a mysteriously slow `sdlQuit()` is **reboot and re-measure**,
+before concluding anything about a specific device — and check for drivers left
+behind by hardware that is no longer attached.
 
 This is worth knowing because it looks like a GPU-teardown hang and isn't: GPU
 teardown here is sub-millisecond, and the stall reproduces with **no window and

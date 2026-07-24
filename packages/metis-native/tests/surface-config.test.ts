@@ -52,10 +52,15 @@ beforeAll(async () => {
 // the machine's HID devices, not by this suite. `sdlInit(Video)` starts SDL's
 // device-hotplug thread, which enumerates every raw-input keyboard and mouse and
 // reads each one's product string; `sdlQuit()` joins that thread, so it blocks
-// until the pass finishes. A HID device that never answers costs a **5 s driver
-// timeout each**, and they add up — on this machine a wedged Corsair mouse makes
-// `sdlQuit()` take a flat 10 s, over Bun's 5 s default, failing the hook while
-// every assertion passes. Nothing here can bound that, so the hook is given room.
+// until the pass finishes. A HID device that never answers costs a multi-second
+// driver timeout each, and they add up — enough to blow Bun's default hook
+// timeout while every assertion in the file passes.
+//
+// That was observed here once and turned out to be transient (a stale driver
+// plus a week of uptime; see metis-native/CLAUDE.md). The timeout stays anyway:
+// the cost is a property of whatever HID hardware the developer has attached,
+// which this suite cannot bound or predict, and a hook that is merely *usually*
+// fast enough is a flake waiting to happen on someone else's machine.
 const TEARDOWN_TIMEOUT_MS = 60_000;
 
 afterAll(() => {
