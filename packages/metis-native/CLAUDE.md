@@ -64,11 +64,22 @@ CMake is installed globally — no PATH manipulation needed.
 
 Measured on this machine (8 cores), rebuilding after touching one file:
 
-| Profile | Command | Incremental | Use for |
-|---|---|---|---|
-| `dev` | `build:debug` | **6 s** | normal development |
-| `fastdev` | `build` | **19 s** | profiling / perf work |
-| `release` | `build:release` | **103 s** | shipping only |
+| Profile | Command | Incremental | Artifact | Use for |
+|---|---|---|---|---|
+| `dev` | `build:debug` | **6 s** | **187 MB** | normal development — *never commit this* |
+| `fastdev` | `build` | **19 s** | 13 MB | profiling / perf work; the one to commit |
+| `release` | `build:release` | **103 s** | 12 MB | shipping only |
+
+**The `.node` is a tracked file, so the profile you last built with is the one
+you commit.** `dev` keeps full debuginfo and produces a **187 MB** artifact —
+past GitHub's 100 MB per-file hard limit, so a branch carrying one cannot be
+pushed at all. The stripped profiles are ~13 MB. This is not hypothetical: the
+wgpu 30 branch was built with `build:debug` throughout and accumulated a 187 MB
+blob in each of five commits, which had to be rewritten out with
+`git filter-branch` before it could be pushed.
+
+So: iterate with `build:debug` freely, but **run `bun run build` before
+committing the binary**, and check `ls -lh *.node` if unsure which you have.
 
 `fastdev` is `release` with `lto = false, codegen-units = 16`. Nearly all of
 `release`'s 103 s is the fat-LTO link — LLVM merging the entire dependency
