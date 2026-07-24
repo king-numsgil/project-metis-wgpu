@@ -136,6 +136,8 @@ export type GPUFeatureName =
   | 'bgra8unorm-storage'
   | 'float32-filterable'
   | 'dual-source-blending'
+  | 'clip-distances'
+  | 'immediates'
 
 /**
  * wgpu extensions with **no WebGPU spec equivalent**. They're separated from
@@ -150,15 +152,15 @@ export type GPUFeatureName =
  *   spans between passes.
  * - `timestamp-query-inside-passes` — `pass.writeTimestamp()`, for timing
  *   individual draws/dispatches inside one pass.
- * - `multi-draw-indirect` — batched indirect draws from a GPU buffer.
- * - `push-constants` — small inline uniforms via `setImmediates()`. Also needs
- *   the `maxPushConstantSize` limit raised from its default of 0.
+ *
+ * Two names left this union in the wgpu 30 upgrade, and neither was replaced:
+ * `multi-draw-indirect` is now unconditional (wgpu dropped the feature gate),
+ * and `push-constants` became the spec feature `immediates` on
+ * `GPUFeatureName`. Requesting either by its old name is a `TypeError`.
  */
 export type GPUNativeFeatureName =
   | 'timestamp-query-inside-encoders'
   | 'timestamp-query-inside-passes'
-  | 'multi-draw-indirect'
-  | 'push-constants'
 
 export type GPUErrorFilter = 'validation' | 'out-of-memory' | 'internal'
 
@@ -167,6 +169,26 @@ export type GPUDeviceLostReason = 'unknown' | 'destroyed'
 export type GPUPresentMode = 'fifo' | 'mailbox' | 'immediate' | 'auto-no-vsync' | 'auto-vsync'
 
 export type GPUAlphaMode = 'premultiplied' | 'postmultiplied' | 'inherit'
+
+/**
+ * Colour space a surface's swapchain is interpreted in, passed to
+ * `surface.configure({ colorSpace })`.
+ *
+ * `auto` keeps the platform default (sRGB, standard dynamic range) and is what
+ * you get by omitting the field. The `extended-*` variants request an HDR
+ * swapchain and are only valid for formats that advertise them — `configure()`
+ * rejects an unsupported pairing rather than silently downgrading it.
+ *
+ * - `srgb` — BT.709 primaries, sRGB transfer function, SDR.
+ * - `extended-srgb` — sRGB primaries with values outside [0,1] permitted (HDR).
+ * - `extended-srgb-linear` — as above with a linear transfer function.
+ *   Native-only; there is no browser equivalent.
+ */
+export type GPUSurfaceColorSpace =
+  | 'auto'
+  | 'srgb'
+  | 'extended-srgb'
+  | 'extended-srgb-linear'
 
 export type GPUCompilationMessageType = 'error' | 'warning' | 'info'
 
@@ -296,9 +318,20 @@ export declare class GpuDevice {
   /**
    * Begin capturing GPU errors of the given type.
    * `filter`: `"validation"` | `"out-of-memory"` | `"internal"`
+   *
+   * Scopes nest, and each one must be closed by a matching
+   * `popErrorScope()`. Only work issued between the two is captured.
    */
   pushErrorScope(filter: GPUErrorFilter): void
-  /** End the current error scope and resolve with the first error captured, or null. */
+  /**
+   * End the current error scope and resolve with the first error captured,
+   * or null.
+   *
+   * The scope closes when this is *called*, not when the returned promise
+   * settles — so work issued immediately afterwards is already outside it,
+   * and there is no need to await before continuing. Throws if no scope is
+   * open on this device.
+   */
   popErrorScope(): Promise<GpuError | null>
   /** Poll device for completion. Returns true if queue is empty. */
   poll(maintain?: string | undefined | null): boolean
@@ -751,7 +784,7 @@ export interface DrawCall {
  * `requestAdapterForWindow` — an adapter picked from this list is not
  * guaranteed to be compatible with a given window's surface.
  */
-export declare function enumerateAdapters(options?: GpuRequestAdapterOptions | undefined | null): Array<GpuAdapter>
+export declare function enumerateAdapters(options?: GpuRequestAdapterOptions | undefined | null): Promise<Array<GpuAdapter>>
 
 /** Font metrics in pixels at a given size. */
 export interface FontMetrics {
@@ -1020,6 +1053,11 @@ export interface GpuRenderPassColorAttachment {
   clearValue?: GpuColor
   loadOp: GPULoadOp
   storeOp: GPUStoreOp
+  /**
+   * Which z-slice of a 3D texture view this attachment renders into.
+   * Required when `view` is a `"3d"` view, and must be omitted otherwise.
+   */
+  depthSlice?: number
 }
 
 export interface GpuRenderPassDepthStencilAttachment {
@@ -1099,15 +1137,12 @@ export interface GpuRequiredLimits {
   maxComputeWorkgroupSizeZ?: number
   maxComputeWorkgroupsPerDimension?: number
   /**
-   * Bytes of push-constant data a pipeline layout may declare. Defaults to
-   * **0**, so requesting the `push-constants` feature without also raising
-   * this yields a device that accepts no push constants at all — set both.
-   *
-   * Reported back on `limits` as `maxImmediateSize`: this is wgpu's
-   * `max_push_constant_size`, which the WebGPU spec later renamed to
-   * "immediate size". Same limit, two names.
+   * Bytes of immediate data a pipeline layout may declare (what earlier
+   * versions of this API, and wgpu before 30, called push constants).
+   * Defaults to **0**, so requesting the `immediates` feature without also
+   * raising this yields a device that accepts no immediates at all — set both.
    */
-  maxPushConstantSize?: number
+  maxImmediateSize?: number
 }
 
 export interface GpuSamplerBindingLayout {
@@ -2226,6 +2261,13 @@ export interface SurfaceConfiguration {
   format?: string
   presentMode?: GPUPresentMode
   alphaMode?: GPUAlphaMode
+  /**
+   * Colour space the swapchain is interpreted in. Omit for `"auto"`, which
+   * keeps the platform default (sRGB, SDR). The extended variants are how
+   * you opt into an HDR swapchain; they are only valid for formats whose
+   * `format_capabilities` advertise them.
+   */
+  colorSpace?: GPUSurfaceColorSpace
 }
 
 export interface WindowPosition {

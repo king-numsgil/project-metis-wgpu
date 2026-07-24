@@ -3,18 +3,40 @@ use super::buffer::{GpuBuffer, GpuBufferDescriptor};
 use super::command_encoder::{GpuCommandEncoder, GpuCommandEncoderDescriptor};
 use super::convert;
 use super::pipeline::{GpuComputePipeline, GpuComputePipelineDescriptor, GpuRenderPipeline, GpuRenderPipelineDescriptor, OwnedComputeArgs, OwnedRenderArgs, build_compute_pipeline, build_render_pipeline, build_compute_from_args, build_render_from_args, extract_compute_args, extract_render_args};
+use super::error::with_validation_scope;
 use super::query_set::{GpuQuerySet, GpuQuerySetDescriptor};
 use super::queue::GpuQueue;
 use super::sampler::{GpuSampler, GpuSamplerDescriptor};
 use super::shader::{GpuShaderModule, GpuShaderModuleDescriptor};
 use super::supported_features::GpuSupportedFeatures;
 use super::texture::{GpuTexture, GpuTextureDescriptor};
-use napi::bindgen_prelude::{AsyncTask, Function};
+use napi::bindgen_prelude::{AsyncTask, Function, PromiseRaw};
 use napi::threadsafe_function::ThreadsafeFunction;
 use napi::{Env, Task};
 use napi_derive::napi;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
+
+thread_local! {
+    /// Open error scopes for this thread, keyed by device.
+    ///
+    /// wgpu 30 made error scopes guard-based, and the guard is `!Send`/`!Sync`
+    /// with a **thread-local** stack inside wgpu itself. That is a poor fit for
+    /// a binding whose `pushErrorScope`/`popErrorScope` are two independent JS
+    /// calls, because the guard cannot be parked on `GpuDevice` (which napi
+    /// requires to be `Send`). It is parked here instead, which is sound for
+    /// exactly the reason wgpu's own stack is: every GPU call this crate
+    /// exposes is a synchronous napi method running on the JS thread, so a
+    /// scope is opened, filled and closed all on one thread.
+    ///
+    /// Keyed by device pointer rather than being one flat stack: two devices
+    /// with interleaved scopes on the same thread would otherwise pop each
+    /// other's guards.
+    static ERROR_SCOPES: RefCell<HashMap<usize, Vec<wgpu::ErrorScopeGuard>>> =
+        RefCell::new(HashMap::new());
+}
 
 // ── Async pipeline tasks (libuv thread pool) ──────────────────────────────────
 
@@ -29,7 +51,11 @@ impl Task for ComputePipelineTask {
 
     fn compute(&mut self) -> napi::Result<GpuComputePipeline> {
         let args = self.args.take().expect("compute called twice");
-        Ok(build_compute_from_args(&self.device, args))
+        // Runs on a libuv worker, so the caller's error scope does not cover
+        // it — see `gpu::error::with_validation_scope`.
+        with_validation_scope(&self.device, "createComputePipelineAsync", || {
+            Ok(build_compute_from_args(&self.device, args))
+        })
     }
 
     fn resolve(&mut self, _env: Env, output: GpuComputePipeline) -> napi::Result<GpuComputePipeline> {
@@ -48,7 +74,9 @@ impl Task for RenderPipelineTask {
 
     fn compute(&mut self) -> napi::Result<GpuRenderPipeline> {
         let args = self.args.take().expect("compute called twice");
-        Ok(build_render_from_args(&self.device, args))
+        with_validation_scope(&self.device, "createRenderPipelineAsync", || {
+            Ok(build_render_from_args(&self.device, args))
+        })
     }
 
     fn resolve(&mut self, _env: Env, output: GpuRenderPipeline) -> napi::Result<GpuRenderPipeline> {
@@ -139,7 +167,6 @@ impl GpuDevice {
     #[napi(getter)]
     pub fn adapter_info(&self) -> crate::gpu::adapter::GpuAdapterInfo {
         let i = &self.raw_adapter_info;
-        let lim = self.inner.limits();
         crate::gpu::adapter::GpuAdapterInfo {
             vendor: i.vendor.to_string(),
             architecture: i.name.clone(),
@@ -148,8 +175,8 @@ impl GpuDevice {
             backend_type: convert::backend_to_str(i.backend).to_string(),
             device_type: convert::device_type_to_str(i.device_type).to_string(),
             is_fallback_adapter: i.device_type == wgpu::DeviceType::Cpu,
-            subgroup_min_size: lim.min_subgroup_size,
-            subgroup_max_size: lim.max_subgroup_size,
+            subgroup_min_size: i.subgroup_min_size,
+            subgroup_max_size: i.subgroup_max_size,
         }
     }
 
@@ -273,23 +300,20 @@ impl GpuDevice {
 
     #[napi]
     pub fn create_pipeline_layout(&self, descriptor: GpuPipelineLayoutDescriptor) -> napi::Result<GpuPipelineLayout> {
-        let bgl_refs: Vec<&wgpu::BindGroupLayout> = descriptor
+        // `Option` entries here are `null` bind group layouts — an unused group
+        // index that still occupies its slot, same rule as vertex buffers.
+        let bgl_refs: Vec<Option<&wgpu::BindGroupLayout>> = descriptor
             .bind_group_layouts
             .iter()
-            .map(|bgl| &*bgl.inner)
+            .map(|bgl| Some(&*bgl.inner))
             .collect();
-        let push_ranges: Vec<wgpu::PushConstantRange> =
-            match descriptor.immediate_size {
-                Some(size) if size > 0 => vec![wgpu::PushConstantRange {
-                    stages: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
-                    range: 0..size,
-                }],
-                _ => vec![],
-            };
+        // wgpu 30 replaced per-stage push-constant ranges with a single
+        // `immediate_size`: immediates are visible to every stage, so the
+        // stage mask this used to build had no meaning to begin with.
         let layout = self.inner.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: descriptor.label.as_deref(),
             bind_group_layouts: &bgl_refs,
-            push_constant_ranges: &push_ranges,
+            immediate_size: descriptor.immediate_size.unwrap_or(0),
         });
         Ok(GpuPipelineLayout::new(layout))
     }
@@ -358,6 +382,9 @@ impl GpuDevice {
 
     /// Begin capturing GPU errors of the given type.
     /// `filter`: `"validation"` | `"out-of-memory"` | `"internal"`
+    ///
+    /// Scopes nest, and each one must be closed by a matching
+    /// `popErrorScope()`. Only work issued between the two is captured.
     #[napi]
     pub fn push_error_scope(&self, #[napi(
         ts_arg_type = "GPUErrorFilter"
@@ -371,33 +398,66 @@ impl GpuDevice {
                 format!("Unknown GPUErrorFilter '{other}'; expected 'validation', 'out-of-memory', or 'internal'"),
             )),
         };
-        self.inner.push_error_scope(f);
+        let guard = self.inner.push_error_scope(f);
+        ERROR_SCOPES.with(|scopes| {
+            scopes
+                .borrow_mut()
+                .entry(Arc::as_ptr(&self.inner) as usize)
+                .or_default()
+                .push(guard)
+        });
         Ok(())
     }
 
-    /// End the current error scope and resolve with the first error captured, or null.
-    #[napi]
-    pub async fn pop_error_scope(&self) -> napi::Result<Option<GpuError>> {
-        let device = Arc::clone(&self.inner);
-        let error = device.pop_error_scope().await;
-        Ok(error.map(|e| {
-            let r#type = match &e {
-                wgpu::Error::Validation { .. } => "validation",
-                wgpu::Error::OutOfMemory { .. } => "out-of-memory",
-                wgpu::Error::Internal { .. } => "internal",
+    /// End the current error scope and resolve with the first error captured,
+    /// or null.
+    ///
+    /// The scope closes when this is *called*, not when the returned promise
+    /// settles — so work issued immediately afterwards is already outside it,
+    /// and there is no need to await before continuing. Throws if no scope is
+    /// open on this device.
+    // Deliberately not an `async fn`: napi would run the whole body on a tokio
+    // worker, and the wgpu 30 scope guard lives in a thread-local belonging to
+    // the JS thread (see ERROR_SCOPES). The guard is therefore taken and popped
+    // here, synchronously, and only the resulting future — which is `Send` — is
+    // handed to the runtime.
+    #[napi(ts_return_type = "Promise<GpuError | null>")]
+    pub fn pop_error_scope<'env>(&self, env: &'env Env) -> napi::Result<PromiseRaw<'env, Option<GpuError>>> {
+        let key = Arc::as_ptr(&self.inner) as usize;
+        let guard = ERROR_SCOPES
+            .with(|scopes| scopes.borrow_mut().get_mut(&key).and_then(|stack| stack.pop()));
+
+        // Pop on this thread (the guard is `!Send`), but report an empty stack
+        // by *rejecting* the returned promise rather than throwing out of the
+        // call. The spec has `popErrorScope()` reject with an `OperationError`
+        // here, and a synchronous throw is not something `.catch()` sees.
+        let pending = guard.map(|g| g.pop());
+        env.spawn_future(async move {
+            let Some(pending) = pending else {
+                return Err(napi::Error::new(
+                    napi::Status::GenericFailure,
+                    "popErrorScope() with no matching pushErrorScope() on this thread",
+                ));
             };
-            GpuError { r#type: r#type.to_string(), message: e.to_string() }
-        }))
+            Ok(pending.await.map(|e| {
+                let r#type = match &e {
+                    wgpu::Error::Validation { .. } => "validation",
+                    wgpu::Error::OutOfMemory { .. } => "out-of-memory",
+                    wgpu::Error::Internal { .. } => "internal",
+                };
+                GpuError { r#type: r#type.to_string(), message: e.to_string() }
+            }))
+        })
     }
 
     /// Poll device for completion. Returns true if queue is empty.
     #[napi]
     pub fn poll(&self, maintain: Option<String>) -> bool {
         let m = match maintain.as_deref() {
-            Some("wait") => wgpu::Maintain::Wait,
-            _ => wgpu::Maintain::Poll,
+            Some("wait") => wgpu::PollType::wait_indefinitely(),
+            _ => wgpu::PollType::Poll,
         };
-        matches!(self.inner.poll(m), wgpu::MaintainResult::SubmissionQueueEmpty)
+        matches!(self.inner.poll(m), Ok(wgpu::PollStatus::QueueEmpty))
     }
 
     #[napi]

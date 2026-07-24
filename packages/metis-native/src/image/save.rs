@@ -20,6 +20,7 @@
 //! letting a test do both from one GPU readback.
 
 use super::generic_err;
+use crate::gpu::error::with_validation_scope;
 use crate::gpu::{GpuDevice, GpuTexture};
 use image::ImageEncoder;
 use napi::bindgen_prelude::{AsyncTask, Uint8Array};
@@ -123,7 +124,21 @@ fn bytes_per_pixel(kind: &SourceKind) -> u32 {
 ///
 /// Runs on an async worker, so blocking on `poll(Wait)` here is fine — it is a
 /// worker thread, not the JS thread.
+/// Wraps the GPU half in a validation scope, because both callers are
+/// `AsyncTask::compute` bodies running on a libuv worker — where a caller's
+/// own `pushErrorScope()` does not reach since wgpu 30 made scopes
+/// thread-local. See `gpu::error::with_validation_scope`.
 fn readback(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    texture: &TextureRef,
+) -> napi::Result<(Vec<u8>, SourceKind)> {
+    with_validation_scope(device, "texture readback", || {
+        readback_inner(device, queue, texture)
+    })
+}
+
+fn readback_inner(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     texture: &TextureRef,
@@ -179,12 +194,14 @@ fn readback(
         let _ = tx.send(r);
     });
     // Blocking wait is correct here: this runs on a libuv worker thread.
-    device.poll(wgpu::Maintain::Wait);
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
     rx.recv()
         .map_err(|_| generic_err("readback mapping was dropped before completing".to_string()))?
         .map_err(|e| generic_err(format!("failed to map readback buffer: {:?}", e)))?;
 
-    let mapped = slice.get_mapped_range();
+    let mapped = slice
+        .get_mapped_range()
+        .map_err(|e| generic_err(format!("mapping staging buffer for readback: {e}")))?;
     let mut tight = vec![0u8; tight_row * height as usize];
     for y in 0..height as usize {
         let src = y * padded_row;

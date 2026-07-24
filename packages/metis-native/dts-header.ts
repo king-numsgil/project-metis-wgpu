@@ -136,6 +136,8 @@ export type GPUFeatureName =
   | 'bgra8unorm-storage'
   | 'float32-filterable'
   | 'dual-source-blending'
+  | 'clip-distances'
+  | 'immediates'
 
 /**
  * wgpu extensions with **no WebGPU spec equivalent**. They're separated from
@@ -150,15 +152,15 @@ export type GPUFeatureName =
  *   spans between passes.
  * - `timestamp-query-inside-passes` — `pass.writeTimestamp()`, for timing
  *   individual draws/dispatches inside one pass.
- * - `multi-draw-indirect` — batched indirect draws from a GPU buffer.
- * - `push-constants` — small inline uniforms via `setImmediates()`. Also needs
- *   the `maxPushConstantSize` limit raised from its default of 0.
+ *
+ * Two names left this union in the wgpu 30 upgrade, and neither was replaced:
+ * `multi-draw-indirect` is now unconditional (wgpu dropped the feature gate),
+ * and `push-constants` became the spec feature `immediates` on
+ * `GPUFeatureName`. Requesting either by its old name is a `TypeError`.
  */
 export type GPUNativeFeatureName =
   | 'timestamp-query-inside-encoders'
   | 'timestamp-query-inside-passes'
-  | 'multi-draw-indirect'
-  | 'push-constants'
 
 export type GPUErrorFilter = 'validation' | 'out-of-memory' | 'internal'
 
@@ -167,6 +169,26 @@ export type GPUDeviceLostReason = 'unknown' | 'destroyed'
 export type GPUPresentMode = 'fifo' | 'mailbox' | 'immediate' | 'auto-no-vsync' | 'auto-vsync'
 
 export type GPUAlphaMode = 'premultiplied' | 'postmultiplied' | 'inherit'
+
+/**
+ * Colour space a surface's swapchain is interpreted in, passed to
+ * `surface.configure({ colorSpace })`.
+ *
+ * `auto` keeps the platform default (sRGB, standard dynamic range) and is what
+ * you get by omitting the field. The `extended-*` variants request an HDR
+ * swapchain and are only valid for formats that advertise them — `configure()`
+ * rejects an unsupported pairing rather than silently downgrading it.
+ *
+ * - `srgb` — BT.709 primaries, sRGB transfer function, SDR.
+ * - `extended-srgb` — sRGB primaries with values outside [0,1] permitted (HDR).
+ * - `extended-srgb-linear` — as above with a linear transfer function.
+ *   Native-only; there is no browser equivalent.
+ */
+export type GPUSurfaceColorSpace =
+  | 'auto'
+  | 'srgb'
+  | 'extended-srgb'
+  | 'extended-srgb-linear'
 
 export type GPUCompilationMessageType = 'error' | 'warning' | 'info'
 

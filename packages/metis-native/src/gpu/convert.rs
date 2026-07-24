@@ -243,6 +243,17 @@ pub fn filter_mode(s: &str) -> napi::Result<wgpu::FilterMode> {
     })
 }
 
+/// Same two names as `filter_mode`, but a distinct wgpu type since 26 — the
+/// spec has always had `GPUMipmapFilterMode` as its own enum, so this mirrors
+/// it rather than aliasing `GPUFilterMode`.
+pub fn mipmap_filter_mode(s: &str) -> napi::Result<wgpu::MipmapFilterMode> {
+    Ok(match s {
+        "nearest" => wgpu::MipmapFilterMode::Nearest,
+        "linear" => wgpu::MipmapFilterMode::Linear,
+        _ => return Err(invalid_enum("GPUMipmapFilterMode", s)),
+    })
+}
+
 pub fn compare_function(s: &str) -> napi::Result<wgpu::CompareFunction> {
     Ok(match s {
         "never" => wgpu::CompareFunction::Never,
@@ -569,11 +580,15 @@ const FEATURES: &[(&str, wgpu::Features)] = &[
     ("bgra8unorm-storage", wgpu::Features::BGRA8UNORM_STORAGE),
     ("float32-filterable", wgpu::Features::FLOAT32_FILTERABLE),
     ("dual-source-blending", wgpu::Features::DUAL_SOURCE_BLENDING),
+    ("clip-distances", wgpu::Features::CLIP_DISTANCES),
+    // `immediates` is what the spec now calls push constants. It is a *spec*
+    // feature (still a proposal on the web, implemented natively here), so it
+    // belongs in this block rather than the native one — see the note on
+    // `GPUNativeFeatureName` in dts-header.ts.
+    ("immediates", wgpu::Features::IMMEDIATES),
     // ── wgpu native-only extensions ───────────────────────────────────────────
     ("timestamp-query-inside-encoders", wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS),
     ("timestamp-query-inside-passes", wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES),
-    ("multi-draw-indirect", wgpu::Features::MULTI_DRAW_INDIRECT),
-    ("push-constants", wgpu::Features::PUSH_CONSTANTS),
 ];
 
 /// Rejects unknown names rather than dropping them. The spec has `requestDevice`
@@ -599,7 +614,7 @@ pub fn features_to_vec(f: wgpu::Features) -> Vec<&'static str> {
 #[allow(unreachable_patterns)] // Backend is #[non_exhaustive]; wildcard needed for future variants
 pub fn backend_to_str(b: wgpu::Backend) -> &'static str {
     match b {
-        wgpu::Backend::Empty => "Empty",
+        wgpu::Backend::Noop => "Noop",
         wgpu::Backend::Vulkan => "Vulkan",
         wgpu::Backend::Metal => "Metal",
         wgpu::Backend::Dx12 => "Dx12",

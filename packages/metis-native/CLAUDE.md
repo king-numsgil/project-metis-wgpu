@@ -3,7 +3,7 @@
 ## What this project is
 
 A Bun/TypeScript game-engine foundation built on a Rust napi-rs library that exposes:
-- **WebGPU** (wgpu 24) — close to the real WebGPU spec so tutorials work
+- **WebGPU** (wgpu 30) — close to the real WebGPU spec so tutorials work
 - **SDL3** — windowing, input, timing, cursor, joystick, gamepad
 
 The Rust crate is at the repo root; the generated JS binding is `index.js` / `index.d.ts` (written directly by `napi build`).
@@ -64,11 +64,22 @@ CMake is installed globally — no PATH manipulation needed.
 
 Measured on this machine (8 cores), rebuilding after touching one file:
 
-| Profile | Command | Incremental | Use for |
-|---|---|---|---|
-| `dev` | `build:debug` | **6 s** | normal development |
-| `fastdev` | `build` | **19 s** | profiling / perf work |
-| `release` | `build:release` | **103 s** | shipping only |
+| Profile | Command | Incremental | Artifact | Use for |
+|---|---|---|---|---|
+| `dev` | `build:debug` | **6 s** | **187 MB** | normal development — *never commit this* |
+| `fastdev` | `build` | **19 s** | 13 MB | profiling / perf work; the one to commit |
+| `release` | `build:release` | **103 s** | 12 MB | shipping only |
+
+**The `.node` is a tracked file, so the profile you last built with is the one
+you commit.** `dev` keeps full debuginfo and produces a **187 MB** artifact —
+past GitHub's 100 MB per-file hard limit, so a branch carrying one cannot be
+pushed at all. The stripped profiles are ~13 MB. This is not hypothetical: the
+wgpu 30 branch was built with `build:debug` throughout and accumulated a 187 MB
+blob in each of five commits, which had to be rewritten out with
+`git filter-branch` before it could be pushed.
+
+So: iterate with `build:debug` freely, but **run `bun run build` before
+committing the binary**, and check `ls -lh *.node` if unsure which you have.
 
 `fastdev` is `release` with `lto = false, codegen-units = 16`. Nearly all of
 `release`'s 103 s is the fat-LTO link — LLVM merging the entire dependency
@@ -87,6 +98,35 @@ the previous build had come from the other tool. Running the same command twice:
 the `.node` the JS side loads, and it doesn't regenerate `index.d.ts` or run the
 `prepend-dts-header` postbuild. `cargo check`/`cargo clippy` are fine (they
 don't link), but anything that produces a loadable artifact goes through napi.
+
+### A stale `Cargo.lock` can break the dx12 build with errors inside wgpu-hal
+
+The first Windows build of the wgpu 30 branch failed to compile **wgpu-hal**,
+with type mismatches in `dx12/suballocation.rs` — `&ID3D12Heap` not satisfying
+`Param<ID3D12Heap>`, and diagnostics naming *two* versions of `windows` /
+`windows-core`. None of it was this crate's code, and there was nothing to fix
+in `src/`.
+
+Cause: `gpu-allocator` (wgpu-hal's dx12 allocator) declares its `windows`
+dependency as an **open range**, so the lock is free to hold it at an old
+version. Ours still pinned the version wgpu 24 had used, while wgpu-hal 30 moved
+to a newer one. The two are semver-incompatible, so cargo kept **both**, and the
+`ID3D12Heap` handed over by the allocator was a different type from the one
+wgpu-hal's device expected.
+
+Fix is a lockfile dedupe, not a code change — bump the stale pin onto the
+version wgpu-hal already uses and the duplicate tree collapses:
+
+```powershell
+cargo update -p windows@<old-version> --precise <version wgpu-hal uses>
+```
+
+**Why it took a Windows build to find:** dx12 is the only backend that compiles
+this path, so the whole dependency conflict is invisible on Linux — the branch
+was developed and tested there and built clean throughout. The general shape is
+worth remembering: after a major wgpu upgrade, a *lockfile* left over from the
+old version can produce compile errors that appear to be upstream bugs. Check
+for duplicate versions of a shared dependency before believing them.
 
 **Any edit to `Cargo.toml` or `.cargo/config.toml` invalidates everything.**
 Changing rustflags forces a full rebuild of all dependencies (~2 min debug,
@@ -118,7 +158,7 @@ once it does, rather than assuming either answer.
 - **SDL3**: built from source via `sdl3-sys = { version = "0.6.7", features = ["build-from-source-static"] }` (bundles SDL 3.4.12)
 - **Image decoding**: `image = { version = "0.25", default-features = false, features = ["png", "jpeg", "tga", "hdr"] }` — pure Rust, no C decoder. Plus `half` for the f32→f16 conversion HDR needs. (SDL3_image was removed; see "Why SDL3_image is gone" below.)
 - **Compressed textures**: `ktx2` (container parsing, zero transitive deps) and `ruzstd` (zstd supercompression). Both pure Rust — deliberately *not* the `zstd` crate, which is C bindings, nor any Basis transcoder. Same rule as the decoder above.
-- **wgpu**: 24.0.5 with WGSL feature
+- **wgpu**: 30.0.0 with WGSL feature
 
 Cargo cache / sdl3-sys source:
 `C:\Users\DarkF\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sdl3-sys-0.6.7+SDL-3.4.12\src\generated\`
@@ -187,12 +227,19 @@ and `features_to_vec` (report) read. It used to be two duplicated lists — a na
 could become requestable but unreportable. Don't split it again.
 
 The table's second block is this crate's **first intentional break from the
-WebGPU spec**: `timestamp-query-inside-encoders`, `timestamp-query-inside-passes`,
-`multi-draw-indirect`, `push-constants`. They're wgpu extensions with no spec
+WebGPU spec**: `timestamp-query-inside-encoders` and
+`timestamp-query-inside-passes`. They're wgpu extensions with no spec
 equivalent, so they're typed as a separate `GPUNativeFeatureName` union (in
 `dts-header.ts`) rather than folded into `GPUFeatureName` — the type is the
 documentation that using one is a native-only decision. Keep that split when
 adding more.
+
+The block **shrank** in the wgpu 30 upgrade, and both departures are worth
+knowing because neither was a rename this crate chose. `multi-draw-indirect`
+stopped being a feature at all (wgpu made multi-draw unconditional), and
+`push-constants` became the *spec* feature `immediates` — so it moved out of
+the native block and into `GPUFeatureName`, which is the direction this split
+is supposed to move in. Requesting either old name is now a `TypeError`.
 
 `feature_to_wgpu` **errors** on an unknown name rather than dropping it. The old
 `if let Some(wf) = … {}` silently ignored typos, handing back a device missing
@@ -202,10 +249,80 @@ reject for exactly this reason.
 **`requestDevice` used to unconditionally OR in `PUSH_CONSTANTS`** regardless of
 what the caller asked for — which would fail device creation outright on any
 adapter lacking it, with no opt-out. It had no consumers anywhere in the repo.
-It's gone; `push-constants` is now a normal opt-in feature. Note it's inert
-without also raising the `maxPushConstantSize` limit (wgpu defaults it to 0), and
-that the *reported* limit is called `maxImmediateSize` (wgpu's
-`max_push_constant_size` under the spec's newer name).
+It's gone; the capability is now the normal opt-in feature `immediates`. It is
+still inert without also raising `maxImmediateSize` (wgpu defaults it to 0).
+
+The request/report **asymmetry this note used to warn about is gone**: the limit
+was previously requested as `maxPushConstantSize` and reported back as
+`maxImmediateSize`, because wgpu and the spec disagreed on the name. wgpu 30
+adopted the spec name, so both directions now say `maxImmediateSize`.
+
+### Error scopes are guard-based in wgpu 30, and the guard cannot be stored
+
+`pushErrorScope`/`popErrorScope` are two independent JS calls, but wgpu 30
+returns an **`ErrorScopeGuard`** from the push, and the guard is `!Send`,
+`!Sync`, and lives on a stack that is **thread-local inside wgpu itself**. It
+therefore cannot be parked on `GpuDevice`, which napi requires to be `Send`.
+
+The resolution is the `ERROR_SCOPES` thread-local in `device.rs`: a
+`HashMap<device_ptr, Vec<ErrorScopeGuard>>`. Three things about it are
+load-bearing:
+
+- **It is keyed by device, not one flat stack.** Two devices with interleaved
+  scopes on the same thread would otherwise pop each other's guards.
+- **`popErrorScope` is deliberately not an `async fn`.** napi runs an `async fn`
+  body on a tokio worker, where the thread-local is empty. So the guard is taken
+  and `.pop()`ed *synchronously* on the JS thread, and only the resulting future
+  — which is `Send` — goes to `env.spawn_future`. This is the whole reason the
+  signature is `fn(&self, &Env) -> PromiseRaw<'_, _>` instead of `async fn`.
+- **An empty stack rejects the promise rather than throwing.** The spec has
+  `popErrorScope()` reject, and a synchronous throw is not something a `.catch()`
+  on the returned promise can ever observe.
+
+Soundness rests on one property: the call is a synchronous napi method running
+on the JS thread, so a scope is opened, filled, and closed all on one thread.
+
+**That property does not hold for everything, and assuming it did was a live
+bug for one commit.** Every operation returning an `AsyncTask` —
+`createRenderPipelineAsync`, `createComputePipelineAsync`, `loadImageTexture`,
+`loadKtx2Texture`, `saveTextureToFile`, `readTexturePixels` — does its GPU work
+inside `Task::compute`, on a libuv worker. A caller's scope on the JS thread
+cannot see it. Under wgpu 24 scopes were device-global and *could*, so the
+upgrade silently broke it: the load still returned a plausible handle and the
+error went to `onuncapturederror`/stderr.
+
+The fix is `gpu::error::with_validation_scope`: each of those tasks brackets
+its own GPU work in a scope **on the worker thread** and turns a captured error
+into a rejected promise. So the contract is split, and both halves matter:
+
+- **Synchronous calls** — covered by the caller's `pushErrorScope`, as before.
+- **Async calls** — reject on their own; a caller's scope will *not* see them
+  and will return `null`.
+
+That second half reads exactly like success, which is why it is pinned by tests
+rather than left to memory (see below). **Any new `AsyncTask` that touches the
+GPU must go through `with_validation_scope`**, or it silently reacquires the
+bug. The helper is also strictly better than what wgpu 24 did: a caller no
+longer has to remember to bracket an async load to find out it failed.
+
+`tests/error-scope.test.ts` pins this, and exists because of a specific blind
+spot: every *other* test that uses an error scope asserts the result is `null`
+(they use it to prove an operation was clean). An implementation that lost the
+guard entirely would return `null` from every pop and **keep the whole suite
+green**. The first test there provokes a validation error on purpose and
+requires it to come back; that is the one that fails if this plumbing breaks.
+
+That blind spot was not hypothetical — it was **live in `image-ktx2.test.ts`**.
+Its `loadChecked` helper wrapped `loadKtx2Texture` in a scope and asserted the
+pop was `null`, which after the upgrade it was, unconditionally. Its own comment
+called it "the load-bearing part of every success-path test" while it had
+stopped loading anything. It now just `await`s the loader and lets a rejection
+fail the test, and the `"GPU-side validation errors reach the caller"` block
+proves the rejection actually fires — using a **well-formed** file with an
+illegal usage flag (`STORAGE_BINDING` on a block-compressed format), so the
+error comes from wgpu rather than from this crate's own CPU-side checks, which
+were never affected. Mutation-checked: drop `with_validation_scope` from
+`LoadKtx2Task` and exactly those two tests fail while the other 21 pass.
 
 ### VectorContext: lyon panics, and the one rule behind all of them
 
@@ -348,6 +465,47 @@ per frame must be expensive" is wrong by two orders of magnitude here.
 - Surface format (e.g. `bgra8unorm-srgb`) can't be read back. For screenshots, render to a separate `rgba8unorm` texture.
 - VSync throttling happens in `getCurrentTexture()` (not `present()`) on DirectX backends. Use `presentMode: 'immediate'` to measure raw CPU costs.
 - **`configure()`'s default present mode is `Mailbox`** (fifo fallback if unsupported) — set in `surface.rs`. This is deliberate: `Fifo`/`AutoVsync` were found to stall `getCurrentTexture()` for a periodic ~50 ms burst on this machine's Vulkan driver when the app renders faster than refresh (a metronomic stutter, diagnosed via a per-phase frame profiler in `metis-game`). `Mailbox` is tear-free and doesn't exhibit it, but is uncapped — pair it with `metis-engine`'s `FrameLimiter` for a frame cap. Don't "restore" a fifo default without re-checking that stall.
+
+### OPEN — a swapchain-teardown abort seen once on Linux, not seen on Windows
+
+**Windows result (2026-07-24): did not reproduce.** The branch's first Windows
+build ran the full suite green, including `surface-teardown` and
+`surface-config`, with no abort. So the "deterministic on Windows' driver"
+hypothesis below is **answered no** — but that is weak evidence, not a
+clearance: the original was a one-in-ten occurrence on Linux, and a single clean
+Windows run cannot distinguish "absent" from "also rare here". It stays open,
+and it remains a Linux-first thing to chase.
+
+Originally observed 2026-07-23 on the `wgpu-v30` branch, during one full
+`bun test` run on Linux/Vulkan:
+
+```
+thread '<unnamed>' panicked at wgpu-hal-30.0.0/src/vulkan/swapchain/native.rs:389:
+  Trying to destroy a SwapchainAcquireSemaphore that is still in use by a SurfaceTexture
+fatal runtime error: failed to initiate panic, error 5, aborting
+```
+
+It aborts the process — nothing JS can catch — and it **did not reproduce in
+nine subsequent runs** (three full suites, six targeted at the surface-heavy
+files). It could not be attributed to a specific test file; the suite has
+several surface users.
+
+The plausible mechanism is that presentation is asynchronous, so a frame
+presented moments earlier can still hold a swapchain acquire semaphore when the
+swapchain is torn down or reconfigured. `tests/surface-config.test.ts` now calls
+`device.poll("wait")` before destroying its surface, which is correct regardless
+— but **that is not a confirmed fix**, because the panic was never reproduced to
+confirm anything against.
+
+Why Windows specifically is worth checking: the section below is a worked
+example of a surface-lifetime bug that was **fatal on exactly one platform** and
+benign on the other, purely because of how the two backends tear surfaces down.
+A one-in-many-runs abort on Linux may be deterministic on Windows' Vulkan
+driver, or absent. Either answer is useful; assuming it is Linux-only is not.
+
+If it does reproduce, the thing to establish first is whether a
+`poll("wait")` before `configure()`/`destroy()` removes it — that distinguishes
+"we tear down too eagerly" from a wgpu-hal bug worth reporting upstream.
 
 ### A surface outliving its window is a segfault, not a leak
 
@@ -837,3 +995,42 @@ const us = (sdlGetPerformanceCounter() - t0) / freq * 1e6
 | napi build fails — cmake not found | CMake not in PATH | Install CMake globally (already done on this machine) |
 | `SDL_GetJoysticks` leak | Forgot to SDL_free the returned array | Copy to Vec, then call `SDL_free(ptr)` |
 | Drop event text is garbage | Pointer copied after PollEvent loop | `copy_cstr` immediately inside `convert()` — already handled |
+| `sdlQuit()` blocks for seconds on Windows; a test hook times out | A HID device not answering a product-string query — often transient; see below | Not a code bug. Reboot and re-measure first; remove drivers for detached hardware |
+
+### `sdlQuit()` can block for seconds, and it is the machine, not the code
+
+On Windows, `sdlInit(Video)` starts SDL's device-hotplug thread, which
+enumerates every raw-input keyboard and mouse and reads each one's product
+string. `sdlQuit()` **joins that thread**, so it blocks until the pass finishes.
+A HID device whose driver never answers costs a multi-second timeout *each*.
+
+**Seen once, 2026-07-24, and it was transient** — worth knowing precisely
+because the obvious conclusion was the wrong one. A mouse that was working fine
+had stopped answering product-string queries, which made every `sdlQuit()` block
+for seconds; it looked like a permanently bad device. It wasn't. The machine had
+been up for about a week with a stale driver installed for a HOTAS that was no
+longer plugged in, and the flakiness had spread to unrelated HID devices.
+Removing the orphaned driver and rebooting returned every device to
+low-single-digit milliseconds.
+
+So the first move on a mysteriously slow `sdlQuit()` is **reboot and re-measure**,
+before concluding anything about a specific device — and check for drivers left
+behind by hardware that is no longer attached.
+
+This is worth knowing because it looks like a GPU-teardown hang and isn't: GPU
+teardown here is sub-millisecond, and the stall reproduces with **no window and
+no GPU at all** — plain `sdlInit(Video)` then `sdlQuit()`. It is also not
+something the binding can fix; SDL offers no hint to skip the enumeration.
+
+**How to re-measure**, since the cost is per-machine and changes when hardware
+does: time `sdlInit`/`sdlQuit` with a sleep of varying length between them. If
+`init + sleep + quit` stays constant as the sleep grows, the work is a
+fixed-length pass started at init and merely *waited on* by quit — and once the
+sleep exceeds it, quit drops to ~free. To find the offending device, time
+`CreateFile` + `HidD_GetProductString` per HID device; a wedged one stands out
+by orders of magnitude, and the open is instant while the *string read* hangs.
+
+The practical consequence for tests: any hook calling `sdlQuit()` has a cost set
+by the developer's hardware, so it must not sit under Bun's default hook
+timeout. `tests/surface-config.test.ts` sets an explicit generous one and
+explains why.

@@ -731,6 +731,37 @@ This is also what makes `DOC.md`'s phrase "a byte-exact screenshot baseline"
 literally true rather than aspirational — it could not have been, while the
 decoder varied by platform.
 
+#### The wgpu 24 → 30 upgrade rebased all eight goldens (2026-07-23)
+
+This is the first golden diff since the baseline was established, and it is
+recorded here as a **worked example of the "look at its shape" rule above**
+rather than as a licence to regenerate.
+
+The upgrade moved naga forward six major versions with it, so shader codegen
+changed — different FMA contraction and instruction selection produce different
+last-bit float results. Same hardware, same driver, different compiler. The
+diff was measured before the goldens were accepted, not after:
+
+| fixture | max Δ | mean Δ | px with Δ>1 | px with Δ>8 |
+|---|---|---|---|---|
+| exterior | 21 | 0.040 | **1** of 360000 | 0 |
+| textured | 7 | 0.045 | 9 of 360000 | 0 |
+| interior | 1 | 0.169 | 0 | 0 |
+| the other five | 1 | ≤0.064 | 0 | 0 |
+
+That is the numeric-drift shape the section above describes, at its extreme: six
+of eight fixtures differ by **at most one LSB anywhere**, and the two that don't
+have single-digit outlier *pixel counts* — one pixel, in `exterior`'s case, on a
+specular edge where a hair's-worth of float difference crosses a rounding
+boundary. Nothing is structured or localised; no region moved, no shading term
+changed magnitude.
+
+**Redo this measurement, don't trust this table, if goldens drift again.** The
+method is the point: decode both PNGs, take the per-pixel max channel delta, and
+report the *distribution* — max, mean, and the counts above Δ=1 and Δ=8. A real
+regression shows up as a contiguous region or a large mean, and no amount of
+"it's probably just the driver" substitutes for the histogram.
+
 
 ### The headless target is sRGB, and it was silently wrong for a long time
 

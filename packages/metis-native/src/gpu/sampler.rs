@@ -49,7 +49,7 @@ pub fn build_descriptor(desc: &GpuSamplerDescriptor) -> napi::Result<wgpu::Sampl
         address_mode_w: desc.address_mode_w.as_deref().map(convert::address_mode).transpose()?.unwrap_or(wgpu::AddressMode::ClampToEdge),
         mag_filter: desc.mag_filter.as_deref().map(convert::filter_mode).transpose()?.unwrap_or(wgpu::FilterMode::Nearest),
         min_filter: desc.min_filter.as_deref().map(convert::filter_mode).transpose()?.unwrap_or(wgpu::FilterMode::Nearest),
-        mipmap_filter: desc.mipmap_filter.as_deref().map(convert::filter_mode).transpose()?.unwrap_or(wgpu::FilterMode::Nearest),
+        mipmap_filter: desc.mipmap_filter.as_deref().map(convert::mipmap_filter_mode).transpose()?.unwrap_or(wgpu::MipmapFilterMode::Nearest),
         lod_min_clamp: desc.lod_min_clamp.unwrap_or(0.0) as f32,
         lod_max_clamp: desc.lod_max_clamp.unwrap_or(32.0) as f32,
         compare,

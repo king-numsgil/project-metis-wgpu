@@ -135,6 +135,12 @@ pub struct SurfaceConfiguration {
     pub present_mode: Option<String>,
     #[napi(ts_type = "GPUAlphaMode")]
     pub alpha_mode: Option<String>,
+    /// Colour space the swapchain is interpreted in. Omit for `"auto"`, which
+    /// keeps the platform default (sRGB, SDR). The extended variants are how
+    /// you opt into an HDR swapchain; they are only valid for formats whose
+    /// `format_capabilities` advertise them.
+    #[napi(ts_type = "GPUSurfaceColorSpace")]
+    pub color_space: Option<String>,
 }
 
 // ── GpuSurface ────────────────────────────────────────────────────────────────
@@ -146,6 +152,13 @@ pub struct GpuSurface {
     /// `destroy()` for why that ordering is load-bearing rather than tidy.
     pub(crate) inner: Mutex<Option<wgpu::Surface<'static>>>,
     pub(crate) adapter: Arc<wgpu::Adapter>,
+    /// Captured in `configure()`. wgpu 30 moved presentation from
+    /// `SurfaceTexture::present()` to `Queue::present(tex)`, so a frame needs a
+    /// queue to present itself. Holding it here — rather than making JS pass a
+    /// device to `present()` — keeps the frame-loop API unchanged, and
+    /// `configure()` is already a hard prerequisite of `getCurrentTexture()`,
+    /// so it is always set by the time a frame exists.
+    pub(crate) queue: Mutex<Option<Arc<wgpu::Queue>>>,
 }
 
 // wgpu explicitly unsafe-impl's Send+Sync for Surface on native targets.
@@ -257,11 +270,46 @@ impl GpuSurface {
             _ => *caps.alpha_modes.first().unwrap_or(&wgpu::CompositeAlphaMode::Auto),
         };
 
+        // Colour space is new in wgpu 30 and, unlike present mode, an
+        // unsupported one is a hard configure failure rather than something to
+        // fall back from — so check it against this format's advertised set and
+        // say which format rejected it.
+        let color_space = match config.color_space.as_deref() {
+            None | Some("auto") => wgpu::SurfaceColorSpace::Auto,
+            Some("srgb") => wgpu::SurfaceColorSpace::Srgb,
+            Some("extended-srgb") => wgpu::SurfaceColorSpace::ExtendedSrgb,
+            Some("extended-srgb-linear") => wgpu::SurfaceColorSpace::ExtendedSrgbLinear,
+            Some(other) => {
+                return Err(napi::Error::new(
+                    napi::Status::InvalidArg,
+                    format!(
+                        "invalid value '{other}' for GPUSurfaceColorSpace; expected 'auto', \
+                         'srgb', 'extended-srgb' or 'extended-srgb-linear'"
+                    ),
+                ))
+            }
+        };
+        // `Auto` has no bit of its own (`to_color_spaces()` gives `None`),
+        // which is exactly the "nothing to check" case.
+        if let Some(wanted) = color_space.to_color_spaces() {
+            if !caps.color_spaces(format).contains(wanted) {
+                return Err(napi::Error::new(
+                    napi::Status::InvalidArg,
+                    format!(
+                        "colorSpace {:?} is not supported for surface format {}",
+                        color_space,
+                        convert::texture_format_to_str(format),
+                    ),
+                ));
+            }
+        }
+
         surface.configure(
             &device.inner,
             &wgpu::SurfaceConfiguration {
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
                 format,
+                color_space,
                 width: config.width,
                 height: config.height,
                 present_mode,
@@ -270,6 +318,9 @@ impl GpuSurface {
                 desired_maximum_frame_latency: 2,
             },
         );
+        // Frames acquired after this point present through this queue; see the
+        // `queue` field on GpuSurface.
+        *self.queue.lock().unwrap() = Some(Arc::clone(&device.queue_inner));
         Ok(())
     }
 
@@ -279,11 +330,52 @@ impl GpuSurface {
     pub fn get_current_texture(&self) -> napi::Result<GpuSurfaceTexture> {
         let guard = self.inner.lock().unwrap();
         let surface = Self::alive(&guard)?;
-        let frame = surface
-            .get_current_texture()
-            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
+        let queue = self.queue.lock().unwrap().clone().ok_or_else(|| {
+            napi::Error::new(
+                napi::Status::GenericFailure,
+                "getCurrentTexture() before configure(): the surface has no swapchain yet",
+            )
+        })?;
+
+        // wgpu 30 replaced `Result<SurfaceTexture, SurfaceError>` with an enum
+        // that separates "usable frame" from "usable frame, but reconfigure" —
+        // the latter used to be a `suboptimal` bool on the texture. Both still
+        // hand back a texture, so both stay success cases here and the flag is
+        // carried on the frame exactly as before.
+        let (frame, suboptimal) = match surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(t) => (t, false),
+            wgpu::CurrentSurfaceTexture::Suboptimal(t) => (t, true),
+            other => {
+                // Every remaining variant means "no texture this frame". They
+                // are distinguished in the message rather than collapsed into
+                // one string, because the right response differs: reconfigure
+                // for Outdated, recreate for Lost, skip the frame for the rest.
+                let (kind, hint) = match other {
+                    wgpu::CurrentSurfaceTexture::Timeout =>
+                        ("timeout", "skip this frame and try again"),
+                    wgpu::CurrentSurfaceTexture::Occluded =>
+                        ("occluded", "window is hidden or minimized; skip this frame"),
+                    wgpu::CurrentSurfaceTexture::Outdated =>
+                        ("outdated", "call configure() again, then retry"),
+                    wgpu::CurrentSurfaceTexture::Lost =>
+                        ("lost", "recreate the surface, then configure() it"),
+                    wgpu::CurrentSurfaceTexture::Validation =>
+                        ("validation", "a validation error was raised; check the error scope"),
+                    // Both success variants are handled above.
+                    wgpu::CurrentSurfaceTexture::Success(_)
+                    | wgpu::CurrentSurfaceTexture::Suboptimal(_) => unreachable!(),
+                };
+                return Err(napi::Error::new(
+                    napi::Status::GenericFailure,
+                    format!("getCurrentTexture: surface {kind} — {hint}"),
+                ));
+            }
+        };
+
         Ok(GpuSurfaceTexture {
             inner: Mutex::new(Some(frame)),
+            queue,
+            suboptimal,
         })
     }
 
@@ -327,6 +419,12 @@ impl GpuSurface {
 #[napi]
 pub struct GpuSurfaceTexture {
     inner: Mutex<Option<wgpu::SurfaceTexture>>,
+    /// Queue this frame presents through — see `GpuSurface::queue`.
+    queue: Arc<wgpu::Queue>,
+    /// Was `SurfaceTexture::suboptimal` before wgpu 30 moved it onto the
+    /// acquire result. Kept here so the JS-facing `frame.suboptimal` is
+    /// unchanged.
+    suboptimal: bool,
 }
 
 // SurfaceTexture is Send on native wgpu backends; we need the unsafe impl
@@ -358,7 +456,7 @@ impl GpuSurfaceTexture {
         let frame = self.inner.lock().unwrap().take().ok_or_else(|| {
             napi::Error::new(napi::Status::GenericFailure, "Surface texture already presented")
         })?;
-        frame.present();
+        self.queue.present(frame);
         Ok(())
     }
 
@@ -366,12 +464,7 @@ impl GpuSurfaceTexture {
     /// improve performance (e.g. after a resize).
     #[napi(getter)]
     pub fn suboptimal(&self) -> bool {
-        self.inner
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|f| f.suboptimal)
-            .unwrap_or(false)
+        self.suboptimal
     }
 }
 
@@ -391,12 +484,13 @@ pub fn create_surface(adapter: &GpuAdapter, window: &SdlWindow) -> napi::Result<
             .instance
             .create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
                 raw_window_handle,
-                raw_display_handle,
+                raw_display_handle: Some(raw_display_handle),
             })
     }
         .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
     Ok(GpuSurface {
         inner: Mutex::new(Some(surface)),
         adapter: Arc::clone(&adapter.inner),
+        queue: Mutex::new(None),
     })
 }

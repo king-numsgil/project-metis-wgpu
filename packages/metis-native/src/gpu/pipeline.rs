@@ -25,7 +25,9 @@ pub(crate) struct OwnedRenderArgs {
     pub layout: Option<Arc<wgpu::PipelineLayout>>,
     pub vertex_module: Arc<wgpu::ShaderModule>,
     pub vertex_ep: Option<String>,
-    pub vertex_buffers: Vec<(u64, wgpu::VertexStepMode, Vec<wgpu::VertexAttribute>)>,
+    /// Index-aligned with the caller's `vertex.buffers`; `None` is a `null`
+    /// slot, which must be preserved so later buffers keep their slot indices.
+    pub vertex_buffers: Vec<Option<(u64, wgpu::VertexStepMode, Vec<wgpu::VertexAttribute>)>>,
     pub primitive: wgpu::PrimitiveState,
     pub depth_stencil: Option<wgpu::DepthStencilState>,
     pub multisample: wgpu::MultisampleState,
@@ -295,37 +297,46 @@ pub fn build_compute_pipeline(device: &wgpu::Device, desc: &GpuComputePipelineDe
 }
 
 pub fn build_render_pipeline(device: &wgpu::Device, desc: &GpuRenderPipelineDescriptor) -> napi::Result<GpuRenderPipeline> {
-    // Vertex buffers
-    let mut vert_attrs_storage: Vec<Vec<wgpu::VertexAttribute>> = Vec::new();
-    let mut vert_buffers: Vec<wgpu::VertexBufferLayout<'_>> = Vec::new();
+    // Vertex buffers.
+    //
+    // A `null` entry in `vertex.buffers` is a *used slot with no buffer* — the
+    // spec keeps it in place so the entries that follow keep their slot indices.
+    // These two vectors therefore stay index-aligned with the caller's array and
+    // carry `None` through; dropping the holes (as this did before wgpu 30 gave
+    // us `Option` here) silently shifts every later buffer down a slot.
+    let mut vert_attrs_storage: Vec<Option<Vec<wgpu::VertexAttribute>>> = Vec::new();
+    let mut vert_buffers: Vec<Option<wgpu::VertexBufferLayout<'_>>> = Vec::new();
 
     if let Some(ref buffers) = desc.vertex.buffers {
         for maybe_buf in buffers {
-            if let Some(ref buf) = maybe_buf {
-                let attrs: Vec<wgpu::VertexAttribute> = buf
-                    .attributes
-                    .iter()
-                    .map(|a| -> napi::Result<_> {
-                        Ok(wgpu::VertexAttribute {
-                            format: convert::vertex_format(&a.format)?,
-                            offset: a.offset as u64,
-                            shader_location: a.shader_location,
+            let attrs = match maybe_buf {
+                Some(buf) => Some(
+                    buf.attributes
+                        .iter()
+                        .map(|a| -> napi::Result<_> {
+                            Ok(wgpu::VertexAttribute {
+                                format: convert::vertex_format(&a.format)?,
+                                offset: a.offset as u64,
+                                shader_location: a.shader_location,
+                            })
                         })
-                    })
-                    .collect::<napi::Result<_>>()?;
-                vert_attrs_storage.push(attrs);
-            }
+                        .collect::<napi::Result<_>>()?,
+                ),
+                None => None,
+            };
+            vert_attrs_storage.push(attrs);
         }
-        let mut attr_idx = 0usize;
-        for maybe_buf in buffers {
-            if let Some(ref buf) = maybe_buf {
-                let step_mode = buf.step_mode.as_deref().map(convert::vertex_step_mode).transpose()?.unwrap_or(wgpu::VertexStepMode::Vertex);
-                vert_buffers.push(wgpu::VertexBufferLayout {
-                    array_stride: buf.array_stride as u64,
-                    step_mode,
-                    attributes: &vert_attrs_storage[attr_idx],
-                });
-                attr_idx += 1;
+        for (maybe_buf, attrs) in buffers.iter().zip(vert_attrs_storage.iter()) {
+            match (maybe_buf, attrs) {
+                (Some(buf), Some(attrs)) => {
+                    let step_mode = buf.step_mode.as_deref().map(convert::vertex_step_mode).transpose()?.unwrap_or(wgpu::VertexStepMode::Vertex);
+                    vert_buffers.push(Some(wgpu::VertexBufferLayout {
+                        array_stride: buf.array_stride as u64,
+                        step_mode,
+                        attributes: attrs,
+                    }));
+                }
+                _ => vert_buffers.push(None),
             }
         }
     }
@@ -355,8 +366,12 @@ pub fn build_render_pipeline(device: &wgpu::Device, desc: &GpuRenderPipelineDesc
     let depth_stencil = if let Some(ref ds) = desc.depth_stencil {
         Some(wgpu::DepthStencilState {
             format: convert::texture_format(&ds.format)?,
-            depth_write_enabled: ds.depth_write_enabled.unwrap_or(false),
-            depth_compare: ds.depth_compare.as_deref().map(convert::compare_function).transpose()?.unwrap_or(wgpu::CompareFunction::Always),
+            // Both are `Option` in wgpu 30, matching the spec: "not provided"
+            // is distinct from `false`/`always`, and is what a depth-less
+            // (stencil-only) attachment wants. Pass the caller's intent through
+            // rather than inventing a default.
+            depth_write_enabled: ds.depth_write_enabled,
+            depth_compare: ds.depth_compare.as_deref().map(convert::compare_function).transpose()?,
             stencil: wgpu::StencilState {
                 front: stencil_face(&ds.stencil_front)?,
                 back: stencil_face(&ds.stencil_back)?,
@@ -427,7 +442,8 @@ pub fn build_render_pipeline(device: &wgpu::Device, desc: &GpuRenderPipelineDesc
         depth_stencil,
         multisample,
         fragment,
-        multiview: None,
+        // Multiview is configured per render pass in wgpu 30.
+        multiview_mask: None,
         cache: None,
     });
     Ok(GpuRenderPipeline::new(pipeline))
@@ -458,21 +474,24 @@ pub(crate) fn build_compute_from_args(device: &wgpu::Device, args: OwnedComputeA
 }
 
 pub(crate) fn extract_render_args(desc: &GpuRenderPipelineDescriptor) -> napi::Result<OwnedRenderArgs> {
-    let mut vertex_buffers: Vec<(u64, wgpu::VertexStepMode, Vec<wgpu::VertexAttribute>)> = Vec::new();
+    let mut vertex_buffers: Vec<Option<(u64, wgpu::VertexStepMode, Vec<wgpu::VertexAttribute>)>> = Vec::new();
     if let Some(ref buffers) = desc.vertex.buffers {
         for maybe_buf in buffers {
-            if let Some(ref buf) = maybe_buf {
-                let step_mode = buf.step_mode.as_deref().map(convert::vertex_step_mode).transpose()?.unwrap_or(wgpu::VertexStepMode::Vertex);
-                let attrs = buf.attributes.iter()
-                    .map(|a| -> napi::Result<_> {
-                        Ok(wgpu::VertexAttribute {
-                            format: convert::vertex_format(&a.format)?,
-                            offset: a.offset as u64,
-                            shader_location: a.shader_location,
+            match maybe_buf {
+                Some(buf) => {
+                    let step_mode = buf.step_mode.as_deref().map(convert::vertex_step_mode).transpose()?.unwrap_or(wgpu::VertexStepMode::Vertex);
+                    let attrs = buf.attributes.iter()
+                        .map(|a| -> napi::Result<_> {
+                            Ok(wgpu::VertexAttribute {
+                                format: convert::vertex_format(&a.format)?,
+                                offset: a.offset as u64,
+                                shader_location: a.shader_location,
+                            })
                         })
-                    })
-                    .collect::<napi::Result<Vec<_>>>()?;
-                vertex_buffers.push((buf.array_stride as u64, step_mode, attrs));
+                        .collect::<napi::Result<Vec<_>>>()?;
+                    vertex_buffers.push(Some((buf.array_stride as u64, step_mode, attrs)));
+                }
+                None => vertex_buffers.push(None),
             }
         }
     }
@@ -493,8 +512,12 @@ pub(crate) fn extract_render_args(desc: &GpuRenderPipelineDescriptor) -> napi::R
     let depth_stencil = if let Some(ref ds) = desc.depth_stencil {
         Some(wgpu::DepthStencilState {
             format: convert::texture_format(&ds.format)?,
-            depth_write_enabled: ds.depth_write_enabled.unwrap_or(false),
-            depth_compare: ds.depth_compare.as_deref().map(convert::compare_function).transpose()?.unwrap_or(wgpu::CompareFunction::Always),
+            // Both are `Option` in wgpu 30, matching the spec: "not provided"
+            // is distinct from `false`/`always`, and is what a depth-less
+            // (stencil-only) attachment wants. Pass the caller's intent through
+            // rather than inventing a default.
+            depth_write_enabled: ds.depth_write_enabled,
+            depth_compare: ds.depth_compare.as_deref().map(convert::compare_function).transpose()?,
             stencil: wgpu::StencilState {
                 front: stencil_face(&ds.stencil_front)?,
                 back: stencil_face(&ds.stencil_back)?,
@@ -562,12 +585,12 @@ pub(crate) fn extract_render_args(desc: &GpuRenderPipelineDescriptor) -> napi::R
 }
 
 pub(crate) fn build_render_from_args(device: &wgpu::Device, args: OwnedRenderArgs) -> GpuRenderPipeline {
-    let vert_buffers: Vec<wgpu::VertexBufferLayout<'_>> = args.vertex_buffers.iter()
-        .map(|(stride, step_mode, attrs)| wgpu::VertexBufferLayout {
+    let vert_buffers: Vec<Option<wgpu::VertexBufferLayout<'_>>> = args.vertex_buffers.iter()
+        .map(|slot| slot.as_ref().map(|(stride, step_mode, attrs)| wgpu::VertexBufferLayout {
             array_stride: *stride,
             step_mode: *step_mode,
             attributes: attrs.as_slice(),
-        })
+        }))
         .collect();
 
     let layout_ref = args.layout.as_deref();
@@ -592,7 +615,8 @@ pub(crate) fn build_render_from_args(device: &wgpu::Device, args: OwnedRenderArg
         depth_stencil: args.depth_stencil,
         multisample: args.multisample,
         fragment,
-        multiview: None,
+        // Multiview is configured per render pass in wgpu 30.
+        multiview_mask: None,
         cache: None,
     });
     GpuRenderPipeline::new(pipeline)
