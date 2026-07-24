@@ -177,6 +177,24 @@ Request and report now use the same name. Before wgpu 30 this limit was asked
 for as `maxPushConstantSize` and reported back as `maxImmediateSize`; if you
 hit the old name in existing code, that is what it became.
 
+In WGSL the block goes in the `immediate` address space (not `push_constant`,
+which no longer parses), and the byte size must be reserved on an **explicit**
+pipeline layout — `layout: "auto"` cannot declare one:
+
+```wgsl
+struct Immediates { color: vec4<f32> }
+var<immediate> pc: Immediates;
+```
+
+```ts
+const layout = device.createPipelineLayout({ bindGroupLayouts: [], immediateSize: 16 });
+const pipeline = device.createRenderPipeline({ layout, /* … */ });
+// …then per draw, no buffer and no bind group involved:
+pass.setImmediates(0, new Uint8Array(new Float32Array([1, 0, 0, 1]).buffer));
+```
+
+`offset` is a byte offset into that block, so several values can share it.
+
 ---
 
 ## 3. Frame loop
