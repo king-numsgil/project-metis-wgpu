@@ -3,6 +3,7 @@ use super::buffer::GpuBuffer;
 use super::convert;
 use super::pipeline::{GpuComputePipeline, GpuRenderPipeline};
 use super::query_set::GpuQuerySet;
+use super::render_bundle::GpuRenderBundle;
 use super::texture::{GpuTextureView, GpuImageCopyTexture, GpuImageCopyBuffer, GpuExtent3D};
 use napi::bindgen_prelude::Reference;
 use napi_derive::napi;
@@ -372,6 +373,25 @@ impl GpuRenderPassEncoder {
         let mut g = self.pass.lock().unwrap();
         g.as_mut().ok_or_else(|| napi::Error::new(napi::Status::GenericFailure, "RenderPass already ended"))?
             .write_timestamp(&query_set.inner, query_index);
+        Ok(())
+    }
+
+    /// Execute pre-recorded `GpuRenderBundle`s in order, as if their commands
+    /// had been issued here.
+    ///
+    /// A bundle's state (pipeline, bind groups, vertex/index buffers) is scoped
+    /// to the bundle: it neither inherits from nor leaks into this pass, so any
+    /// state the pass needs afterwards must be re-set. The bundles' formats and
+    /// sample count must match this pass's attachments.
+    #[napi]
+    pub fn execute_bundles(&self, bundles: Vec<Reference<GpuRenderBundle>>) -> napi::Result<()> {
+        let mut g = self.pass.lock().unwrap();
+        let pass = g.as_mut().ok_or_else(|| {
+            napi::Error::new(napi::Status::GenericFailure, "RenderPass already ended")
+        })?;
+        let held: Vec<Arc<wgpu::RenderBundle>> =
+            bundles.iter().map(|b| Arc::clone(&b.inner)).collect();
+        pass.execute_bundles(held.iter().map(|b| b.as_ref()));
         Ok(())
     }
 

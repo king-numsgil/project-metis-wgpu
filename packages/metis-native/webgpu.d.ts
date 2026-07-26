@@ -30,6 +30,18 @@ declare module "./index.js" {
     /** Iterate the feature names — `for (const f of device.features)`. */
     [Symbol.iterator](): IterableIterator<GPUFeatureName | GPUNativeFeatureName>;
   }
+  interface GpuShaderModuleDescriptor {
+    /**
+     * Accepted and ignored — a developer-tooling hint in the spec, which wgpu
+     * has no use for. Typed so spec-shaped descriptors compile.
+     */
+    sourceMap?: unknown;
+    /**
+     * Accepted and ignored — lets a spec implementation start compiling early
+     * for a known layout; wgpu compiles at pipeline creation regardless.
+     */
+    compilationHints?: unknown;
+  }
   interface GpuDevice {
     /** Register an `uncapturederror` listener (in addition to `onuncapturederror`). */
     addEventListener(

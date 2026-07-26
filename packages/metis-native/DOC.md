@@ -346,6 +346,30 @@ rules follow:
   converts each byte to a float. That mistake cost a real debugging session (see
   metis-engine CLAUDE.md).
 
+**Use-after-unmap is silent, not loud.** A detached range reads as
+`byteLength === 0`, and a typed-array view taken *before* the unmap also goes
+empty — reads give `undefined` and **writes are dropped without throwing**. So a
+stale writer loses data quietly rather than crashing; the detach is what stops it
+being a use-after-free instead. `getMappedRange()` on an unmapped buffer throws.
+
+**A write→read roundtrip needs two buffers.** The spec allows `MAP_READ` only
+with `COPY_DST`, and `MAP_WRITE` only with `COPY_SRC`, so no single buffer can be
+both (this binding rejects the combination). Write into a `MAP_WRITE` /
+`mappedAtCreation` buffer, `copyBufferToBuffer` into a `MAP_READ` one, and map
+that:
+
+```ts
+const src = device.createBuffer({ size, usage: GPUBufferUsage.COPY_SRC, mappedAtCreation: true });
+new Uint8Array(src.getMappedRange()).set(bytes);
+src.unmap();                                   // flushes the write
+encoder.copyBufferToBuffer(src, 0, dst, 0, size);   // dst: COPY_DST | MAP_READ
+```
+
+**`mapState`** reports all three spec values — `"unmapped"`, `"pending"`,
+`"mapped"` — and flips to `"pending"` *synchronously*, before `mapAsync`'s
+promise settles. Calling `mapAsync` on an already-mapped or pending buffer
+throws.
+
 To copy a texture out, it needs `GPUTextureUsage.COPY_SRC`, and
 `copyTextureToBuffer` requires `bytesPerRow` to be a multiple of 256.
 Surface formats (`bgra8unorm-srgb`) can't be read back — render to a separate
@@ -460,6 +484,44 @@ encoder.pushDebugGroup("shadow");   // visible in RenderDoc / PIX / Nsight
 pass.insertDebugMarker("draw-hull");
 encoder.popDebugGroup();
 ```
+
+---
+
+## 6b. Render bundles
+
+Record a sequence of render commands once, then replay it in any number of
+passes — the encode-time saving is the point, so reach for it when the same
+draws are re-issued every frame.
+
+```ts
+const bundleEnc = device.createRenderBundleEncoder({
+  colorFormats: [format],           // must match the executing pass
+  depthStencilFormat: "depth32float",   // ...as must this, and sampleCount
+});
+bundleEnc.setPipeline(pipeline);
+bundleEnc.setBindGroup(0, bindGroup);
+bundleEnc.setVertexBuffer(0, vbo);
+bundleEnc.setIndexBuffer(ibo, "uint32");
+bundleEnc.drawIndexed(indexCount);
+const bundle = bundleEnc.finish({ label: "hull" });   // encoder is spent
+
+// later, in any pass with a matching layout:
+pass.executeBundles([bundle]);
+```
+
+- **Bundle state is scoped to the bundle.** It doesn't inherit pipeline/bind
+  groups from the pass, and doesn't leak back out — re-set anything the pass
+  needs afterwards.
+- **The layout must match the pass** (`colorFormats`, `depthStencilFormat`,
+  `sampleCount`), or executing it is a validation error.
+- **`finish()` may only be called once**; recording afterwards throws.
+- **A layout with no attachments is rejected up front** (`colorFormats: []`, or
+  all-`null` with no `depthStencilFormat`) — wgpu *panics* on that, which would
+  abort the process, so the binding throws instead.
+- Commands are limited to the spec's `GPURenderCommandsMixin`
+  (pipeline / bind groups / vertex+index buffers / `draw*` / `setImmediates`).
+  **Debug groups are not available inside a bundle** — wgpu 30's bundle encoder
+  doesn't expose them, though the spec has them; use them on the pass instead.
 
 ---
 

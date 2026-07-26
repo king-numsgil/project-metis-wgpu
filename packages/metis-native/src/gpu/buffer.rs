@@ -34,6 +34,15 @@ struct MappedRanges(Vec<HandedRange>);
 unsafe impl Send for MappedRanges {}
 unsafe impl Sync for MappedRanges {}
 
+/// The spec's three `GPUBufferMapState` values. `Pending` is entered
+/// *synchronously* by `mapAsync` (see there) so JS can observe it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MapState {
+    Unmapped,
+    Pending,
+    Mapped,
+}
+
 #[napi]
 pub struct GpuBuffer {
     pub(crate) inner: Arc<wgpu::Buffer>,
@@ -41,7 +50,9 @@ pub struct GpuBuffer {
     pub(crate) size: u64,
     pub(crate) usage: u32,
     label: Mutex<Option<String>>,
-    mapped: Mutex<bool>,
+    /// Shared with the in-flight `mapAsync` future, which resolves it to
+    /// `Mapped` or back to `Unmapped` once the mapping settles.
+    map_state: Arc<Mutex<MapState>>,
     mapped_ranges: Mutex<MappedRanges>,
 }
 
@@ -53,7 +64,11 @@ impl GpuBuffer {
             size,
             usage,
             label: Mutex::new(label),
-            mapped: Mutex::new(mapped_at_creation),
+            map_state: Arc::new(Mutex::new(if mapped_at_creation {
+                MapState::Mapped
+            } else {
+                MapState::Unmapped
+            })),
             mapped_ranges: Mutex::new(MappedRanges(Vec::new())),
         }
     }
@@ -105,11 +120,15 @@ impl GpuBuffer {
     #[napi(setter)]
     pub fn set_label(&self, label: String) { *self.label.lock().unwrap() = Some(label); }
 
-    /// Current map state: `"mapped"` or `"unmapped"`. (The transient
-    /// `"pending"` state the spec defines is not surfaced separately here.)
-    #[napi(getter)]
+    /// Current map state — the spec's three values: `"unmapped"`, `"pending"`
+    /// (a `mapAsync` is in flight) or `"mapped"`.
+    #[napi(getter, ts_return_type = "'unmapped' | 'pending' | 'mapped'")]
     pub fn map_state(&self) -> String {
-        if *self.mapped.lock().unwrap() { "mapped".into() } else { "unmapped".into() }
+        match *self.map_state.lock().unwrap() {
+            MapState::Unmapped => "unmapped".into(),
+            MapState::Pending => "pending".into(),
+            MapState::Mapped => "mapped".into(),
+        }
     }
 
     /// Map the buffer for CPU access and resolve once the mapping is ready.
@@ -120,8 +139,23 @@ impl GpuBuffer {
     /// device poll internally, so the returned promise settling means the range
     /// is ready for `getMappedRange`. Call `unmap()` before using the buffer on
     /// the GPU again.
-    #[napi]
-    pub async fn map_async(&self, mode: u32, offset: Option<f64>, size: Option<f64>) -> napi::Result<()> {
+    ///
+    /// `mapState` becomes `"pending"` **synchronously**, before this returns,
+    /// and `"mapped"` (or back to `"unmapped"` on failure) when the promise
+    /// settles. Mapping an already-mapped or already-pending buffer rejects.
+    // Deliberately not an `async fn`: napi would run the whole body on a tokio
+    // worker, so the `"pending"` transition — which the spec requires to be
+    // observable immediately after the call — would land too late. The state is
+    // therefore flipped here, synchronously on the JS thread, and only the
+    // waiting half goes to the runtime. Same reasoning as `popErrorScope`.
+    #[napi(ts_return_type = "Promise<void>")]
+    pub fn map_async<'env>(
+        &self,
+        env: &'env Env,
+        mode: u32,
+        offset: Option<f64>,
+        size: Option<f64>,
+    ) -> napi::Result<PromiseRaw<'env, ()>> {
         let offset = offset.unwrap_or(0.0) as u64;
         let end = size.map_or(self.size, |s| offset + s as u64);
         let map_mode = if mode & 0x0001 != 0 {
@@ -132,6 +166,17 @@ impl GpuBuffer {
             return Err(napi::Error::new(napi::Status::InvalidArg, "GPUMapMode must be READ (1) or WRITE (2)"));
         };
 
+        {
+            let mut st = self.map_state.lock().unwrap();
+            if *st != MapState::Unmapped {
+                return Err(napi::Error::new(
+                    napi::Status::GenericFailure,
+                    "mapAsync() on a buffer that is already mapped or has a mapping pending",
+                ));
+            }
+            *st = MapState::Pending;
+        }
+
         let (tx, rx) = tokio::sync::oneshot::channel::<std::result::Result<(), String>>();
         self.inner.slice(offset..end).map_async(map_mode, move |r| {
             let result: std::result::Result<(), String> = r.map_err(|e| format!("{e:?}"));
@@ -139,22 +184,29 @@ impl GpuBuffer {
         });
 
         let device = Arc::clone(&self.device);
-        // `poll` returns a Result as of wgpu 25. Dropping it would turn a lost
-        // device or a timed-out wait into a hang on the channel below, or a
-        // bare "channel closed" that names neither cause.
-        tokio::task::spawn_blocking(move || device.poll(wgpu::PollType::wait_indefinitely()))
-            .await
-            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?
-            .map_err(map_err_display)?;
+        let state = Arc::clone(&self.map_state);
+        env.spawn_future(async move {
+            // `poll` returns a Result as of wgpu 25. Dropping it would turn a
+            // lost device or a timed-out wait into a hang on the channel below,
+            // or a bare "channel closed" that names neither cause.
+            let polled = tokio::task::spawn_blocking(move || device.poll(wgpu::PollType::wait_indefinitely()))
+                .await
+                .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))
+                .and_then(|r| r.map_err(map_err_display));
 
-        let map_result: std::result::Result<(), String> = rx.await
-            .map_err(|_| napi::Error::new(napi::Status::GenericFailure, "mapping channel closed"))?;
-        if let Err(msg) = map_result {
-            return Err(napi::Error::new(napi::Status::GenericFailure, msg));
-        }
+            let settled: napi::Result<()> = match polled {
+                Err(e) => Err(e),
+                Ok(_) => match rx.await {
+                    Err(_) => Err(napi::Error::new(napi::Status::GenericFailure, "mapping channel closed")),
+                    Ok(Err(msg)) => Err(napi::Error::new(napi::Status::GenericFailure, msg)),
+                    Ok(Ok(())) => Ok(()),
+                },
+            };
 
-        *self.mapped.lock().unwrap() = true;
-        Ok(())
+            // A failed mapping must not leave the buffer stuck in `"pending"`.
+            *state.lock().unwrap() = if settled.is_ok() { MapState::Mapped } else { MapState::Unmapped };
+            settled
+        })
     }
 
     /// Return an `ArrayBuffer` that **aliases** the mapped memory directly — no
@@ -174,7 +226,7 @@ impl GpuBuffer {
     /// coherent — write-mapped ranges are meant to be written, not read.)
     #[napi(ts_return_type = "ArrayBuffer")]
     pub fn get_mapped_range<'env>(&self, env: &'env Env, offset: Option<f64>, size: Option<f64>) -> napi::Result<Unknown<'env>> {
-        if !*self.mapped.lock().unwrap() {
+        if *self.map_state.lock().unwrap() != MapState::Mapped {
             return Err(napi::Error::new(napi::Status::GenericFailure, "Buffer is not mapped"));
         }
         let offset = offset.unwrap_or(0.0) as u64;
@@ -214,7 +266,7 @@ impl GpuBuffer {
     pub fn unmap(&self, env: &Env) -> napi::Result<()> {
         self.detach_all(env);
         self.inner.unmap();
-        *self.mapped.lock().unwrap() = false;
+        *self.map_state.lock().unwrap() = MapState::Unmapped;
         Ok(())
     }
 
@@ -224,6 +276,6 @@ impl GpuBuffer {
     pub fn destroy(&self, env: &Env) {
         self.detach_all(env);
         self.inner.destroy();
-        *self.mapped.lock().unwrap() = false;
+        *self.map_state.lock().unwrap() = MapState::Unmapped;
     }
 }

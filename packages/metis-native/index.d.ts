@@ -273,10 +273,10 @@ export declare class GpuBuffer {
   get label(): string | null
   set label(label: string)
   /**
-   * Current map state: `"mapped"` or `"unmapped"`. (The transient
-   * `"pending"` state the spec defines is not surfaced separately here.)
+   * Current map state — the spec's three values: `"unmapped"`, `"pending"`
+   * (a `mapAsync` is in flight) or `"mapped"`.
    */
-  get mapState(): string
+  get mapState(): 'unmapped' | 'pending' | 'mapped'
   /**
    * Map the buffer for CPU access and resolve once the mapping is ready.
    *
@@ -286,6 +286,10 @@ export declare class GpuBuffer {
    * device poll internally, so the returned promise settling means the range
    * is ready for `getMappedRange`. Call `unmap()` before using the buffer on
    * the GPU again.
+   *
+   * `mapState` becomes `"pending"` **synchronously**, before this returns,
+   * and `"mapped"` (or back to `"unmapped"` on failure) when the promise
+   * settles. Mapping an already-mapped or already-pending buffer rejects.
    */
   mapAsync(mode: number, offset?: number | undefined | null, size?: number | undefined | null): Promise<void>
   /**
@@ -621,6 +625,15 @@ export declare class GpuDevice {
    */
   createCommandEncoder(descriptor?: GpuCommandEncoderDescriptor | undefined | null): GpuCommandEncoder
   /**
+   * Create a `GpuRenderBundleEncoder` for recording a reusable sequence of
+   * render commands.
+   *
+   * `colorFormats` / `depthStencilFormat` / `sampleCount` describe the render
+   * pass the bundle will be executed in and must match it, since the bundle
+   * is compiled against them.
+   */
+  createRenderBundleEncoder(descriptor: GpuRenderBundleEncoderDescriptor): GpuRenderBundleEncoder
+  /**
    * Create a `GpuQuerySet` of `count` slots for `"occlusion"` or
    * `"timestamp"` queries. Timestamp queries need the `timestamp-query`
    * feature.
@@ -739,6 +752,54 @@ export declare class GpuQueue {
 }
 
 /**
+ * A finished, immutable render bundle. Execute it (repeatedly, in any number of
+ * passes) with `renderPass.executeBundles([bundle])`.
+ */
+export declare class GpuRenderBundle {
+  /** Debug label (read-write). */
+  get label(): string | null
+  set label(label: string)
+}
+
+/**
+ * Records a reusable sequence of render commands, created by
+ * `device.createRenderBundleEncoder(descriptor)`.
+ *
+ * The command subset is the spec's `GPURenderCommandsMixin` — pipeline, bind
+ * groups, vertex/index buffers and the `draw*` family. State set inside a
+ * bundle does **not** leak into the pass that executes it, and vice versa.
+ *
+ * Call `finish()` once to produce a `GpuRenderBundle`; the encoder is spent
+ * afterwards.
+ */
+export declare class GpuRenderBundleEncoder {
+  /** Set the render pipeline used by subsequent `draw*` calls. */
+  setPipeline(pipeline: GpuRenderPipeline): void
+  /** Bind a `GpuBindGroup` (or `null` to clear the slot) at group `index`. */
+  setBindGroup(index: number, bindGroup?: GpuBindGroup | undefined | null, dynamicOffsets?: Array<number> | undefined | null): void
+  /** Bind `buffer` as the vertex buffer for `slot`. */
+  setVertexBuffer(slot: number, buffer: GpuBuffer, offset?: number | undefined | null, size?: number | undefined | null): void
+  /** Bind the index buffer used by `drawIndexed` / `drawIndexedIndirect`. */
+  setIndexBuffer(buffer: GpuBuffer, indexFormat: GPUIndexFormat, offset?: number | undefined | null, size?: number | undefined | null): void
+  /** Draw `vertexCount` vertices in `instanceCount` instances (default 1). */
+  draw(vertexCount: number, instanceCount?: number | undefined | null, firstVertex?: number | undefined | null, firstInstance?: number | undefined | null): void
+  /** Draw using the bound index buffer. */
+  drawIndexed(indexCount: number, instanceCount?: number | undefined | null, firstIndex?: number | undefined | null, baseVertex?: number | undefined | null, firstInstance?: number | undefined | null): void
+  /** Like `draw`, with parameters read from `indirectBuffer` (needs `INDIRECT`). */
+  drawIndirect(indirectBuffer: GpuBuffer, indirectOffset: number): void
+  /** Like `drawIndexed`, with parameters read from `indirectBuffer`. */
+  drawIndexedIndirect(indirectBuffer: GpuBuffer, indirectOffset: number): void
+  /** Upload immediate (push-constant) data. Requires the `immediates` feature. */
+  setImmediates(offset: number, data: Uint8Array): void
+  /**
+   * Replay the recorded commands into a real wgpu bundle encoder and return
+   * the finished `GpuRenderBundle`. The encoder is spent — further calls,
+   * including a second `finish()`, are an error.
+   */
+  finish(descriptor?: GpuRenderBundleDescriptor | undefined | null): GpuRenderBundle
+}
+
+/**
  * Records the draw commands of a single render pass. Created by
  * `commandEncoder.beginRenderPass(descriptor)`, which binds the pass's colour
  * and depth/stencil attachments.
@@ -851,6 +912,16 @@ export declare class GpuRenderPassEncoder {
    * `adapter.features.has("timestamp-query-inside-passes")`.
    */
   writeTimestamp(querySet: GpuQuerySet, queryIndex: number): void
+  /**
+   * Execute pre-recorded `GpuRenderBundle`s in order, as if their commands
+   * had been issued here.
+   *
+   * A bundle's state (pipeline, bind groups, vertex/index buffers) is scoped
+   * to the bundle: it neither inherits from nor leaks into this pass, so any
+   * state the pass needs afterwards must be re-set. The bundles' formats and
+   * sample count must match this pass's attachments.
+   */
+  executeBundles(bundles: Array<GpuRenderBundle>): void
   /**
    * Finish the render pass and release the parent `GpuCommandEncoder` for
    * further recording. No other method on this pass may be called afterwards.
@@ -1584,6 +1655,27 @@ export interface GpuQueueDescriptor {
   label?: string
 }
 
+export interface GpuRenderBundleDescriptor {
+  label?: string
+}
+
+export interface GpuRenderBundleEncoderDescriptor {
+  label?: string
+  /**
+   * Formats of the colour attachments this bundle will be executed against.
+   * Must match the render pass that executes it. `null` marks an unused slot.
+   */
+  colorFormats: Array<GPUTextureFormat | undefined | null>
+  /** Format of the depth/stencil attachment, if the target pass has one. */
+  depthStencilFormat?: GPUTextureFormat
+  /** Sample count of the target pass. Defaults to 1. */
+  sampleCount?: number
+  /** Set when the executing pass's depth attachment is read-only. */
+  depthReadOnly?: boolean
+  /** Set when the executing pass's stencil attachment is read-only. */
+  stencilReadOnly?: boolean
+}
+
 export interface GpuRenderPassColorAttachment {
   view: GpuTextureView
   resolveTarget?: GpuTextureView
@@ -1702,6 +1794,15 @@ export interface GpuSamplerDescriptor {
 
 export interface GpuShaderModuleDescriptor {
   label?: string
+  /**
+   * WGSL source. This binding takes WGSL only — there is no SPIR-V or GLSL
+   * entry point.
+   *
+   * The spec's optional `sourceMap` / `compilationHints` may also be passed:
+   * undeclared properties are ignored here, and `webgpu.d.ts` types them so
+   * spec-shaped descriptors compile. Neither affects compilation — wgpu has
+   * no use for either.
+   */
   code: string
 }
 

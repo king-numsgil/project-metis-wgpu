@@ -10,6 +10,7 @@ mod instance;
 mod pipeline;
 mod query_set;
 mod queue;
+mod render_bundle;
 mod sampler;
 mod shader;
 mod surface;
@@ -26,6 +27,7 @@ pub use instance::{enumerate_adapters,request_adapter, request_adapter_for_windo
 pub use pipeline::{GpuComputePipeline, GpuRenderPipeline};
 pub use query_set::GpuQuerySet;
 pub use queue::GpuQueue;
+pub use render_bundle::{GpuRenderBundle, GpuRenderBundleEncoder};
 pub use sampler::GpuSampler;
 pub use shader::GpuShaderModule;
 pub use supported_features::GpuSupportedFeatures;

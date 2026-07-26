@@ -6,6 +6,7 @@ use super::pipeline::{GpuComputePipeline, GpuComputePipelineDescriptor, GpuRende
 use super::error::with_validation_scope;
 use super::query_set::{GpuQuerySet, GpuQuerySetDescriptor};
 use super::queue::GpuQueue;
+use super::render_bundle::{GpuRenderBundleEncoder, GpuRenderBundleEncoderDescriptor};
 use super::sampler::{GpuSampler, GpuSamplerDescriptor};
 use super::shader::{GpuShaderModule, GpuShaderModuleDescriptor};
 use super::supported_features::GpuSupportedFeatures;
@@ -427,6 +428,20 @@ impl GpuDevice {
             label: label.as_deref(),
         });
         GpuCommandEncoder::new(encoder, label)
+    }
+
+    /// Create a `GpuRenderBundleEncoder` for recording a reusable sequence of
+    /// render commands.
+    ///
+    /// `colorFormats` / `depthStencilFormat` / `sampleCount` describe the render
+    /// pass the bundle will be executed in and must match it, since the bundle
+    /// is compiled against them.
+    #[napi]
+    pub fn create_render_bundle_encoder(
+        &self,
+        descriptor: GpuRenderBundleEncoderDescriptor,
+    ) -> napi::Result<GpuRenderBundleEncoder> {
+        GpuRenderBundleEncoder::new(Arc::clone(&self.inner), descriptor)
     }
 
     /// Create a `GpuQuerySet` of `count` slots for `"occlusion"` or

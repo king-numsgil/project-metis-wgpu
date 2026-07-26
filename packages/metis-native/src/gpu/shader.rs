@@ -4,6 +4,13 @@ use std::sync::{Arc, Mutex};
 #[napi(object)]
 pub struct GpuShaderModuleDescriptor {
     pub label: Option<String>,
+    /// WGSL source. This binding takes WGSL only — there is no SPIR-V or GLSL
+    /// entry point.
+    ///
+    /// The spec's optional `sourceMap` / `compilationHints` may also be passed:
+    /// undeclared properties are ignored here, and `webgpu.d.ts` types them so
+    /// spec-shaped descriptors compile. Neither affects compilation — wgpu has
+    /// no use for either.
     pub code: String,
 }
 

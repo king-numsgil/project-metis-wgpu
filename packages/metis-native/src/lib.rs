@@ -64,6 +64,7 @@ pub use gpu::{enumerate_adapters, request_adapter, request_adapter_for_window};
 pub use gpu::{GpuComputePipeline, GpuRenderPipeline};
 pub use gpu::GpuQuerySet;
 pub use gpu::GpuQueue;
+pub use gpu::{GpuRenderBundle, GpuRenderBundleEncoder};
 pub use gpu::GpuSampler;
 pub use gpu::GpuShaderModule;
 pub use gpu::{GpuTexture, GpuTextureView};

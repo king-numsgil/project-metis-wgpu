@@ -372,6 +372,62 @@ Consumers that keep data past `unmap()` must **copy out first** (`raw.slice(0)`)
 because the range detaches — the old copy-returning version let a stale
 `Uint8Array` survive unmap, this one does not. See `DOC.md` §4.
 
+**Mutation-checked, and the two halves of `detach_all` fail differently** —
+worth knowing, because it shows neither is redundant:
+
+- Skip the **whole** function and *wgpu* panics on unmap ("You cannot unmap a
+  buffer that still has accessible mapped views") — it tracks outstanding
+  `BufferView`s. So dropping the view is what satisfies wgpu.
+- Skip **only the JS detach** (still dropping the view) and the suite fails
+  cleanly on 5 tests, one of which reads back **99 from a write made after
+  unmap** — a live use-after-free into unmapped GPU memory. So the detach is
+  what makes it safe for JS.
+
+`tests/buffer-mapping.test.ts` pins both, plus the roundtrips and `mapState`.
+
+**`mapAsync` is deliberately not an `async fn`**, for the same reason
+`popErrorScope` isn't: napi runs an `async fn` body on a tokio worker, so the
+spec-required `mapState === "pending"` transition would land *after* the call
+returned and JS could observe `"unmapped"` for a mapping already in flight. The
+state is flipped synchronously on the JS thread and only the waiting half goes to
+`env.spawn_future`. A failed mapping resets it to `"unmapped"` rather than
+stranding the buffer in `"pending"`.
+
+### Render bundles: a third answer to "wgpu handed us a `!Send` type"
+
+`RenderBundleEncoder<'a>` is **`!Send + !Sync`** (wgpu asserts it — it's an
+allocation on the recording thread), and napi requires a `#[napi]` class to be
+`Send`. That's the same wall the error-scope guard hit, but the resolution is
+different and simpler, and the three cases together are worth comparing:
+
+| `!Send` thing | resolution |
+|---|---|
+| `ErrorScopeGuard` | park it in a thread-local keyed by device (`ERROR_SCOPES`) |
+| `RenderPass` | `Box` the encoder for a stable address + erase the lifetime |
+| `RenderBundleEncoder` | **don't hold it at all** — buffer the commands |
+
+`GpuRenderBundleEncoder` records into a `Vec<BundleCommand>` holding only `Arc`
+handles (`Send + Sync`), and `finish()` creates the real wgpu encoder, replays
+the list, and consumes it — all inside one synchronous napi call, so nothing
+`!Send` ever outlives a method. No thread-local, no `unsafe`, no lifetime
+erasure. The finished `wgpu::RenderBundle` *is* `Send + Sync`, so
+`GpuRenderBundle` holds it directly.
+
+Prefer this shape when it's available: it's the only one of the three with no
+soundness argument to maintain.
+
+**An attachment-less layout is rejected in `new()`, deliberately.** wgpu
+*panics* inside `finish()` on `colorFormats: []` (or all-`null`) with no
+depth-stencil — "Render bundle encoder has already ended", which is a confusing
+message for the actual cause — and a panic across the napi boundary aborts the
+process rather than throwing. Found by a test that expected the empty case to
+be accepted; it took the runner down instead. Same rule as the VectorContext
+lyon panics: **validate CPU-side rather than letting wgpu panic.**
+
+**Debug groups are absent from bundles because wgpu 30 doesn't expose them** on
+`RenderBundleEncoder` (the spec's `GPUDebugCommandsMixin` does include them).
+Not an oversight; don't "add" them without checking wgpu gained them.
+
 ### `webgpu.js` — a JS compat layer for the spec shapes napi can't express
 
 The package's public entry is **`webgpu.js`** (hand-written), not the
