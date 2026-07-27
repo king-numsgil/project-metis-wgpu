@@ -212,6 +212,7 @@ buf.get(): [x,y,…];  buf.set([x,y,…]): void;  buf.at(i): ScalarMemoryBuffer<
 
 // MatMemoryBuffer<S,N>      — column-addressed
 buf.at(col): VecMemoryBuffer<S,N>;  buf.get(col): [..];  buf.set(col, [..]): void
+buf.columnElements: number;  // stride between columns in view() elements
 
 // ArrayMemoryBuffer<Item,N>
 buf.at(i): DescriptorToMemoryBuffer<Item>;  buf.view();  for (const el of buf) { … }
@@ -227,6 +228,44 @@ is the plain-value shape a `set()` accepts (numbers/tuples/nested objects).
 
 Vec buffers also expose `getComponent(i)` / `setComponent(i, v)` — single-component
 read/write with no tuple allocation.
+
+### Allocation — what costs what
+
+Know this before putting any of it in a per-frame loop:
+
+| Call | Allocates |
+|---|---|
+| `getComponent(i)` / `setComponent(i, v)` | **nothing** — hits a cached view |
+| `view()` (vec and mat) | **nothing** — cached at construction |
+| `get()` / `get(col)` | a fresh tuple array, every call |
+| `set([…])` / `set(col, […])` | the array literal you pass |
+| `at(i)` / `get(name)` | a fresh sub-buffer object |
+| `allocate(desc)` | a fresh `ArrayBuffer` |
+| `wrap(desc, buf, off)` | a fresh view object (no copy of the bytes) |
+
+`MatMemoryBuffer.columnElements` is the stride between columns **in `view()`
+elements, not bytes** — component (col, row) is `view()[col * columnElements +
+row]`. It is not always N: a Std140 `Mat3` pads its columns to 4 elements. Use it
+with `view()` for allocation-free matrix walking.
+
+**The math ops are not uniformly allocation-free — check which layer you're on:**
+
+| Layer | State |
+|---|---|
+| `Vec2`, `Vec3`, `Vec4` | every op **allocation-free** and view-based |
+| `Mat4.multiply`/`invert`, `Mat3.multiply`, `Quat.multiply` | rewritten view-based — the hot ops |
+| the remaining `Mat*`/`Quat` ops | still `get()`/`set()`-based, but each column access now costs one tuple rather than a tuple *plus* a throwaway sub-buffer |
+
+Every producing op — rewritten or not — is safe when `out` aliases an input.
+
+All of them are out-first, so none allocates the *result*; the difference is the
+per-call tuple churn. **`bun run bench/mathAlloc.ts` is the live answer** — it
+races each op against an open-coded equivalent and labels it `at parity` or
+`NOT YET REWRITTEN`, on your machine rather than someone else's.
+
+Only `create`/`clone` allocate by contract (they mint the buffer). If you need a
+genuinely allocation-free inner loop over a matrix today, work through `view()` +
+`columnElements` directly.
 
 **Performance note.** These buffers are a *convenience* API over **GPU-layout
 (AoS) data** — for packing and uploading, and for access that isn't a per-frame
@@ -259,6 +298,34 @@ Vec3.distance/distanceSquared(a, b): number
 Vec3.normalize(out, v);  Vec3.equals(a, b): boolean
 Vec3.transformQuat(out, v, q)      // Vec3 only
 ```
+
+### Transforms (allocation-free)
+
+```ts
+Vec3.transformMat4(out, v, m4)            // POINT: m * vec4(v,1), divided by w
+Vec3.transformMat3(out, v, m3)            // DIRECTION: linear map, no translation
+Vec3.transformMat4Upper3x3(out, v, m4)    // DIRECTION: m4's upper 3x3
+Vec4.transformMat4(out, v, m4)            // raw homogeneous, NO w divide
+Vec2.transformMat3(out, v, m3)            // 2D point (translation applies)
+Vec2.transformMat2(out, v, m2)            // 2D direction
+```
+
+Point vs. direction is the distinction to get right: `Vec3.transformMat4` applies
+the translation column and divides by `w`; the direction forms do neither.
+Passing a normal through the point form silently adds the translation.
+
+`Vec3.transformMat4`'s `w` divide is what makes it correct through a projection
+(unprojecting a frustum corner needs it). Through an affine view/model matrix `w`
+is 1 and the divide is a no-op, so it's also the right call for world→view. A
+`w` of exactly 0 is treated as 1 rather than yielding `Infinity`.
+
+`Vec4.transformMat4` deliberately leaves `w` undivided — for clip-space positions
+and plane equations, where the `w` is the answer.
+
+**Normals need the inverse-transpose** of the model's upper 3x3, not the linear
+part. `Vec3.transformMat3` applies whatever you hand it; computing the right
+matrix is the caller's job (`Mat4.getLinearTransform` then `Mat3.invert` +
+`Mat3.transpose`).
 
 ### Quat (`VecMemoryBuffer<S,4>`, XYZW)
 

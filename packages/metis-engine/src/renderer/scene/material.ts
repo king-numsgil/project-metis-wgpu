@@ -7,7 +7,7 @@ import {
     type GpuTextureView,
 } from "metis-native";
 import { getMaterialDefaults } from "../assets/texture.ts";
-import { Std140Writer } from "../shading/std140.ts";
+import { MaterialUniforms, stage } from "../shading/gpuLayouts.ts";
 
 /** Constructor parameters for {@link Material}. Every field is optional; the defaults are a plain white dielectric. */
 export interface MaterialParams {
@@ -56,6 +56,13 @@ export class Material {
 
     private buffer: GpuBuffer | null = null;
     private bindGroup: GpuBindGroup | null = null;
+    /** Per-material CPU staging, created with the GPU buffer on first use. */
+    private staging: {
+        bytes: Uint8Array;
+        baseColor: Float32Array;
+        metallicRoughness: Float32Array;
+        emissive: Float32Array;
+    } | null = null;
 
     constructor(params?: MaterialParams) {
         this.baseColor = params?.baseColor ?? [1, 1, 1, 1];
@@ -71,17 +78,18 @@ export class Material {
 
     /** Uploads current factors and returns a bind group for group(1) of the forward pipeline. Cheap to call every frame. */
     getBindGroup(device: GpuDevice, layout: GpuBindGroupLayout): GpuBindGroup {
-        const w = new Std140Writer();
-        w.vec4(this.baseColor[0], this.baseColor[1], this.baseColor[2], this.baseColor[3]);
-        w.vec4(this.metallic, this.roughness, 0, 0);
-        w.vec3(this.emissive);
-        const bytes = w.toBytes();
-
-        if (!this.buffer) {
+        if (!this.staging) {
+            const s = stage(MaterialUniforms);
+            this.staging = {
+                bytes: s.bytes,
+                baseColor: s.f32("baseColor", 4),
+                metallicRoughness: s.f32("metallicRoughness", 4),
+                emissive: s.f32("emissive", 3),
+            };
             const defaults = getMaterialDefaults(device);
             this.buffer = device.createBuffer({
                 label: "metis-engine/material",
-                size: bytes.byteLength,
+                size: MaterialUniforms.byteSize,
                 usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
             });
             this.bindGroup = device.createBindGroup({
@@ -99,7 +107,13 @@ export class Material {
             });
         }
 
-        device.queue.writeBuffer(this.buffer, 0, bytes);
+        const s = this.staging;
+        s.baseColor.set(this.baseColor);
+        s.metallicRoughness[0] = this.metallic;
+        s.metallicRoughness[1] = this.roughness;
+        s.emissive.set(this.emissive);
+
+        device.queue.writeBuffer(this.buffer!, 0, s.bytes);
         return this.bindGroup!;
     }
 
@@ -112,5 +126,6 @@ export class Material {
         this.buffer?.destroy();
         this.buffer = null;
         this.bindGroup = null;
+        this.staging = null;
     }
 }

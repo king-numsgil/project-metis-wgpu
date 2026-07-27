@@ -28,13 +28,37 @@ don't have to read a dozen source files to recall an API. Fall back to source
 only when the doc doesn't cover what you need, or when the task hinges on an
 exact signature (for `metis-native`, prefer `index.d.ts` over the doc).
 
-**Keep them current.** If you change a public API — an exported symbol's
-signature, a config constant's value or meaning, a required call order, or a
-documented invariant — update that package's `DOC.md` **in the same change**. A
-stale doc is worse than none, because it will be trusted.
+### Keeping the docs current is not optional
 
-`CLAUDE.md` explains *why* (architecture, rationale, debugging history);
-`DOC.md` explains *what to call*. Keep that split.
+**Every change updates the affected package's `DOC.md` and `CLAUDE.md` in the
+same change. No exceptions, no "I'll do it after", no "it's a small change".**
+
+This is a hard rule, and it is the one most likely to be quietly skipped, because
+the code works either way and nothing fails when a doc rots. That is exactly why
+it needs stating: a stale doc is worse than no doc, because it will be *trusted*
+— by the next session, by a subagent that reads it instead of the source, and by
+the human who wrote neither. Real damage already caused by exactly this:
+`metis-data`'s `CLAUDE.md` went on describing the ECS as its main consumer for
+long after the ECS had dropped it, and would have justified optimizing that
+package for a workload it no longer has.
+
+Concretely, when a change touches any of these, the docs move with it:
+
+- an exported symbol appearing, disappearing, or changing signature;
+- a config constant's value or meaning;
+- a required call order, ownership rule, or teardown order;
+- a documented invariant, or a *reason* one exists;
+- a dependency added or dropped;
+- an architectural decision, including ones deliberately **declined** — record
+  the "we measured this and rejected it" so it isn't re-litigated.
+
+Which file gets the edit: `CLAUDE.md` explains *why* (architecture, rationale,
+debugging history, roads not taken); `DOC.md` explains *what to call*
+(signatures, recipes, invariants). Keep that split — don't duplicate war stories
+into `DOC.md`, don't grow an API listing in `CLAUDE.md`.
+
+If a change makes a doc statement false and you are not fixing it in that change,
+you are not done with that change.
 
 ## Commands
 

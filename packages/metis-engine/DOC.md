@@ -542,15 +542,49 @@ Z-slicing is exponential (Doom 2016): slice `z` spans view depth
 `[zNear·(zFar/zNear)^(z/countZ), …^((z+1)/countZ))`. The fragment-side lookup in
 `common.wgsl` is its exact algebraic inverse.
 
-### `Std140Writer`
+### GPU struct layouts (`gpuLayouts.ts`)
 
-Hand-rolled uniform/storage packing. `vec3` pads to 16 bytes and the `w` argument
-fills that padding slot (so `{ vec3, f32 }` is 16 bytes, not 32). `mat4` = 4 vec4
-columns; `mat3` = 3 padded columns.
+**`Std140Writer` is gone.** Every uniform and storage struct the renderer uploads
+is now a `metis-data` descriptor in `shading/gpuLayouts.ts` — the TypeScript half
+of `wgsl/common.wgsl`, in one file so the two can actually be diffed against each
+other.
 
 ```ts
-new Std140Writer().mat4(m).vec3(v, w).vec4(x,y,z,w).vec4u(x,y,z,w).f32(x).u32(x).vec2(x,y).mat3(m).toBytes(): Uint8Array
+import { CameraUniforms, GpuLight, GpuLightArray, stage, stageArray } from "metis-engine/renderer";
+
+CameraUniforms.byteSize        // 144 — derived, not a magic number
+GpuLight.byteSize              // 64, and exactly full (no room for a shadow index)
+GpuLight.offsets               // { worldPosition: 0, range: 12, viewPosition: 16, … }
 ```
+
+Descriptors exported: `CameraUniforms`, `EnvironmentUniforms`, `ModelUniforms`,
+`MaterialUniforms`, `ClusterParams`, `GpuLight`, `GpuLightArray`,
+`CascadeUniforms`, `SpotShadowUniforms`, `AoUniforms`, `LuminanceParams`,
+`AutoExposureParams`, `VectorTextFrame`, plus `SHADOW_RENDER_STRIDE`.
+
+To pack a buffer for a pass of your own:
+
+```ts
+const s = stage(CameraUniforms);          // once, at construction
+const viewProj = s.f32("viewProj", 16);   // typed view at the descriptor's offset
+// … per frame:
+viewProj.set(camera.viewProjectionMatrix());
+device.queue.writeBuffer(gpuBuffer, 0, s.bytes);
+```
+
+`stage()` allocates the backing `ArrayBuffer` once and hands out `Float32Array` /
+`Uint32Array` views at descriptor-computed offsets; `stageArray()` does the same
+per element of an `ArrayOf`, striding by the descriptor's `arrayPitch`.
+
+**Why views rather than metis-data's `MemoryBuffer.get()`/`set()`:** those
+allocate a tuple per call (see metis-data DOC.md's allocation table), and these
+writes happen per instance per frame. The descriptors remain the source of layout
+truth — every offset comes from `offsetOf` — but the writing is a plain typed
+array store.
+
+Sizes are now **derived**, so adding a field can't leave a buffer too short. What
+descriptors do *not* check is your agreement with the WGSL: field order and types
+still have to match `common.wgsl` by inspection.
 
 ---
 

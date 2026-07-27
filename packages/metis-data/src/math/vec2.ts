@@ -1,9 +1,11 @@
-import { allocate, F32, type ScalarDescriptor, Vec, type VecMemoryBuffer } from "metis-data";
-import type { TupleOf } from "type-fest";
+import { allocate, F32, type MatMemoryBuffer, type ScalarDescriptor, Vec, type VecMemoryBuffer } from "metis-data";
 
 // ============================================================================
 // Vec2 Math Object
 // ============================================================================
+//
+// View-based, allocation-free, and alias-safe — see the note at the top of
+// vec3.ts for why (it is the reference implementation of this style).
 export const Vec2 = {
     /**
      * Create a new Vec2 memory buffer initialized with the given values.
@@ -15,7 +17,9 @@ export const Vec2 = {
     ): VecMemoryBuffer<S, 2> {
         const descriptor = Vec(scalar, 2);
         const buffer = allocate(descriptor);
-        buffer.set([x, y] as TupleOf<2, number>);
+        const v = buffer.view();
+        v[0] = x;
+        v[1] = y;
         return buffer;
     },
 
@@ -27,7 +31,7 @@ export const Vec2 = {
     ): VecMemoryBuffer<S, 2> {
         const descriptor = Vec(v.type.scalar, 2);
         const buffer = allocate(descriptor);
-        buffer.set(v.get());
+        buffer.view().set(v.view());
         return buffer;
     },
 
@@ -38,7 +42,7 @@ export const Vec2 = {
         out: VecMemoryBuffer<S, 2>,
         v: VecMemoryBuffer<S, 2>,
     ): VecMemoryBuffer<S, 2> {
-        out.set(v.get());
+        out.view().set(v.view());
         return out;
     },
 
@@ -50,7 +54,9 @@ export const Vec2 = {
         x: number,
         y: number,
     ): VecMemoryBuffer<S, 2> {
-        out.set([x, y] as TupleOf<2, number>);
+        const o = out.view();
+        o[0] = x;
+        o[1] = y;
         return out;
     },
 
@@ -62,9 +68,11 @@ export const Vec2 = {
         a: VecMemoryBuffer<S, 2>,
         b: VecMemoryBuffer<S, 2>,
     ): VecMemoryBuffer<S, 2> {
-        const [ax, ay] = a.get();
-        const [bx, by] = b.get();
-        out.set([ax + bx, ay + by] as TupleOf<2, number>);
+        const av = a.view(), bv = b.view(), o = out.view();
+        const ax = av[0] as number, ay = av[1] as number;
+        const bx = bv[0] as number, by = bv[1] as number;
+        o[0] = ax + bx;
+        o[1] = ay + by;
         return out;
     },
 
@@ -76,9 +84,11 @@ export const Vec2 = {
         a: VecMemoryBuffer<S, 2>,
         b: VecMemoryBuffer<S, 2>,
     ): VecMemoryBuffer<S, 2> {
-        const [ax, ay] = a.get();
-        const [bx, by] = b.get();
-        out.set([ax - bx, ay - by] as TupleOf<2, number>);
+        const av = a.view(), bv = b.view(), o = out.view();
+        const ax = av[0] as number, ay = av[1] as number;
+        const bx = bv[0] as number, by = bv[1] as number;
+        o[0] = ax - bx;
+        o[1] = ay - by;
         return out;
     },
 
@@ -90,9 +100,11 @@ export const Vec2 = {
         a: VecMemoryBuffer<S, 2>,
         b: VecMemoryBuffer<S, 2>,
     ): VecMemoryBuffer<S, 2> {
-        const [ax, ay] = a.get();
-        const [bx, by] = b.get();
-        out.set([ax * bx, ay * by] as TupleOf<2, number>);
+        const av = a.view(), bv = b.view(), o = out.view();
+        const ax = av[0] as number, ay = av[1] as number;
+        const bx = bv[0] as number, by = bv[1] as number;
+        o[0] = ax * bx;
+        o[1] = ay * by;
         return out;
     },
 
@@ -104,9 +116,11 @@ export const Vec2 = {
         a: VecMemoryBuffer<S, 2>,
         b: VecMemoryBuffer<S, 2>,
     ): VecMemoryBuffer<S, 2> {
-        const [ax, ay] = a.get();
-        const [bx, by] = b.get();
-        out.set([ax / bx, ay / by] as TupleOf<2, number>);
+        const av = a.view(), bv = b.view(), o = out.view();
+        const ax = av[0] as number, ay = av[1] as number;
+        const bx = bv[0] as number, by = bv[1] as number;
+        o[0] = ax / bx;
+        o[1] = ay / by;
         return out;
     },
 
@@ -118,8 +132,10 @@ export const Vec2 = {
         v: VecMemoryBuffer<S, 2>,
         s: number,
     ): VecMemoryBuffer<S, 2> {
-        const [x, y] = v.get();
-        out.set([x * s, y * s] as TupleOf<2, number>);
+        const vv = v.view(), o = out.view();
+        const x = vv[0] as number, y = vv[1] as number;
+        o[0] = x * s;
+        o[1] = y * s;
         return out;
     },
 
@@ -130,28 +146,27 @@ export const Vec2 = {
         a: VecMemoryBuffer<S, 2>,
         b: VecMemoryBuffer<S, 2>,
     ): number {
-        const [ax, ay] = a.get();
-        const [bx, by] = b.get();
-        return ax * bx + ay * by;
+        const av = a.view(), bv = b.view();
+        return (av[0] as number) * (bv[0] as number) + (av[1] as number) * (bv[1] as number);
     },
 
     /**
-     * Calculate the cross product magnitude (z-component) of two Vec2s.
+     * 2D cross product — the scalar z of the 3D cross product.
      */
     cross<S extends ScalarDescriptor>(
         a: VecMemoryBuffer<S, 2>,
         b: VecMemoryBuffer<S, 2>,
     ): number {
-        const [ax, ay] = a.get();
-        const [bx, by] = b.get();
-        return ax * by - ay * bx;
+        const av = a.view(), bv = b.view();
+        return (av[0] as number) * (bv[1] as number) - (av[1] as number) * (bv[0] as number);
     },
 
     /**
      * Calculate the length (magnitude) of a Vec2.
      */
     length<S extends ScalarDescriptor>(v: VecMemoryBuffer<S, 2>): number {
-        const [x, y] = v.get();
+        const vv = v.view();
+        const x = vv[0] as number, y = vv[1] as number;
         return Math.sqrt(x * x + y * y);
     },
 
@@ -159,7 +174,8 @@ export const Vec2 = {
      * Calculate the squared length of a Vec2.
      */
     lengthSquared<S extends ScalarDescriptor>(v: VecMemoryBuffer<S, 2>): number {
-        const [x, y] = v.get();
+        const vv = v.view();
+        const x = vv[0] as number, y = vv[1] as number;
         return x * x + y * y;
     },
 
@@ -170,10 +186,9 @@ export const Vec2 = {
         a: VecMemoryBuffer<S, 2>,
         b: VecMemoryBuffer<S, 2>,
     ): number {
-        const [ax, ay] = a.get();
-        const [bx, by] = b.get();
-        const dx = bx - ax;
-        const dy = by - ay;
+        const av = a.view(), bv = b.view();
+        const dx = (bv[0] as number) - (av[0] as number);
+        const dy = (bv[1] as number) - (av[1] as number);
         return Math.sqrt(dx * dx + dy * dy);
     },
 
@@ -184,26 +199,30 @@ export const Vec2 = {
         a: VecMemoryBuffer<S, 2>,
         b: VecMemoryBuffer<S, 2>,
     ): number {
-        const [ax, ay] = a.get();
-        const [bx, by] = b.get();
-        const dx = bx - ax;
-        const dy = by - ay;
+        const av = a.view(), bv = b.view();
+        const dx = (bv[0] as number) - (av[0] as number);
+        const dy = (bv[1] as number) - (av[1] as number);
         return dx * dx + dy * dy;
     },
 
     /**
-     * Normalize a Vec2: out = v / |v|
+     * Normalize a Vec2: out = v / |v|. A zero-length vector yields zero rather
+     * than NaN.
      */
     normalize<S extends ScalarDescriptor>(
         out: VecMemoryBuffer<S, 2>,
         v: VecMemoryBuffer<S, 2>,
     ): VecMemoryBuffer<S, 2> {
-        const [x, y] = v.get();
+        const vv = v.view(), o = out.view();
+        const x = vv[0] as number, y = vv[1] as number;
         const len = Math.sqrt(x * x + y * y);
         if (len > 0) {
-            out.set([x / len, y / len] as TupleOf<2, number>);
+            const inv = 1 / len;
+            o[0] = x * inv;
+            o[1] = y * inv;
         } else {
-            out.set([0, 0] as TupleOf<2, number>);
+            o[0] = 0;
+            o[1] = 0;
         }
         return out;
     },
@@ -215,8 +234,10 @@ export const Vec2 = {
         out: VecMemoryBuffer<S, 2>,
         v: VecMemoryBuffer<S, 2>,
     ): VecMemoryBuffer<S, 2> {
-        const [x, y] = v.get();
-        out.set([-x, -y] as TupleOf<2, number>);
+        const vv = v.view(), o = out.view();
+        const x = vv[0] as number, y = vv[1] as number;
+        o[0] = -x;
+        o[1] = -y;
         return out;
     },
 
@@ -229,30 +250,31 @@ export const Vec2 = {
         b: VecMemoryBuffer<S, 2>,
         t: number,
     ): VecMemoryBuffer<S, 2> {
-        const [ax, ay] = a.get();
-        const [bx, by] = b.get();
-        out.set([
-            ax + t * (bx - ax),
-            ay + t * (by - ay),
-        ] as TupleOf<2, number>);
+        const av = a.view(), bv = b.view(), o = out.view();
+        const ax = av[0] as number, ay = av[1] as number;
+        const bx = bv[0] as number, by = bv[1] as number;
+        o[0] = ax + t * (bx - ax);
+        o[1] = ay + t * (by - ay);
         return out;
     },
 
     /**
      * Rotate a Vec2 by an angle (in radians).
+     *
+     * Safe when `out` aliases `v` — both components are read before either is
+     * written, which this op genuinely needs.
      */
     rotate<S extends ScalarDescriptor>(
         out: VecMemoryBuffer<S, 2>,
         v: VecMemoryBuffer<S, 2>,
         angle: number,
     ): VecMemoryBuffer<S, 2> {
-        const [x, y] = v.get();
+        const vv = v.view(), o = out.view();
+        const x = vv[0] as number, y = vv[1] as number;
         const c = Math.cos(angle);
         const s = Math.sin(angle);
-        out.set([
-            x * c - y * s,
-            x * s + y * c,
-        ] as TupleOf<2, number>);
+        o[0] = x * c - y * s;
+        o[1] = x * s + y * c;
         return out;
     },
 
@@ -260,8 +282,53 @@ export const Vec2 = {
      * Get the angle of a Vec2 (in radians).
      */
     angle<S extends ScalarDescriptor>(v: VecMemoryBuffer<S, 2>): number {
-        const [x, y] = v.get();
-        return Math.atan2(y, x);
+        const vv = v.view();
+        return Math.atan2(vv[1] as number, vv[0] as number);
+    },
+
+    /**
+     * Transform a Vec2 as a **point** by a Mat3 2D transform: `out = (m *
+     * vec3(v, 1)).xy`.
+     *
+     * Pairs with `Mat3.fromTRS`/`translation`/`rotation`/`scaling`, which build
+     * 2D affine transforms. The translation column applies — for a direction
+     * (a velocity, a normal) use {@link transformMat2}.
+     */
+    transformMat3<S extends ScalarDescriptor>(
+        out: VecMemoryBuffer<S, 2>,
+        v: VecMemoryBuffer<S, 2>,
+        m: MatMemoryBuffer<S, 3>,
+    ): VecMemoryBuffer<S, 2> {
+        const mv = m.view(), vv = v.view(), o = out.view();
+        const c = m.columnElements;
+        const x = vv[0] as number, y = vv[1] as number;
+
+        const rx = (mv[0] as number) * x + (mv[c] as number) * y + (mv[2 * c] as number);
+        const ry = (mv[1] as number) * x + (mv[c + 1] as number) * y + (mv[2 * c + 1] as number);
+
+        o[0] = rx;
+        o[1] = ry;
+        return out;
+    },
+
+    /**
+     * Transform a Vec2 as a **direction** by a Mat2: `out = m * v`.
+     */
+    transformMat2<S extends ScalarDescriptor>(
+        out: VecMemoryBuffer<S, 2>,
+        v: VecMemoryBuffer<S, 2>,
+        m: MatMemoryBuffer<S, 2>,
+    ): VecMemoryBuffer<S, 2> {
+        const mv = m.view(), vv = v.view(), o = out.view();
+        const c = m.columnElements;
+        const x = vv[0] as number, y = vv[1] as number;
+
+        const rx = (mv[0] as number) * x + (mv[c] as number) * y;
+        const ry = (mv[1] as number) * x + (mv[c + 1] as number) * y;
+
+        o[0] = rx;
+        o[1] = ry;
+        return out;
     },
 
     /**
@@ -271,8 +338,7 @@ export const Vec2 = {
         a: VecMemoryBuffer<S, 2>,
         b: VecMemoryBuffer<S, 2>,
     ): boolean {
-        const [ax, ay] = a.get();
-        const [bx, by] = b.get();
-        return ax === bx && ay === by;
+        const av = a.view(), bv = b.view();
+        return av[0] === bv[0] && av[1] === bv[1];
     },
 };

@@ -16,19 +16,16 @@ import { mat4, type Mat4Arg, vec3 } from "wgpu-matrix";
 import type { GpuProfiler } from "../debug/gpuProfiler.ts";
 import { MESH_VERTEX_LAYOUT } from "../scene/mesh.ts";
 import type { Scene } from "../scene/scene.ts";
-import { Std140Writer } from "./std140.ts";
+import { CASCADE_COUNT, SHADOW_MAP_SIZE } from "./shadowConfig.ts";
+import { CascadeUniforms, SHADOW_RENDER_STRIDE, stage } from "./gpuLayouts.ts";
 import commonWgsl from "./wgsl/common.wgsl" with { type: "text" };
 import shadowWgsl from "./wgsl/shadow.wgsl" with { type: "text" };
 
-/**
- * Per-cascade resolution. 2048 (down from a former 4096 single map) is enough
- * because roomBox's solid-slab walls give corner depth gaps ~wall-thickness, far
- * wider than any shadow test here needs to resolve.
- *
- * The normal-offset bias is texel-scaled, so this can be changed without
- * retuning bias. VRAM is `CASCADE_COUNT * SHADOW_MAP_SIZE² * 4` bytes.
- */
-export const SHADOW_MAP_SIZE = 2048;
+// Defined in shadowConfig.ts (a leaf module) so gpuLayouts.ts can size its
+// descriptor arrays without importing this file back — see shadowConfig.ts.
+// Re-exported here so the public import path is unchanged.
+export { CASCADE_COUNT, SHADOW_MAP_SIZE };
+
 const SHADOW_DEPTH_FORMAT = "depth32float" as const;
 
 // Normal-offset sizing, applied per cascade. The offset must clear the depth
@@ -57,12 +54,6 @@ const SHADOW_NORMAL_OFFSET_MIN = 0.04;
 // is the only bias needed. See CLAUDE.md "Cascaded shadow maps".
 //
 // VRAM at 2048²: 4 × depth32float (4 × 17 MB) ≈ 67 MB.
-/**
- * Cascades in the directional shadow. **Compile-time**: it sizes the depth
- * array and the `array<mat4x4>` in `CascadeUniforms`, and WGSL array lengths
- * must be constant, so changing it means editing `common.wgsl` to match.
- */
-export const CASCADE_COUNT = 4;
 /** Default for `ClusteredForwardRenderer.cascadeSplitLambda` — see that field for what it does. */
 export const CASCADE_SPLIT_LAMBDA_DEFAULT = 0.85;
 /** Default for `ClusteredForwardRenderer.shadowDistance`, in world units. */
@@ -75,16 +66,15 @@ const CASCADE_BLEND_FRACTION = 0.12;
 // NEAR is generous so occluders standing just outside the slice still cast in.
 const CASCADE_ORTHO_NEAR_SCALE = 3.0;
 const CASCADE_ORTHO_FAR_SCALE = 1.5;
-// 256-byte stride for the per-cascade shadow-render uniform (one mat4 each),
-// meeting the uniform dynamic/offset alignment so 4 bind groups can slice one buffer.
-const CASCADE_RENDER_STRIDE = 256;
-// Forward-pass cascade uniform: mat4[4] (256) + splitDepths vec4 (16) +
-// normalOffsets vec4 (16) + params vec4 (16) = 304. Keep in sync with
-// common.wgsl's CascadeUniforms.
-const CASCADE_FORWARD_SIZE = 304;
+// Sizes/strides now come from gpuLayouts.ts (CascadeUniforms,
+// SHADOW_RENDER_STRIDE) rather than being hand-computed here.
 
+/**
+ * A fitted cascade. **No `viewProj` field** — `computeCascades` writes each
+ * cascade's matrix directly into its render-buffer slice
+ * (`renderMatrices[c]`) rather than handing one back to be copied.
+ */
 interface Cascade {
-    viewProj: Mat4Arg;
     radius: number;
     splitFar: number;
     normalOffset: number;
@@ -114,6 +104,16 @@ export class ShadowCascades {
     private readonly cascadeRenderBuffer: GpuBuffer;
     private readonly cascadeRenderBindGroups: GpuBindGroup[];
     private readonly pcfDepthPipeline: GpuRenderPipeline; // single-sample depth
+    /** Persistent staging, allocated once (see gpuLayouts.ts). */
+    private readonly renderBytes: Uint8Array;
+    private readonly renderMatrices: Float32Array[];
+    private readonly forwardBytes: Uint8Array;
+    private readonly forwardStaging: {
+        viewProj: Float32Array;
+        splitDepths: Float32Array;
+        normalOffsets: Float32Array;
+        params: Float32Array;
+    };
 
     constructor(device: GpuDevice, modelBindGroupLayout: GpuBindGroupLayout) {
         this.device = device;
@@ -150,14 +150,38 @@ export class ShadowCascades {
         // Per-cascade light matrix for the render passes (one mat4 per slice).
         this.cascadeRenderBuffer = device.createBuffer({
             label: "metis-engine/cascade-render-uniforms",
-            size: CASCADE_COUNT * CASCADE_RENDER_STRIDE,
+            size: CASCADE_COUNT * SHADOW_RENDER_STRIDE,
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
         this.uniformBuffer = device.createBuffer({
             label: "metis-engine/cascade-forward-uniforms",
-            size: CASCADE_FORWARD_SIZE,
+            size: CascadeUniforms.byteSize,
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
+
+        // Per-cascade render matrix staging. One mat4 per 256-byte slice, so
+        // this is a raw buffer with a view per slice rather than an ArrayOf —
+        // metis-data has no way to declare a stride wider than the element.
+        this.renderBytes = new Uint8Array(CASCADE_COUNT * SHADOW_RENDER_STRIDE);
+        this.renderMatrices = [];
+        for (let i = 0; i < CASCADE_COUNT; i++) {
+            this.renderMatrices.push(
+                new Float32Array(this.renderBytes.buffer, i * SHADOW_RENDER_STRIDE, 16),
+            );
+        }
+
+        const fw = stage(CascadeUniforms);
+        this.forwardBytes = fw.bytes;
+        this.forwardStaging = {
+            viewProj: fw.f32("viewProj", CASCADE_COUNT * 16),
+            splitDepths: fw.f32("splitDepths", 4),
+            normalOffsets: fw.f32("normalOffsets", 4),
+            params: fw.f32("params", 4),
+        };
+        // params is constant for the lifetime of the object.
+        this.forwardStaging.params[0] = CASCADE_COUNT;
+        this.forwardStaging.params[1] = SHADOW_MAP_SIZE;
+        this.forwardStaging.params[2] = CASCADE_BLEND_FRACTION;
 
         const shadowFrameBGL = device.createBindGroupLayout({
             label: "metis-engine/shadow-frame-bgl",
@@ -171,7 +195,7 @@ export class ShadowCascades {
                 layout: shadowFrameBGL,
                 entries: [{
                     binding: 0,
-                    buffer: {buffer: this.cascadeRenderBuffer, offset: i * CASCADE_RENDER_STRIDE, size: 64},
+                    buffer: {buffer: this.cascadeRenderBuffer, offset: i * SHADOW_RENDER_STRIDE, size: 64},
                 }],
             }));
         }
@@ -217,21 +241,21 @@ export class ShadowCascades {
     ) {
         const cascades = this.computeCascades(scene, shadowDistance, splitLambda);
 
-        // Per-cascade render matrix (one 64-byte mat4 per 256-byte slice).
+        // Per-cascade render matrix (one 64-byte mat4 per 256-byte slice), then
+        // the forward set: matrices + split far-depths + per-cascade offsets.
+        // `params` was written once at construction.
+        // `computeCascades` wrote each viewProj straight into its 256-stride
+        // render slice, so this only fans it out to the forward array.
+        const fw = this.forwardStaging;
         for (let c = 0; c < CASCADE_COUNT; c++) {
-            const w = new Std140Writer();
-            w.mat4(cascades[c]!.viewProj);
-            this.device.queue.writeBuffer(this.cascadeRenderBuffer, c * CASCADE_RENDER_STRIDE, w.toBytes());
+            const cascade = cascades[c]!;
+            fw.viewProj.set(this.renderMatrices[c]!, c * 16);
+            fw.splitDepths[c] = cascade.splitFar;
+            fw.normalOffsets[c] = cascade.normalOffset;
         }
-        // Forward cascade set: matrices + split far-depths + per-cascade offsets + params.
-        const fw = new Std140Writer();
-        for (let c = 0; c < CASCADE_COUNT; c++) {
-            fw.mat4(cascades[c]!.viewProj);
-        }
-        fw.vec4(cascades[0]!.splitFar, cascades[1]!.splitFar, cascades[2]!.splitFar, cascades[3]!.splitFar);
-        fw.vec4(cascades[0]!.normalOffset, cascades[1]!.normalOffset, cascades[2]!.normalOffset, cascades[3]!.normalOffset);
-        fw.vec4(CASCADE_COUNT, SHADOW_MAP_SIZE, CASCADE_BLEND_FRACTION, 0);
-        this.device.queue.writeBuffer(this.uniformBuffer, 0, fw.toBytes());
+        // One upload for all four slices instead of four.
+        this.device.queue.writeBuffer(this.cascadeRenderBuffer, 0, this.renderBytes);
+        this.device.queue.writeBuffer(this.uniformBuffer, 0, this.forwardBytes);
 
         const drawScene = (pass: ReturnType<GpuCommandEncoder["beginRenderPass"]>, cascade: number) => {
             pass.setBindGroup(0, this.cascadeRenderBindGroups[cascade]!);
@@ -347,7 +371,11 @@ export class ShadowCascades {
             const proj = mat4.ortho(-half, half, -half, half, 0, dist + radius * CASCADE_ORTHO_FAR_SCALE);
 
             const normalOffset = Math.max(SHADOW_NORMAL_OFFSET_MIN, SHADOW_NORMAL_OFFSET_TEXELS * worldPerTexel);
-            cascades.push({viewProj: mat4.multiply(proj, lightView), radius, splitFar: sliceFar, normalOffset});
+            // Straight into this cascade's 256-stride render slice; `render`
+            // then fans it out to the forward uniform. The matrix used to be
+            // allocated here and copied into both.
+            mat4.multiply(proj, lightView, this.renderMatrices[c]!);
+            cascades.push({radius, splitFar: sliceFar, normalOffset});
             sliceNear = sliceFar;
         }
         return cascades;

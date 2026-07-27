@@ -158,15 +158,15 @@ export const Quat = {
         a: VecMemoryBuffer<S, 4>,
         b: VecMemoryBuffer<S, 4>,
     ): VecMemoryBuffer<S, 4> {
-        const [ax, ay, az, aw] = a.get();
-        const [bx, by, bz, bw] = b.get();
+        // Read both operands before writing — `out` may alias either.
+        const av = a.view(), bv = b.view(), ov = out.view();
+        const ax = av[0] as number, ay = av[1] as number, az = av[2] as number, aw = av[3] as number;
+        const bx = bv[0] as number, by = bv[1] as number, bz = bv[2] as number, bw = bv[3] as number;
 
-        out.set([
-            ax * bw + aw * bx + ay * bz - az * by,
-            ay * bw + aw * by + az * bx - ax * bz,
-            az * bw + aw * bz + ax * by - ay * bx,
-            aw * bw - ax * bx - ay * by - az * bz,
-        ] as TupleOf<4, number>);
+        ov[0] = ax * bw + aw * bx + ay * bz - az * by;
+        ov[1] = ay * bw + aw * by + az * bx - ax * bz;
+        ov[2] = az * bw + aw * bz + ax * by - ay * bx;
+        ov[3] = aw * bw - ax * bx - ay * by - az * bz;
         return out;
     },
 

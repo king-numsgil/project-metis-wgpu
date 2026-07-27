@@ -8,6 +8,7 @@ import {
     type GpuRenderPipeline,
     GPUShaderStage,
 } from "metis-native";
+import { mat4 } from "wgpu-matrix";
 import { AmbientOcclusion } from "../ao/ambientOcclusion.ts";
 import { AoTechnique } from "../ao/aoConfig.ts";
 import type { GpuProfiler } from "../debug/gpuProfiler.ts";
@@ -17,7 +18,7 @@ import type { Scene } from "../scene/scene.ts";
 import { LightCuller } from "./lightCuller.ts";
 import { CASCADE_SPLIT_LAMBDA_DEFAULT, SHADOW_DISTANCE_DEFAULT, ShadowCascades } from "./shadowCascades.ts";
 import { selectShadowCastingSpots, SpotShadows } from "./spotShadows.ts";
-import { Std140Writer } from "./std140.ts";
+import { CameraUniforms, EnvironmentUniforms, stage } from "./gpuLayouts.ts";
 import commonWgsl from "./wgsl/common.wgsl" with { type: "text" };
 import depthPrepassWgsl from "./wgsl/depth_prepass.wgsl" with { type: "text" };
 import forwardWgsl from "./wgsl/forward.wgsl" with { type: "text" };
@@ -108,6 +109,17 @@ export class ClusteredForwardRenderer {
     private readonly pipelineDepthEqual: GpuRenderPipeline;
     private readonly cameraBuffer: GpuBuffer;
     private readonly environmentBuffer: GpuBuffer;
+    /** Scratch for the projection in `writeFrameUniforms`, so that path allocates nothing. */
+    private readonly projScratch = mat4.identity();
+    /** Persistent CPU staging — allocated once, rewritten in place each frame. */
+    private readonly cameraBytes: Uint8Array;
+    private readonly cameraStaging: {viewProj: Float32Array; view: Float32Array; position: Float32Array};
+    private readonly environmentBytes: Uint8Array;
+    private readonly environmentStaging: {
+        sunDirection: Float32Array;
+        sunColorIntensity: Float32Array;
+        ambientColorIntensity: Float32Array;
+    };
     private readonly culler: LightCuller;
     private readonly shadows: ShadowCascades;
     /** Per-spot-light shadow maps. `lastDrawnInstances`/`lastCandidateInstances` report cull effectiveness. */
@@ -227,16 +239,33 @@ ${depthPrepassWgsl}`,
             multisample: {count: MSAA_SAMPLE_COUNT},
         });
 
+        // Sizes derive from the descriptors — see gpuLayouts.ts. Each staging
+        // buffer is allocated once and rewritten in place every frame.
         this.cameraBuffer = device.createBuffer({
             label: "metis-engine/camera",
-            size: 144, // mat4 viewProj + mat4 view + vec3 position (padded)
+            size: CameraUniforms.byteSize,
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
         this.environmentBuffer = device.createBuffer({
             label: "metis-engine/environment",
-            size: 48, // vec3 (padded) + vec4 + vec4
+            size: EnvironmentUniforms.byteSize,
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
+        const camStage = stage(CameraUniforms);
+        this.cameraBytes = camStage.bytes;
+        this.cameraStaging = {
+            viewProj: camStage.f32("viewProj", 16),
+            view: camStage.f32("view", 16),
+            position: camStage.f32("position", 3),
+        };
+        const envStage = stage(EnvironmentUniforms);
+        this.environmentBytes = envStage.bytes;
+        this.environmentStaging = {
+            sunDirection: envStage.f32("sunDirection", 3),
+            sunColorIntensity: envStage.f32("sunColorIntensity", 4),
+            ambientColorIntensity: envStage.f32("ambientColorIntensity", 4),
+        };
+
         this.depthPrepassBindGroup = device.createBindGroup({
             label: "metis-engine/depth-prepass-bind-group",
             layout: prepassCameraLayout,
@@ -375,18 +404,33 @@ ${depthPrepassWgsl}`,
     }
 
     private writeFrameUniforms(scene: Scene) {
-        const cam = new Std140Writer();
-        cam.mat4(scene.camera.viewProjectionMatrix());
-        cam.mat4(scene.camera.viewMatrix());
-        cam.vec3(scene.camera.position);
-        this.device.queue.writeBuffer(this.cameraBuffer, 0, cam.toBytes());
+        // Written straight into the packed slots — no intermediate matrices.
+        // `view` is computed once here and reused for the product, rather than
+        // calling viewProjectionMatrix() (which would recompute it internally).
+        const cam = this.cameraStaging;
+        scene.camera.viewMatrix(cam.view);
+        mat4.multiply(scene.camera.projectionMatrix(this.projScratch), cam.view, cam.viewProj);
+        const p = scene.camera.position;
+        cam.position[0] = p[0]!;
+        cam.position[1] = p[1]!;
+        cam.position[2] = p[2]!;
+        this.device.queue.writeBuffer(this.cameraBuffer, 0, this.cameraBytes);
 
-        const env = new Std140Writer();
-        env.vec3(scene.environment.sunDirection);
+        const env = this.environmentStaging;
+        const sd = scene.environment.sunDirection;
+        env.sunDirection[0] = sd[0]!;
+        env.sunDirection[1] = sd[1]!;
+        env.sunDirection[2] = sd[2]!;
         const sc = scene.environment.sunColor;
-        env.vec4(sc[0], sc[1], sc[2], scene.environment.sunIntensity);
+        env.sunColorIntensity[0] = sc[0];
+        env.sunColorIntensity[1] = sc[1];
+        env.sunColorIntensity[2] = sc[2];
+        env.sunColorIntensity[3] = scene.environment.sunIntensity;
         const ac = scene.environment.ambientColor;
-        env.vec4(ac[0], ac[1], ac[2], scene.environment.ambientIntensity);
-        this.device.queue.writeBuffer(this.environmentBuffer, 0, env.toBytes());
+        env.ambientColorIntensity[0] = ac[0];
+        env.ambientColorIntensity[1] = ac[1];
+        env.ambientColorIntensity[2] = ac[2];
+        env.ambientColorIntensity[3] = scene.environment.ambientIntensity;
+        this.device.queue.writeBuffer(this.environmentBuffer, 0, this.environmentBytes);
     }
 }

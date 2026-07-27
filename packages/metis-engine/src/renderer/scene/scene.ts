@@ -8,7 +8,7 @@ import {
 import type { Mat4Arg } from "wgpu-matrix";
 import { Camera } from "../math/camera.ts";
 import { createTransform, normalMatrixFromModel, type Transform, transformToMat4 } from "../math/transform.ts";
-import { Std140Writer } from "../shading/std140.ts";
+import { ModelUniforms, stage } from "../shading/gpuLayouts.ts";
 import { createExteriorEnvironment, type Environment } from "./environment.ts";
 import type { Light } from "./light.ts";
 import type { Material } from "./material.ts";
@@ -27,6 +27,13 @@ export class SceneInstance {
 
     private buffer: GpuBuffer | null = null;
     private bindGroup: GpuBindGroup | null = null;
+    /**
+     * Per-instance CPU staging, created with the GPU buffer on first use and
+     * rewritten in place every frame. This is the allocation that scaled with
+     * scene size before — one `Std140Writer` per instance per frame, each with
+     * five allocations of its own.
+     */
+    private staging: {bytes: Uint8Array; model: Float32Array; normalMatrix: Float32Array} | null = null;
 
     /**
      * @param mesh geometry to draw; shared freely between instances.
@@ -43,18 +50,17 @@ export class SceneInstance {
 
     /** Recomputes model + normal matrices from `transform` (or uses `modelMatrixOverride`) and returns a bind group for group(2) of the forward pipeline. */
     getModelBindGroup(device: GpuDevice, layout: GpuBindGroupLayout): GpuBindGroup {
-        const model = this.modelMatrixOverride ?? transformToMat4(this.transform);
-        const normalMat = normalMatrixFromModel(model);
-
-        const w = new Std140Writer();
-        w.mat4(model);
-        w.mat3(normalMat as Float32Array);
-        const bytes = w.toBytes();
-
-        if (!this.buffer) {
+        if (!this.staging) {
+            const s = stage(ModelUniforms);
+            this.staging = {
+                bytes: s.bytes,
+                model: s.f32("model", 16),
+                // A std140 mat3 is three *vec4* columns — 12 floats, not 9.
+                normalMatrix: s.f32("normalMatrix", 12),
+            };
             this.buffer = device.createBuffer({
                 label: "metis-engine/model",
-                size: bytes.byteLength,
+                size: ModelUniforms.byteSize,
                 usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
             });
             this.bindGroup = device.createBindGroup({
@@ -64,7 +70,13 @@ export class SceneInstance {
             });
         }
 
-        device.queue.writeBuffer(this.buffer, 0, bytes);
+        const model = this.modelMatrixOverride ?? transformToMat4(this.transform);
+        this.staging.model.set(model as Float32Array);
+        // wgpu-matrix's Mat3 is already 12 floats with the same column padding
+        // std140 wants, so this copies straight across.
+        this.staging.normalMatrix.set(normalMatrixFromModel(model) as Float32Array);
+
+        device.queue.writeBuffer(this.buffer!, 0, this.staging.bytes);
         return this.bindGroup!;
     }
 
@@ -73,6 +85,7 @@ export class SceneInstance {
         this.buffer?.destroy();
         this.buffer = null;
         this.bindGroup = null;
+        this.staging = null;
     }
 }
 

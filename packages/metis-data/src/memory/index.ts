@@ -98,6 +98,15 @@ export interface MatMemoryBuffer<
     get(colIndex: ArrayIndices<TupleOf<N, number>>): TupleOf<N, number>;
 
     set(colIndex: ArrayIndices<TupleOf<N, number>>, value: TupleOf<N, number>): void;
+
+    /**
+     * Stride between columns in **scalar elements** of `view()`, not bytes:
+     * component (col, row) is `view()[col * columnElements + row]`. Under
+     * Std140 a `Mat3`'s columns pad to 4 elements, so this is not always N.
+     *
+     * For allocation-free access to a matrix — `at()`/`get()` both allocate.
+     */
+    readonly columnElements: number;
 }
 
 export interface ArrayMemoryBuffer<

@@ -9,7 +9,7 @@ import {
     GPUShaderStage,
     type GpuTextureView,
 } from "metis-native";
-import { Std140Writer } from "../shading/std140.ts";
+import { LuminanceParams, stage } from "../shading/gpuLayouts.ts";
 import type { PostProcessFrameContext, PostProcessPass } from "./pipeline.ts";
 import luminanceAverageWgsl from "./wgsl/luminance_average.wgsl" with { type: "text" };
 
@@ -34,9 +34,12 @@ export class LuminanceAveragePass implements PostProcessPass {
     execute(encoder: GpuCommandEncoder, ctx: PostProcessFrameContext): void {
         const {tileCountX, tileCountY, tileCount} = this.ensureCapacity(ctx.width, ctx.height);
 
-        const params = new Std140Writer();
-        params.vec4u(ctx.width, ctx.height, tileCountX, tileCount);
-        this.device.queue.writeBuffer(this.paramsBuffer, 0, params.toBytes());
+        const dims = this.paramsStaging;
+        dims[0] = ctx.width;
+        dims[1] = ctx.height;
+        dims[2] = tileCountX;
+        dims[3] = tileCount;
+        this.device.queue.writeBuffer(this.paramsBuffer, 0, this.paramsBytes);
 
         if (!this.tileBindGroup || this.lastHdrView !== ctx.hdrColorView || this.lastDepthView !== ctx.depthView) {
             this.tileBindGroup = this.device.createBindGroup({
@@ -94,6 +97,9 @@ export class LuminanceAveragePass implements PostProcessPass {
     }
 
     private readonly paramsBuffer: GpuBuffer;
+    /** Persistent staging, allocated once (see gpuLayouts.ts). */
+    private readonly paramsBytes: Uint8Array;
+    private readonly paramsStaging: Uint32Array;
     private readonly avgLogLuminanceBuffer: GpuBuffer;
     private readonly tileBindGroupLayout: GpuBindGroupLayout;
     private readonly tilePipeline: GpuComputePipeline;
@@ -110,9 +116,12 @@ export class LuminanceAveragePass implements PostProcessPass {
     constructor(private readonly device: GpuDevice) {
         this.paramsBuffer = device.createBuffer({
             label: "metis-engine/luminance-params",
-            size: 16,
+            size: LuminanceParams.byteSize,
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
+        const s = stage(LuminanceParams);
+        this.paramsBytes = s.bytes;
+        this.paramsStaging = s.u32("dims", 4);
         this.avgLogLuminanceBuffer = device.createBuffer({
             label: "metis-engine/avg-log-luminance",
             size: 4,

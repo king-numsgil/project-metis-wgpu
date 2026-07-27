@@ -12,7 +12,7 @@ import {
 } from "metis-native";
 import { mat4 } from "wgpu-matrix";
 import type { GpuProfiler } from "../debug/gpuProfiler.ts";
-import { Std140Writer } from "../shading/std140.ts";
+import { VectorTextFrame } from "../shading/gpuLayouts.ts";
 import vectorWgsl from "./wgsl/vector.wgsl" with { type: "text" };
 
 /** Linear (not sRGB) RGBA in 0..1 — the HDR targets and the swapchain both want linear. */
@@ -55,6 +55,9 @@ export class VectorText {
     /** Dynamic-offset stride: one palette slot per alignment unit, not per 16 bytes. */
     private readonly paletteStride: number;
     private readonly paletteStaging: Uint8Array;
+    /** Persistent staging for the ortho projection (a bare mat4). */
+    private readonly projectionBytes: Uint8Array;
+    private readonly projectionStaging: Float32Array;
     /**
      * Optional GPU profiler. Set it and this class's render pass shows up in the
      * profiler tree alongside the renderer's own passes.
@@ -142,9 +145,12 @@ export class VectorText {
 
         this.frameBuffer = device.createBuffer({
             label: "metis-engine/vector-text-frame",
-            size: 64, // mat4
+            size: VectorTextFrame.byteSize,
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
+        const projBuffer = new ArrayBuffer(VectorTextFrame.byteSize);
+        this.projectionBytes = new Uint8Array(projBuffer);
+        this.projectionStaging = new Float32Array(projBuffer, 0, 16);
         this.paletteBuffer = device.createBuffer({
             label: "metis-engine/vector-text-palette",
             size: this.paletteStride * MAX_PALETTE_COLORS,
@@ -215,10 +221,7 @@ export class VectorText {
         this.lastPalette = palette;
         const used = Math.min(palette.length, MAX_PALETTE_COLORS);
 
-        const proj = mat4.ortho(0, width, height, 0, -1, 1);
-        const w = new Std140Writer();
-        w.mat4(proj);
-        this.device.queue.writeBuffer(this.frameBuffer, 0, w.toBytes());
+        this.writeProjection(width, height);
 
         // One writeBuffer for the whole palette: the staging array is laid out at
         // the dynamic-offset stride so each color lands where its offset points.
@@ -297,11 +300,17 @@ export class VectorText {
         }
         // The projection still has to be rewritten: the window may have resized
         // since the geometry was built.
-        const proj = mat4.ortho(0, width, height, 0, -1, 1);
-        const w = new Std140Writer();
-        w.mat4(proj);
-        this.device.queue.writeBuffer(this.frameBuffer, 0, w.toBytes());
+        this.writeProjection(width, height);
         this.encodePass(encoder, view, loadOp, calls, Math.min(this.lastPalette.length, MAX_PALETTE_COLORS));
+    }
+
+    /**
+     * Uploads the top-left-origin, y-down pixel-space projection. Writes into a
+     * persistent staging matrix rather than packing a fresh buffer per call.
+     */
+    private writeProjection(width: number, height: number) {
+        this.projectionStaging.set(mat4.ortho(0, width, height, 0, -1, 1) as Float32Array);
+        this.device.queue.writeBuffer(this.frameBuffer, 0, this.projectionBytes);
     }
 
     /** Releases the frame + palette buffers. The underlying `VectorContext`'s geometry buffers go with the device. */

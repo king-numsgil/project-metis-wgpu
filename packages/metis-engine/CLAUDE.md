@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-`metis-engine` is a WebGPU clustered-forward PBR renderer for the space-sim game — built directly on `metis-native`'s raw WebGPU/SDL3 bindings (no other rendering-facing dependency; `wgpu-matrix` is the only non-`metis-native` dependency, for matrix/vector math). It's a standalone package with no dependency on `metis-tui`. `metis-game` consumes it (a 100-point-light demo), and does so via the caller-owned-device path — it never touches `RenderContext`. See "The engine does not own the window" below.
+`metis-engine` is a WebGPU clustered-forward PBR renderer for the space-sim game — built directly on `metis-native`'s raw WebGPU/SDL3 bindings. Two other dependencies: `metis-data` (GPU struct layouts — every uniform/storage buffer the renderer uploads is a descriptor; see "GPU layouts are descriptors now") and `wgpu-matrix` (matrix/vector math). **Moving the math onto `metis-data`'s own `Vec`/`Mat`/`Quat` is intended but not done** — the blocker is that most of metis-data's math ops allocate a tuple per call, so porting today would trade a large packing win for a per-frame allocation regression in the light loop. See that package's CLAUDE.md, "out-first is not allocation-free". It's a standalone package with no dependency on `metis-tui`. `metis-game` consumes it (a 100-point-light demo), and does so via the caller-owned-device path — it never touches `RenderContext`. See "The engine does not own the window" below.
 
 **`src/` is split into two independent subtrees.** `src/renderer/` is the entire renderer described in this doc (including `renderer/debug/` — the opt-in GPU profiler and the debug widgets); `src/ecs/` is a young archetype ECS (Structure-of-Arrays storage, no `metis-data` dependency) that will eventually feed the renderer. They do not depend on each other yet — the renderer still takes a hand-built `Scene`, not ECS data. The root `src/index.ts` re-exports them as namespaces (`export * as Renderer`, `export * as ECS`), but consumers import through the package's **subpath exports** — `metis-engine/renderer` and `metis-engine/ecs` — which is what `examples/`, `test/`, `bench/`, and `metis-game` now do (`import { ClusteredForwardRenderer, … } from "metis-engine/renderer"`). The ECS's current shape and limits are in "The ECS" below.
 
@@ -51,8 +51,9 @@ bun install
 # Headless render + screenshot validation — writes PNGs to test/output/,
 # via metis-native's native readTexturePixels/saveTextureToFile.
 # The goldens are byte-exact: a clean `git status` after this means the render
-# path reproduced exactly. A diff is signal — read "The fixture goldens are a
-# genuine byte-exact baseline" below before reverting it.
+# path reproduced exactly. A diff means something moved — check its shape, then
+# regenerate deliberately. See "The fixture goldens are a genuine byte-exact
+# baseline" below.
 bun run fixture && git status --short test/output
 
 # Interactive windowed demos (WASD+QE fly, arrows look, Esc quit)
@@ -110,9 +111,12 @@ src/renderer/   — the entire renderer; import via "metis-engine/renderer"
                                  depth-only pass per cascade into a depth-array layer); exposes the
                                  depth-array/compare-sampler/uniform the forward frame bind group
                                  binds (shadow.wgsl)
-                std140.ts     — hand-rolled uniform/storage buffer byte-packing (WGSL's std140-ish
-                                 alignment rules: vec3 pads to 16 bytes, a following scalar packs into
-                                 that gap, mat4 is 4 vec4 columns)
+                gpuLayouts.ts — every uniform/storage struct as a metis-data descriptor; the
+                                 TypeScript half of common.wgsl. Replaced the hand-rolled
+                                 Std140Writer (see "GPU layouts are descriptors now" below)
+                shadowConfig.ts — CASCADE_COUNT/SHADOW_MAP_SIZE/MAX_SHADOW_SPOTS/SPOT_SHADOW_MAP_SIZE
+                                 in a leaf module, so gpuLayouts can size arrays without an
+                                 import cycle back through the classes that use them
   ao/           ambientOcclusion.ts — screen-space AO subsystem owned by the forward
                                  renderer: a geometry prepass (view-space normals + depth) ->
                                  SSAO or HBAO -> box blur, feeding the forward pass's ambient term
@@ -521,6 +525,51 @@ instance), not `SHADOW_MAP_SIZE`. This section previously proposed halving
 pass; deleting that pass outright turned out to be strictly better and cost no
 quality.
 
+### GPU layouts are descriptors now, not a hand-rolled writer
+
+Every uniform and storage struct the renderer uploads is a `metis-data`
+descriptor in `shading/gpuLayouts.ts`. That replaced `Std140Writer`, 99 lines of
+hand-rolled alignment, and — the actual motivation — **seven hand-computed size
+constants** scattered across five files (`CLUSTER_PARAMS_SIZE = 128`,
+`CASCADE_FORWARD_SIZE = 304`, `FORWARD_UNIFORM_SIZE = 288`, `AO_UNIFORMS_SIZE =
+288`, `LIGHT_STRIDE = 64`, and inline `size: 144` / `size: 48`), each with a
+comment asking the reader to trust arithmetic they couldn't check. Sizes are
+derived now, so adding a field cannot silently leave a buffer short.
+
+**The allocation story is the other half.** `Std140Writer` allocated per call —
+a growable `number[]`, a *parallel* `string[]` of `"f32"|"u32"` type tags, an
+`ArrayBuffer`, a `DataView`, a `Uint8Array` — and then wrote word-at-a-time
+through `setFloat32`. It ran `~17 + 2 × instanceCount` times per frame, and the
+light array alone pushed 6144 entries onto two JS arrays and made 6144 `DataView`
+calls at `MAX_LIGHTS`. Staging buffers are allocated once at construction and
+rewritten in place now; a matrix upload is one `Float32Array.set`.
+
+**Descriptors are the layout authority, but the writes deliberately bypass
+metis-data's accessors.** Every offset comes from `offsetOf`, so metis-data's
+packing rules and their tests govern the layout — but `MemoryBuffer.get()/set()`
+allocate a tuple per call, which is wrong for a per-instance-per-frame path. The
+`stage()` helper takes raw typed-array views at descriptor-computed offsets. Keep
+that split if you add a pass: get the offset from the descriptor, do the store
+yourself.
+
+**What descriptors do NOT check:** agreement with the WGSL. metis-data validates
+std140/std430 packing, not that your field order matches `common.wgsl`. That is
+still a by-inspection invariant — which is exactly why the descriptors live in
+one file mirroring one shader file, instead of beside the classes that use them.
+
+**The migration was verified byte-exact**, which is the useful part: all eight
+fixture goldens reproduced with zero diff, and `test/ao.test.ts`,
+`clusterNear.test.ts`, `spotLight.test.ts` and `spotShadow.test.ts` passed 20/20.
+A pure repacking *should* be bit-identical, so the clean `git status` is a real
+assertion that the new offsets match the old ones — not merely that the image
+still looks right.
+
+One layout resisted: the per-cascade and per-spot shadow render matrices live at
+a **256-byte dynamic-offset stride** with a 64-byte `mat4` in each slice, and
+metis-data has no `@size`/`@align` override to declare a stride wider than the
+element. Those stay a raw buffer with a view per slice (`SHADOW_RENDER_STRIDE`).
+If that limitation is ever lifted they become an ordinary `ArrayOf`.
+
 ### Why "clustered forward," concretely
 
 `ClusteredForwardRenderer.render()` does, every frame: (1) write the camera/environment uniforms, (2) fit one orthographic frustum per cascade to its slice of the camera frustum and render a depth-only pass from the sun's viewpoint per cascade (`shadow.wgsl`), (3) run two compute passes — `cluster_build.wgsl` divides the view frustum into a fixed 16×9×24 grid with exponential depth slicing, `light_cull.wgsl` sphere-tests every local light against every cluster's AABB and writes a per-cluster light-index list — then (4) the actual forward pass, where `forward.wgsl`'s fragment shader looks up its own cluster and only shades the lights assigned to it, plus the sun (shadow-tested) and a flat ambient term. See `math/Clustered forward formulas.md` for the exact formulas, including the two real bugs hit building this (a room mesh's shadow frustum computed from instance *position* instead of mesh *extent*, and shadow-pass backface culling dropping a room's inward-facing geometry when viewed from outside by the light) and how they were diagnosed.
@@ -700,9 +749,25 @@ because the wrong belief is the actively dangerous artifact — "goldens drift
 between platforms, just revert them" licenses dismissing every image diff as
 noise, which is exactly how a real regression walks in unnoticed.
 
-**What this licenses.** A golden diff is now *signal*. `bun run fixture` followed
-by a clean `git status` means the render path reproduced exactly; a diff means
-something changed, and the first move is to find out what, not to revert.
+**What this licenses — and the posture to hold.** A golden diff is *signal*, not
+an alarm. `bun run fixture` followed by a clean `git status` means the render
+path reproduced exactly; a diff means something changed, and the useful move is
+to find out what.
+
+**This is an engine under active development, so goldens will drift, and that is
+normal.** Touch the BRDF, the light loop, the depth setup, the packing of a
+uniform — the pixels move. That is the system working. The goldens are a
+*change detector*, not a contract to be defended: their job is to make sure no
+change is invisible, not to make every change forbidden. Regenerating them is a
+routine part of landing a rendering change.
+
+What's actually being asked of you is small: **look before you regenerate, and
+say what you saw.** Decode both PNGs, check the delta distribution, and be able
+to state in one line whether the diff is the change you meant to make. "Rebased
+goldens: added the depth prepass, coplanar tie-break flipped, max Δ 3 on two
+surface seams" is a good commit line. Blind `git checkout` of a diff you never
+looked at is the only thing to avoid, because that's how a real regression rides
+in on the back of an intended one.
 
 **What this does NOT license — the bound.** The guarantee is uneven, and the two
 halves have very different strength:
@@ -721,11 +786,17 @@ halves have very different strength:
 
 So on genuinely different hardware (AMD, Intel, Apple, or a CI runner), goldens
 may legitimately differ: FMA contraction, transcendental precision, and
-fast-math latitude are all implementation-defined in shader compilation. Before
-calling such a diff a regression, look at its *shape* — a few LSBs scattered
-across the whole image is numeric drift; a structured or localised difference is
-a real change. Do not "fix" a cross-vendor diff by regenerating goldens on the
-new machine, or the baseline stops meaning anything on the old one.
+fast-math latitude are all implementation-defined in shader compilation. Read
+such a diff by its *shape* — a few LSBs scattered across the whole image is
+numeric drift; a structured or localised difference is a real change.
+
+The one case that genuinely isn't worth doing: silently regenerating a
+**cross-vendor** diff on a different machine than the baseline came from. Not
+because regenerating is wrong, but because the committed bytes then describe
+whichever GPU last ran the suite, and the file stops meaning anything on the
+other one. If the baseline should move to different hardware, that's a fine
+decision — just make it deliberately and note it, rather than letting it happen
+as a side effect of running the fixture somewhere new.
 
 This is also what makes `DOC.md`'s phrase "a byte-exact screenshot baseline"
 literally true rather than aspirational — it could not have been, while the
@@ -733,9 +804,9 @@ decoder varied by platform.
 
 #### The wgpu 24 → 30 upgrade rebased all eight goldens (2026-07-23)
 
-This is the first golden diff since the baseline was established, and it is
-recorded here as a **worked example of the "look at its shape" rule above**
-rather than as a licence to regenerate.
+This is the first golden diff since the baseline was established, and it is kept
+here as a **worked example of what "look at its shape" means in practice** —
+what the measurement looks like, and what conclusion it supports.
 
 The upgrade moved naga forward six major versions with it, so shader codegen
 changed — different FMA contraction and instruction selection produce different
@@ -756,11 +827,17 @@ specular edge where a hair's-worth of float difference crosses a rounding
 boundary. Nothing is structured or localised; no region moved, no shading term
 changed magnitude.
 
-**Redo this measurement, don't trust this table, if goldens drift again.** The
-method is the point: decode both PNGs, take the per-pixel max channel delta, and
-report the *distribution* — max, mean, and the counts above Δ=1 and Δ=8. A real
-regression shows up as a contiguous region or a large mean, and no amount of
-"it's probably just the driver" substitutes for the histogram.
+**The method is the point, not the table.** When goldens drift, redo the
+measurement rather than reasoning from these numbers: decode both PNGs, take the
+per-pixel max channel delta, and report the *distribution* — max, mean, and the
+counts above Δ=1 and Δ=8. It costs a minute and turns "the goldens changed" into
+a sentence you can put in the commit.
+
+Reading it: a large mean or a contiguous region means the image genuinely
+changed — which is the *expected* answer when you meant to change the renderer,
+and the interesting one when you didn't. Scattered single-LSB noise means
+compiler or driver drift. Either way you regenerate; the difference is what you
+write down.
 
 
 ### The headless target is sRGB, and it was silently wrong for a long time

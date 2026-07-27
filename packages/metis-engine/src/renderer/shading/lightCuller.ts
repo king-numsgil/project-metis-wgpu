@@ -22,18 +22,12 @@ import {
     MAX_LIGHTS,
     NUM_CLUSTERS,
 } from "./clusterConfig.ts";
-import { Std140Writer } from "./std140.ts";
+import { ClusterParams, GpuLight, GpuLightArray, stage, stageArray } from "./gpuLayouts.ts";
 import clusterBuildWgsl from "./wgsl/cluster_build.wgsl" with { type: "text" };
 import commonWgsl from "./wgsl/common.wgsl" with { type: "text" };
 import lightCullWgsl from "./wgsl/light_cull.wgsl" with { type: "text" };
 
-const CLUSTER_PARAMS_SIZE = 128; // mat4 invProj + vec4 + vec4<u32> + vec4<u32> + vec4 (depthBounds)
-// Keep in sync with common.wgsl's GpuLight:
-// worldPosition+range, viewPosition+intensity, color+cosOuter, worldDirection+spotScale.
-const LIGHT_STRIDE = 64;
-/** `worldDirection` for a point light — unused by the shader, written for determinism. */
-const ZERO_DIRECTION = vec3.create(0, 0, 0);
-const CLUSTER_AABB_STRIDE = 32; // vec3+pad, vec3+pad
+const CLUSTER_AABB_STRIDE = 32; // vec3+pad, vec3+pad — written by the shader only, no CPU layout needed
 const DISPATCH_GROUPS = Math.ceil(NUM_CLUSTERS / COMPUTE_WORKGROUP_SIZE);
 
 /**
@@ -55,6 +49,21 @@ export class LightCuller {
     readonly bindGroup: GpuBindGroup;
 
     private readonly device: GpuDevice;
+    private readonly paramsBytes: Uint8Array;
+    private readonly paramsStaging: {
+        invProj: Float32Array;
+        screenAndDepth: Float32Array;
+        counts: Uint32Array;
+        lightCount: Uint32Array;
+        cameraNear: Float32Array;
+    };
+    private readonly lightsBytes: Uint8Array;
+    private readonly lightStaging: Array<{
+        worldPositionRange: Float32Array;
+        viewPositionIntensity: Float32Array;
+        colorCosOuter: Float32Array;
+        directionSpotScale: Float32Array;
+    }>;
     private readonly clusterParamsBuffer: GpuBuffer;
     private readonly lightsBuffer: GpuBuffer;
     private readonly clusterAABBsBuffer: GpuBuffer;
@@ -69,14 +78,48 @@ export class LightCuller {
     constructor(device: GpuDevice) {
         this.device = device;
 
+        // Sizes and offsets come from gpuLayouts.ts; the staging buffers are
+        // allocated once here and rewritten in place each frame.
+        const params = stage(ClusterParams);
+        this.paramsBytes = params.bytes;
+        this.paramsStaging = {
+            invProj: params.f32("invProj", 16),
+            screenAndDepth: params.f32("screenAndDepth", 4),
+            counts: params.u32("counts", 4),
+            lightCount: params.u32("lightCount", 4),
+            cameraNear: params.f32("cameraNear", 4),
+        };
+        this.paramsStaging.counts[0] = CLUSTER_COUNT_X;
+        this.paramsStaging.counts[1] = CLUSTER_COUNT_Y;
+        this.paramsStaging.counts[2] = CLUSTER_COUNT_Z;
+        this.paramsStaging.counts[3] = MAX_LIGHTS_PER_CLUSTER;
+
+        const lights = stageArray(GpuLightArray, GpuLight);
+        this.lightsBytes = lights.bytes;
+        // Per-light member views, built once. Indexing these per frame is a
+        // typed-array store; the old path pushed every component onto a JS
+        // number[] and then walked it with DataView.setFloat32 — 6144 calls a
+        // frame at MAX_LIGHTS.
+        this.lightStaging = [];
+        for (let i = 0; i < MAX_LIGHTS; i++) {
+            this.lightStaging.push({
+                // Each vec3 is followed by its paired scalar in the same 16-byte
+                // slot, so a 4-element view covers both: [x, y, z, scalar].
+                worldPositionRange: lights.elementF32(i, "worldPosition", 4),
+                viewPositionIntensity: lights.elementF32(i, "viewPosition", 4),
+                colorCosOuter: lights.elementF32(i, "color", 4),
+                directionSpotScale: lights.elementF32(i, "worldDirection", 4),
+            });
+        }
+
         this.clusterParamsBuffer = device.createBuffer({
             label: "metis-engine/cluster-params",
-            size: CLUSTER_PARAMS_SIZE,
+            size: ClusterParams.byteSize,
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
         this.lightsBuffer = device.createBuffer({
             label: "metis-engine/point-lights",
-            size: MAX_LIGHTS * LIGHT_STRIDE,
+            size: GpuLightArray.byteSize,
             usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
         });
         this.clusterAABBsBuffer = device.createBuffer({
@@ -187,9 +230,8 @@ export class LightCuller {
      *   array, or fragments get shadowed by the wrong light's map.
      */
     write(scene: Scene, targets: RenderTargets, shadowSpots: SpotLight[] = []) {
-        const invProj = mat4.invert(scene.camera.projectionMatrix());
-        const params = new Std140Writer();
-        params.mat4(invProj);
+        const p = this.paramsStaging;
+        p.invProj.set(mat4.invert(scene.camera.projectionMatrix()) as Float32Array);
         // clusterFar, not a projection far plane — the reverse-Z projection is
         // infinite. The cluster grid needs a finite range to slice
         // exponentially; lights past it simply aren't culled into any cluster.
@@ -197,8 +239,11 @@ export class LightCuller {
         // projection's near plane, which is far too small to slice against.
         // See Camera.clusterNear.
         const clusterNear = Math.max(scene.camera.clusterNear, 1e-4);
-        params.vec4(targets.width, targets.height, clusterNear, scene.camera.clusterFar);
-        params.vec4u(CLUSTER_COUNT_X, CLUSTER_COUNT_Y, CLUSTER_COUNT_Z, MAX_LIGHTS_PER_CLUSTER);
+        p.screenAndDepth[0] = targets.width;
+        p.screenAndDepth[1] = targets.height;
+        p.screenAndDepth[2] = clusterNear;
+        p.screenAndDepth[3] = scene.camera.clusterFar;
+        // `counts` is constant and was written once at construction.
         // Shadow-casting spots first, in exactly the order SpotShadows rendered
         // them: a light's buffer index doubles as its shadow-map layer, which is
         // what keeps GpuLight at 64 bytes with no shadow-index field. Get this
@@ -209,19 +254,35 @@ export class LightCuller {
         const casters = new Set<Light>(shadowSpots);
         const ordered: Light[] = [...shadowSpots, ...scene.lights.filter((l) => !casters.has(l))];
         const lightCount = Math.min(ordered.length, MAX_LIGHTS);
-        params.vec4u(lightCount, 0, 0, 0);
+        p.lightCount[0] = lightCount;
         // True camera near — slice 0's AABB reaches down to this so geometry
         // closer than clusterNear keeps a correct light list.
-        params.vec4(scene.camera.near, 0, 0, 0);
-        this.device.queue.writeBuffer(this.clusterParamsBuffer, 0, params.toBytes());
+        p.cameraNear[0] = scene.camera.near;
+        this.device.queue.writeBuffer(this.clusterParamsBuffer, 0, this.paramsBytes);
 
         const view = scene.camera.viewMatrix();
-        const lights = new Std140Writer();
         for (let i = 0; i < lightCount; i++) {
             const light = ordered[i]!;
-            const viewPos = vec3.transformMat4(light.position, view);
-            lights.vec3(light.position, light.range);
-            lights.vec3(viewPos, light.intensity);
+            const s = this.lightStaging[i]!;
+
+            // Every write below lands *directly* in the packed GpuLight slot —
+            // there is no intermediate vector anywhere in this loop. The vec3
+            // ops take a `dst`, and each staging view is the 4-float
+            // [x, y, z, scalar] slot, so a vec3 op fills xyz and leaves the
+            // paired scalar for the assignment on the next line. Passing no
+            // `dst` (the obvious way to write this) allocates a Float32Array per
+            // call and then needs three stores to copy it in — two allocations
+            // and six stores per light, at up to MAX_LIGHTS a frame.
+            vec3.copy(light.position, s.worldPositionRange);
+            s.worldPositionRange[3] = light.range;
+
+            vec3.transformMat4(light.position, view, s.viewPositionIntensity);
+            s.viewPositionIntensity[3] = light.intensity;
+
+            s.colorCosOuter[0] = light.color[0];
+            s.colorCosOuter[1] = light.color[1];
+            s.colorCosOuter[2] = light.color[2];
+
             // A point light is encoded as a cone that can't reject anything:
             // cosOuter = -2 is below every possible cos, and spotScale = 1 then
             // saturates the shader's clamp to exactly 1.0. See common.wgsl's
@@ -232,16 +293,28 @@ export class LightCuller {
                 // Guard the reciprocal: outerAngle <= innerAngle (a degenerate
                 // or inverted cone) would divide by ~0. Clamping the
                 // denominator turns that into a hard-edged cone instead of Inf.
-                const spotScale = 1 / Math.max(cosInner - cosOuter, 1e-4);
-                lights.vec3(light.color, cosOuter);
-                lights.vec3(vec3.normalize(light.direction), spotScale);
+                s.colorCosOuter[3] = cosOuter;
+                vec3.normalize(light.direction, s.directionSpotScale);
+                s.directionSpotScale[3] = 1 / Math.max(cosInner - cosOuter, 1e-4);
             } else {
-                lights.vec3(light.color, -2);
-                lights.vec3(ZERO_DIRECTION, 1);
+                s.colorCosOuter[3] = -2;
+                // Zeroed explicitly rather than left stale: the staging buffer
+                // persists across frames now, so a slot that held a spot last
+                // frame would otherwise keep its direction.
+                s.directionSpotScale[0] = 0;
+                s.directionSpotScale[1] = 0;
+                s.directionSpotScale[2] = 0;
+                s.directionSpotScale[3] = 1;
             }
         }
         if (lightCount > 0) {
-            this.device.queue.writeBuffer(this.lightsBuffer, 0, lights.toBytes());
+            // Upload only the live prefix — the tail is stale but never read,
+            // since the shader loops to `lightCount`.
+            this.device.queue.writeBuffer(
+                this.lightsBuffer,
+                0,
+                this.lightsBytes.subarray(0, lightCount * GpuLight.byteSize),
+            );
         }
         if (ordered.length > MAX_LIGHTS) {
             console.warn(

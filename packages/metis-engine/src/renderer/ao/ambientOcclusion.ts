@@ -16,7 +16,7 @@ import type { GpuProfiler } from "../debug/gpuProfiler.ts";
 import type { RenderTargets } from "../rhi/targets.ts";
 import { MESH_VERTEX_LAYOUT } from "../scene/mesh.ts";
 import type { Scene } from "../scene/scene.ts";
-import { Std140Writer } from "../shading/std140.ts";
+import { AoUniforms, stage } from "../shading/gpuLayouts.ts";
 import {
     AO_NOISE_DIM,
     AoTechnique,
@@ -35,7 +35,6 @@ const NORMAL_FORMAT = "rgba16float" as const;
 const DEPTH_FORMAT = "depth32float" as const;
 const AO_FORMAT = "r8unorm" as const;
 
-const AO_UNIFORMS_SIZE = 288; // 4 * mat4 (256) + 2 * vec4 (32)
 const KERNEL_BUFFER_SIZE = SSAO_KERNEL_SIZE * 16; // vec4 per sample
 const NOISE_BUFFER_SIZE = AO_NOISE_DIM * AO_NOISE_DIM * 16; // vec4 per texel
 
@@ -79,6 +78,16 @@ export class AmbientOcclusion {
     private aoResultView!: GpuTextureView;
     // Static resources.
     private readonly uniforms: GpuBuffer;
+    /** Persistent staging, allocated once (see gpuLayouts.ts). */
+    private readonly uniformBytes: Uint8Array;
+    private readonly uniformStaging: {
+        view: Float32Array;
+        viewProj: Float32Array;
+        proj: Float32Array;
+        invProj: Float32Array;
+        screenAndDepth: Float32Array;
+        tuning: Float32Array;
+    };
     private readonly kernelBuffer: GpuBuffer;
     private readonly noiseBuffer: GpuBuffer;
     private readonly prepassPipeline: GpuRenderPipeline;
@@ -100,9 +109,19 @@ export class AmbientOcclusion {
 
         this.uniforms = device.createBuffer({
             label: "metis-engine/ao-uniforms",
-            size: AO_UNIFORMS_SIZE,
+            size: AoUniforms.byteSize,
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
+        const s = stage(AoUniforms);
+        this.uniformBytes = s.bytes;
+        this.uniformStaging = {
+            view: s.f32("view", 16),
+            viewProj: s.f32("viewProj", 16),
+            proj: s.f32("proj", 16),
+            invProj: s.f32("invProj", 16),
+            screenAndDepth: s.f32("screenAndDepth", 4),
+            tuning: s.f32("tuning", 4),
+        };
         this.kernelBuffer = device.createBuffer({
             label: "metis-engine/ao-ssao-kernel",
             size: KERNEL_BUFFER_SIZE,
@@ -346,17 +365,23 @@ export class AmbientOcclusion {
 
     private writeUniforms(scene: Scene) {
         const proj = scene.camera.projectionMatrix();
-        const w = new Std140Writer();
-        w.mat4(scene.camera.viewMatrix());
-        w.mat4(scene.camera.viewProjectionMatrix());
-        w.mat4(proj);
-        w.mat4(mat4.invert(proj));
+        const s = this.uniformStaging;
+        s.view.set(scene.camera.viewMatrix() as Float32Array);
+        s.viewProj.set(scene.camera.viewProjectionMatrix() as Float32Array);
+        s.proj.set(proj as Float32Array);
+        s.invProj.set(mat4.invert(proj) as Float32Array);
         // z/w are informational only (the AO shaders reconstruct through invProj
         // and read just params0.xy). `clusterFar` stands in for the projection's
         // far plane, which is infinite under reverse-Z and would poison the f32.
-        w.vec4(this.width, this.height, scene.camera.near, scene.camera.clusterFar);
-        w.vec4(this.radius, this.bias, this.intensity, this.power);
-        this.device.queue.writeBuffer(this.uniforms, 0, w.toBytes());
+        s.screenAndDepth[0] = this.width;
+        s.screenAndDepth[1] = this.height;
+        s.screenAndDepth[2] = scene.camera.near;
+        s.screenAndDepth[3] = scene.camera.clusterFar;
+        s.tuning[0] = this.radius;
+        s.tuning[1] = this.bias;
+        s.tuning[2] = this.intensity;
+        s.tuning[3] = this.power;
+        this.device.queue.writeBuffer(this.uniforms, 0, this.uniformBytes);
     }
 
     private destroyTextures() {

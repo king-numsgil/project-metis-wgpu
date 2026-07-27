@@ -154,30 +154,30 @@ export const Mat3 = {
         a: MatMemoryBuffer<S, 3>,
         b: MatMemoryBuffer<S, 3>,
     ): MatMemoryBuffer<S, 3> {
-        const aCol0 = a.get(0);
-        const aCol1 = a.get(1);
-        const aCol2 = a.get(2);
-        const bCol0 = b.get(0);
-        const bCol1 = b.get(1);
-        const bCol2 = b.get(2);
+        // View-based; all nine of each operand read before any write, so `out`
+        // may alias `a` or `b`. See mat4.ts's multiply for the same pattern.
+        const av = a.view(), bv = b.view(), ov = out.view();
+        const ac = a.columnElements, bc = b.columnElements, oc = out.columnElements;
 
-        // Matrix multiplication: result[i][j] = sum(a[i][k] * b[k][j])
-        // Since we store in column-major: result[j][i] = sum(a[k][i] * b[j][k])
-        out.set(0, [
-            aCol0[0]! * bCol0[0]! + aCol1[0]! * bCol0[1]! + aCol2[0]! * bCol0[2]!,
-            aCol0[1]! * bCol0[0]! + aCol1[1]! * bCol0[1]! + aCol2[1]! * bCol0[2]!,
-            aCol0[2]! * bCol0[0]! + aCol1[2]! * bCol0[1]! + aCol2[2]! * bCol0[2]!,
-        ] as TupleOf<3, number>);
-        out.set(1, [
-            aCol0[0]! * bCol1[0]! + aCol1[0]! * bCol1[1]! + aCol2[0]! * bCol1[2]!,
-            aCol0[1]! * bCol1[0]! + aCol1[1]! * bCol1[1]! + aCol2[1]! * bCol1[2]!,
-            aCol0[2]! * bCol1[0]! + aCol1[2]! * bCol1[1]! + aCol2[2]! * bCol1[2]!,
-        ] as TupleOf<3, number>);
-        out.set(2, [
-            aCol0[0]! * bCol2[0]! + aCol1[0]! * bCol2[1]! + aCol2[0]! * bCol2[2]!,
-            aCol0[1]! * bCol2[0]! + aCol1[1]! * bCol2[1]! + aCol2[1]! * bCol2[2]!,
-            aCol0[2]! * bCol2[0]! + aCol1[2]! * bCol2[1]! + aCol2[2]! * bCol2[2]!,
-        ] as TupleOf<3, number>);
+        const a00 = av[0] as number, a01 = av[1] as number, a02 = av[2] as number;
+        const a10 = av[ac] as number, a11 = av[ac + 1] as number, a12 = av[ac + 2] as number;
+        const a20 = av[2 * ac] as number, a21 = av[2 * ac + 1] as number, a22 = av[2 * ac + 2] as number;
+
+        const b00 = bv[0] as number, b01 = bv[1] as number, b02 = bv[2] as number;
+        const b10 = bv[bc] as number, b11 = bv[bc + 1] as number, b12 = bv[bc + 2] as number;
+        const b20 = bv[2 * bc] as number, b21 = bv[2 * bc + 1] as number, b22 = bv[2 * bc + 2] as number;
+
+        ov[0] = a00 * b00 + a10 * b01 + a20 * b02;
+        ov[1] = a01 * b00 + a11 * b01 + a21 * b02;
+        ov[2] = a02 * b00 + a12 * b01 + a22 * b02;
+
+        ov[oc] = a00 * b10 + a10 * b11 + a20 * b12;
+        ov[oc + 1] = a01 * b10 + a11 * b11 + a21 * b12;
+        ov[oc + 2] = a02 * b10 + a12 * b11 + a22 * b12;
+
+        ov[2 * oc] = a00 * b20 + a10 * b21 + a20 * b22;
+        ov[2 * oc + 1] = a01 * b20 + a11 * b21 + a21 * b22;
+        ov[2 * oc + 2] = a02 * b20 + a12 * b21 + a22 * b22;
         return out;
     },
 

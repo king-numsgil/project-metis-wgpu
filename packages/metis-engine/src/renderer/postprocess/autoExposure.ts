@@ -8,7 +8,7 @@ import {
     type GpuDevice,
     GPUShaderStage,
 } from "metis-native";
-import { Std140Writer } from "../shading/std140.ts";
+import { AutoExposureParams, stage } from "../shading/gpuLayouts.ts";
 import type { ExposureState } from "./exposureState.ts";
 import type { LuminanceAveragePass } from "./luminanceAverage.ts";
 import type { PostProcessFrameContext, PostProcessPass } from "./pipeline.ts";
@@ -25,9 +25,11 @@ export class AutoExposurePass implements PostProcessPass {
 
     /** Records the single-workgroup compute pass that steps `ExposureState` toward the metered target by `ctx.deltaTime`. */
     execute(encoder: GpuCommandEncoder, ctx: PostProcessFrameContext): void {
-        const params = new Std140Writer();
-        params.vec4(ctx.deltaTime, this.adaptationTau, this.exposureCompensation, 0);
-        this.device.queue.writeBuffer(this.paramsBuffer, 0, params.toBytes());
+        const p = this.paramsStaging;
+        p[0] = ctx.deltaTime;
+        p[1] = this.adaptationTau;
+        p[2] = this.exposureCompensation;
+        this.device.queue.writeBuffer(this.paramsBuffer, 0, this.paramsBytes);
 
         const pass = encoder.beginComputePass({
             label: "metis-engine/auto-exposure-pass",
@@ -49,6 +51,9 @@ export class AutoExposurePass implements PostProcessPass {
     exposureCompensation = 1.0;
     private readonly device: GpuDevice;
     private readonly paramsBuffer: GpuBuffer;
+    /** Persistent staging, allocated once (see gpuLayouts.ts). */
+    private readonly paramsBytes: Uint8Array;
+    private readonly paramsStaging: Float32Array;
     private readonly bindGroupLayout: GpuBindGroupLayout;
     private readonly pipeline: GpuComputePipeline;
     private readonly bindGroup: GpuBindGroup;
@@ -61,9 +66,12 @@ export class AutoExposurePass implements PostProcessPass {
         this.device = device;
         this.paramsBuffer = device.createBuffer({
             label: "metis-engine/auto-exposure-params",
-            size: 16,
+            size: AutoExposureParams.byteSize,
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
+        const s = stage(AutoExposureParams);
+        this.paramsBytes = s.bytes;
+        this.paramsStaging = s.f32("params", 4);
         this.bindGroupLayout = device.createBindGroupLayout({
             label: "metis-engine/auto-exposure-bgl",
             entries: [

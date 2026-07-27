@@ -185,41 +185,46 @@ export const Mat4 = {
         a: MatMemoryBuffer<S, 4>,
         b: MatMemoryBuffer<S, 4>,
     ): MatMemoryBuffer<S, 4> {
-        const aCol0 = a.get(0);
-        const aCol1 = a.get(1);
-        const aCol2 = a.get(2);
-        const aCol3 = a.get(3);
-        const bCol0 = b.get(0);
-        const bCol1 = b.get(1);
-        const bCol2 = b.get(2);
-        const bCol3 = b.get(3);
+        // View-based: reads and writes go through the cached typed arrays, with
+        // no per-column tuple. `ac`/`bc`/`oc` are column strides in *elements*
+        // — under Std140 that is not always N (see MatMemoryBuffer.columnElements).
+        const av = a.view(), bv = b.view(), ov = out.view();
+        const ac = a.columnElements, bc = b.columnElements, oc = out.columnElements;
 
-        // Matrix multiplication: result[i][j] = sum(a[i][k] * b[k][j])
-        // Since we store in column-major: result[j][i] = sum(a[k][i] * b[j][k])
-        out.set(0, [
-            aCol0[0]! * bCol0[0]! + aCol1[0]! * bCol0[1]! + aCol2[0]! * bCol0[2]! + aCol3[0]! * bCol0[3]!,
-            aCol0[1]! * bCol0[0]! + aCol1[1]! * bCol0[1]! + aCol2[1]! * bCol0[2]! + aCol3[1]! * bCol0[3]!,
-            aCol0[2]! * bCol0[0]! + aCol1[2]! * bCol0[1]! + aCol2[2]! * bCol0[2]! + aCol3[2]! * bCol0[3]!,
-            aCol0[3]! * bCol0[0]! + aCol1[3]! * bCol0[1]! + aCol2[3]! * bCol0[2]! + aCol3[3]! * bCol0[3]!,
-        ] as TupleOf<4, number>);
-        out.set(1, [
-            aCol0[0]! * bCol1[0]! + aCol1[0]! * bCol1[1]! + aCol2[0]! * bCol1[2]! + aCol3[0]! * bCol1[3]!,
-            aCol0[1]! * bCol1[0]! + aCol1[1]! * bCol1[1]! + aCol2[1]! * bCol1[2]! + aCol3[1]! * bCol1[3]!,
-            aCol0[2]! * bCol1[0]! + aCol1[2]! * bCol1[1]! + aCol2[2]! * bCol1[2]! + aCol3[2]! * bCol1[3]!,
-            aCol0[3]! * bCol1[0]! + aCol1[3]! * bCol1[1]! + aCol2[3]! * bCol1[2]! + aCol3[3]! * bCol1[3]!,
-        ] as TupleOf<4, number>);
-        out.set(2, [
-            aCol0[0]! * bCol2[0]! + aCol1[0]! * bCol2[1]! + aCol2[0]! * bCol2[2]! + aCol3[0]! * bCol2[3]!,
-            aCol0[1]! * bCol2[0]! + aCol1[1]! * bCol2[1]! + aCol2[1]! * bCol2[2]! + aCol3[1]! * bCol2[3]!,
-            aCol0[2]! * bCol2[0]! + aCol1[2]! * bCol2[1]! + aCol2[2]! * bCol2[2]! + aCol3[2]! * bCol2[3]!,
-            aCol0[3]! * bCol2[0]! + aCol1[3]! * bCol2[1]! + aCol2[3]! * bCol2[2]! + aCol3[3]! * bCol2[3]!,
-        ] as TupleOf<4, number>);
-        out.set(3, [
-            aCol0[0]! * bCol3[0]! + aCol1[0]! * bCol3[1]! + aCol2[0]! * bCol3[2]! + aCol3[0]! * bCol3[3]!,
-            aCol0[1]! * bCol3[0]! + aCol1[1]! * bCol3[1]! + aCol2[1]! * bCol3[2]! + aCol3[1]! * bCol3[3]!,
-            aCol0[2]! * bCol3[0]! + aCol1[2]! * bCol3[1]! + aCol2[2]! * bCol3[2]! + aCol3[2]! * bCol3[3]!,
-            aCol0[3]! * bCol3[0]! + aCol1[3]! * bCol3[1]! + aCol2[3]! * bCol3[2]! + aCol3[3]! * bCol3[3]!,
-        ] as TupleOf<4, number>);
+        // Every operand is read into locals BEFORE any output is written, which
+        // is what makes `out` safe to alias with `a` or `b` — each output column
+        // depends on all four input columns, so writing column 0 early would
+        // corrupt the rest. Pinned by test/aliasingMat.test.ts.
+        const a00 = av[0] as number, a01 = av[1] as number, a02 = av[2] as number, a03 = av[3] as number;
+        const a10 = av[ac] as number, a11 = av[ac + 1] as number, a12 = av[ac + 2] as number, a13 = av[ac + 3] as number;
+        const a20 = av[2 * ac] as number, a21 = av[2 * ac + 1] as number, a22 = av[2 * ac + 2] as number, a23 = av[2 * ac + 3] as number;
+        const a30 = av[3 * ac] as number, a31 = av[3 * ac + 1] as number, a32 = av[3 * ac + 2] as number, a33 = av[3 * ac + 3] as number;
+
+        const b00 = bv[0] as number, b01 = bv[1] as number, b02 = bv[2] as number, b03 = bv[3] as number;
+        const b10 = bv[bc] as number, b11 = bv[bc + 1] as number, b12 = bv[bc + 2] as number, b13 = bv[bc + 3] as number;
+        const b20 = bv[2 * bc] as number, b21 = bv[2 * bc + 1] as number, b22 = bv[2 * bc + 2] as number, b23 = bv[2 * bc + 3] as number;
+        const b30 = bv[3 * bc] as number, b31 = bv[3 * bc + 1] as number, b32 = bv[3 * bc + 2] as number, b33 = bv[3 * bc + 3] as number;
+
+        // Column-major: result column j = sum over k of (a column k) * b[j][k].
+        ov[0] = a00 * b00 + a10 * b01 + a20 * b02 + a30 * b03;
+        ov[1] = a01 * b00 + a11 * b01 + a21 * b02 + a31 * b03;
+        ov[2] = a02 * b00 + a12 * b01 + a22 * b02 + a32 * b03;
+        ov[3] = a03 * b00 + a13 * b01 + a23 * b02 + a33 * b03;
+
+        ov[oc] = a00 * b10 + a10 * b11 + a20 * b12 + a30 * b13;
+        ov[oc + 1] = a01 * b10 + a11 * b11 + a21 * b12 + a31 * b13;
+        ov[oc + 2] = a02 * b10 + a12 * b11 + a22 * b12 + a32 * b13;
+        ov[oc + 3] = a03 * b10 + a13 * b11 + a23 * b12 + a33 * b13;
+
+        ov[2 * oc] = a00 * b20 + a10 * b21 + a20 * b22 + a30 * b23;
+        ov[2 * oc + 1] = a01 * b20 + a11 * b21 + a21 * b22 + a31 * b23;
+        ov[2 * oc + 2] = a02 * b20 + a12 * b21 + a22 * b22 + a32 * b23;
+        ov[2 * oc + 3] = a03 * b20 + a13 * b21 + a23 * b22 + a33 * b23;
+
+        ov[3 * oc] = a00 * b30 + a10 * b31 + a20 * b32 + a30 * b33;
+        ov[3 * oc + 1] = a01 * b30 + a11 * b31 + a21 * b32 + a31 * b33;
+        ov[3 * oc + 2] = a02 * b30 + a12 * b31 + a22 * b32 + a32 * b33;
+        ov[3 * oc + 3] = a03 * b30 + a13 * b31 + a23 * b32 + a33 * b33;
         return out;
     },
 
@@ -286,53 +291,77 @@ export const Mat4 = {
         out: MatMemoryBuffer<S, 4>,
         m: MatMemoryBuffer<S, 4>,
     ): MatMemoryBuffer<S, 4> {
-        const [m00, m01, m02, m03] = m.get(0);
-        const [m10, m11, m12, m13] = m.get(1);
-        const [m20, m21, m22, m23] = m.get(2);
-        const [m30, m31, m32, m33] = m.get(3);
+        const mv = m.view(), ov = out.view();
+        const mc = m.columnElements, oc = out.columnElements;
 
-        // Calculate the determinant
-        const det = m00 * (m11 * (m22 * m33 - m23 * m32) - m12 * (m21 * m33 - m23 * m31) + m13 * (m21 * m32 - m22 * m31)) -
-            m01 * (m10 * (m22 * m33 - m23 * m32) - m12 * (m20 * m33 - m23 * m30) + m13 * (m20 * m32 - m22 * m30)) +
-            m02 * (m10 * (m21 * m33 - m23 * m31) - m11 * (m20 * m33 - m23 * m30) + m13 * (m20 * m31 - m21 * m30)) -
-            m03 * (m10 * (m21 * m32 - m22 * m31) - m11 * (m20 * m32 - m22 * m30) + m12 * (m20 * m31 - m21 * m30));
+        // All 16 read before any write — `out` may alias `m`.
+        const m00 = mv[0] as number, m01 = mv[1] as number, m02 = mv[2] as number, m03 = mv[3] as number;
+        const m10 = mv[mc] as number, m11 = mv[mc + 1] as number, m12 = mv[mc + 2] as number, m13 = mv[mc + 3] as number;
+        const m20 = mv[2 * mc] as number, m21 = mv[2 * mc + 1] as number, m22 = mv[2 * mc + 2] as number, m23 = mv[2 * mc + 3] as number;
+        const m30 = mv[3 * mc] as number, m31 = mv[3 * mc + 1] as number, m32 = mv[3 * mc + 2] as number, m33 = mv[3 * mc + 3] as number;
+
+        // 2x2 minors of the bottom two rows, each used several times below. The
+        // previous version recomputed every one of these inline — the same
+        // subexpression appears up to six times across the adjugate.
+        const s0 = m22 * m33 - m23 * m32;
+        const s1 = m21 * m33 - m23 * m31;
+        const s2 = m21 * m32 - m22 * m31;
+        const s3 = m20 * m33 - m23 * m30;
+        const s4 = m20 * m32 - m22 * m30;
+        const s5 = m20 * m31 - m21 * m30;
+        const s6 = m12 * m33 - m13 * m32;
+        const s7 = m11 * m33 - m13 * m31;
+        const s8 = m11 * m32 - m12 * m31;
+        const s9 = m10 * m33 - m13 * m30;
+        const s10 = m10 * m32 - m12 * m30;
+        const s11 = m10 * m31 - m11 * m30;
+        const s12 = m12 * m23 - m13 * m22;
+        const s13 = m11 * m23 - m13 * m21;
+        const s14 = m11 * m22 - m12 * m21;
+        const s15 = m10 * m23 - m13 * m20;
+        const s16 = m10 * m22 - m12 * m20;
+        const s17 = m10 * m21 - m11 * m20;
+
+        const c0 = m11 * s0 - m12 * s1 + m13 * s2;
+        const c1 = m10 * s0 - m12 * s3 + m13 * s4;
+        const c2 = m10 * s1 - m11 * s3 + m13 * s5;
+        const c3 = m10 * s2 - m11 * s4 + m12 * s5;
+
+        const det = m00 * c0 - m01 * c1 + m02 * c2 - m03 * c3;
 
         if (det === 0) {
-            // Matrix is not invertible, return zero matrix
-            out.set(0, [0, 0, 0, 0] as TupleOf<4, number>);
-            out.set(1, [0, 0, 0, 0] as TupleOf<4, number>);
-            out.set(2, [0, 0, 0, 0] as TupleOf<4, number>);
-            out.set(3, [0, 0, 0, 0] as TupleOf<4, number>);
+            // Not invertible — zero matrix, matching the previous behaviour.
+            for (let col = 0; col < 4; col++) {
+                ov[col * oc] = 0;
+                ov[col * oc + 1] = 0;
+                ov[col * oc + 2] = 0;
+                ov[col * oc + 3] = 0;
+            }
             return out;
         }
 
         const invDet = 1 / det;
 
-        // Calculate adjugate matrix (transpose of cofactor matrix)
-        out.set(0, [
-            (m11 * (m22 * m33 - m23 * m32) - m12 * (m21 * m33 - m23 * m31) + m13 * (m21 * m32 - m22 * m31)) * invDet,
-            (-m01 * (m22 * m33 - m23 * m32) + m02 * (m21 * m33 - m23 * m31) - m03 * (m21 * m32 - m22 * m31)) * invDet,
-            (m01 * (m12 * m33 - m13 * m32) - m02 * (m11 * m33 - m13 * m31) + m03 * (m11 * m32 - m12 * m31)) * invDet,
-            (-m01 * (m12 * m23 - m13 * m22) + m02 * (m11 * m23 - m13 * m21) - m03 * (m11 * m22 - m12 * m21)) * invDet,
-        ] as TupleOf<4, number>);
-        out.set(1, [
-            (-m10 * (m22 * m33 - m23 * m32) + m12 * (m20 * m33 - m23 * m30) - m13 * (m20 * m32 - m22 * m30)) * invDet,
-            (m00 * (m22 * m33 - m23 * m32) - m02 * (m20 * m33 - m23 * m30) + m03 * (m20 * m32 - m22 * m30)) * invDet,
-            (-m00 * (m12 * m33 - m13 * m32) + m02 * (m10 * m33 - m13 * m30) - m03 * (m10 * m32 - m12 * m30)) * invDet,
-            (m00 * (m12 * m23 - m13 * m22) - m02 * (m10 * m23 - m13 * m20) + m03 * (m10 * m22 - m12 * m20)) * invDet,
-        ] as TupleOf<4, number>);
-        out.set(2, [
-            (m10 * (m21 * m33 - m23 * m31) - m11 * (m20 * m33 - m23 * m30) + m13 * (m20 * m31 - m21 * m30)) * invDet,
-            (-m00 * (m21 * m33 - m23 * m31) + m01 * (m20 * m33 - m23 * m30) - m03 * (m20 * m31 - m21 * m30)) * invDet,
-            (m00 * (m11 * m33 - m13 * m31) - m01 * (m10 * m33 - m13 * m30) + m03 * (m10 * m31 - m11 * m30)) * invDet,
-            (-m00 * (m11 * m23 - m13 * m21) + m01 * (m10 * m23 - m13 * m20) - m03 * (m10 * m21 - m11 * m20)) * invDet,
-        ] as TupleOf<4, number>);
-        out.set(3, [
-            (-m10 * (m21 * m32 - m22 * m31) + m11 * (m20 * m32 - m22 * m30) - m12 * (m20 * m31 - m21 * m30)) * invDet,
-            (m00 * (m21 * m32 - m22 * m31) - m01 * (m20 * m32 - m22 * m30) + m02 * (m20 * m31 - m21 * m30)) * invDet,
-            (-m00 * (m11 * m32 - m12 * m31) + m01 * (m10 * m32 - m12 * m30) - m02 * (m10 * m31 - m11 * m30)) * invDet,
-            (m00 * (m11 * m22 - m12 * m21) - m01 * (m10 * m22 - m12 * m20) + m02 * (m10 * m21 - m11 * m20)) * invDet,
-        ] as TupleOf<4, number>);
+        // Adjugate (transpose of the cofactor matrix), scaled by 1/det.
+        ov[0] = c0 * invDet;
+        ov[1] = (-m01 * s0 + m02 * s1 - m03 * s2) * invDet;
+        ov[2] = (m01 * s6 - m02 * s7 + m03 * s8) * invDet;
+        ov[3] = (-m01 * s12 + m02 * s13 - m03 * s14) * invDet;
+
+        ov[oc] = -c1 * invDet;
+        ov[oc + 1] = (m00 * s0 - m02 * s3 + m03 * s4) * invDet;
+        ov[oc + 2] = (-m00 * s6 + m02 * s9 - m03 * s10) * invDet;
+        ov[oc + 3] = (m00 * s12 - m02 * s15 + m03 * s16) * invDet;
+
+        ov[2 * oc] = c2 * invDet;
+        ov[2 * oc + 1] = (-m00 * s1 + m01 * s3 - m03 * s5) * invDet;
+        ov[2 * oc + 2] = (m00 * s7 - m01 * s9 + m03 * s11) * invDet;
+        ov[2 * oc + 3] = (-m00 * s13 + m01 * s15 - m03 * s17) * invDet;
+
+        ov[3 * oc] = -c3 * invDet;
+        ov[3 * oc + 1] = (m00 * s2 - m01 * s4 + m02 * s5) * invDet;
+        ov[3 * oc + 2] = (-m00 * s8 + m01 * s10 - m02 * s11) * invDet;
+        ov[3 * oc + 3] = (m00 * s14 - m01 * s16 + m02 * s17) * invDet;
         return out;
     },
 
@@ -725,6 +754,61 @@ export const Mat4 = {
      * Combines translation (tx, ty, tz), rotation (quaternion), and scale (sx, sy, sz)
      * into a single transformation matrix: T * R * S
      */
+    /**
+     * Compose translation * rotation * scale into `out` — the out-first,
+     * allocation-free counterpart to {@link fromTRS}.
+     *
+     * Identical result to `fromTRS`, which builds three intermediate matrices
+     * and multiplies them. That is fine for setup, but this is the shape a
+     * renderer calls per instance per frame, so it writes the closed form
+     * directly: the rotation's columns scaled by `sx`/`sy`/`sz`, plus the
+     * translation column. Safe when `out` aliases nothing else (`q` is only
+     * read).
+     *
+     * The quaternion convention matches {@link rotation} exactly — change one
+     * and this silently disagrees with it.
+     */
+    composeTRS<S extends ScalarDescriptor>(
+        out: MatMemoryBuffer<S, 4>,
+        tx: number,
+        ty: number,
+        tz: number,
+        q: VecMemoryBuffer<S, 4>,
+        sx: number,
+        sy: number,
+        sz: number,
+    ): MatMemoryBuffer<S, 4> {
+        const qv = q.view();
+        const x = qv[0] as number, y = qv[1] as number, z = qv[2] as number, w = qv[3] as number;
+        const ov = out.view();
+        const c = out.columnElements;
+
+        const xx = x * x, yy = y * y, zz = z * z;
+        const xy = x * y, xz = x * z, yz = y * z;
+        const wx = w * x, wy = w * y, wz = w * z;
+
+        ov[0] = (1 - 2 * (yy + zz)) * sx;
+        ov[1] = (2 * (xy + wz)) * sx;
+        ov[2] = (2 * (xz - wy)) * sx;
+        ov[3] = 0;
+
+        ov[c] = (2 * (xy - wz)) * sy;
+        ov[c + 1] = (1 - 2 * (xx + zz)) * sy;
+        ov[c + 2] = (2 * (yz + wx)) * sy;
+        ov[c + 3] = 0;
+
+        ov[2 * c] = (2 * (xz + wy)) * sz;
+        ov[2 * c + 1] = (2 * (yz - wx)) * sz;
+        ov[2 * c + 2] = (1 - 2 * (xx + yy)) * sz;
+        ov[2 * c + 3] = 0;
+
+        ov[3 * c] = tx;
+        ov[3 * c + 1] = ty;
+        ov[3 * c + 2] = tz;
+        ov[3 * c + 3] = 1;
+        return out;
+    },
+
     fromTRS<S extends ScalarDescriptor>(
         scalar: S = F32 as S,
         tx: number,

@@ -18,38 +18,17 @@ import { transformToMat4 } from "../math/transform.ts";
 import type { Light, SpotLight } from "../scene/light.ts";
 import { MESH_VERTEX_LAYOUT } from "../scene/mesh.ts";
 import type { Scene } from "../scene/scene.ts";
-import { Std140Writer } from "./std140.ts";
+import { MAX_SHADOW_SPOTS, SPOT_SHADOW_MAP_SIZE } from "./shadowConfig.ts";
+import { SHADOW_RENDER_STRIDE, SpotShadowUniforms, stage } from "./gpuLayouts.ts";
 import commonWgsl from "./wgsl/common.wgsl" with { type: "text" };
 import shadowWgsl from "./wgsl/shadow.wgsl" with { type: "text" };
 
-/**
- * How many spot lights may cast shadows in one frame. This is a **compile-time**
- * bound, not a runtime dial: it sizes the depth array and the `array<mat4x4>` in
- * `SpotShadowUniforms`, and WGSL array lengths must be constant. Changing it is
- * a one-line edit plus a rebuild, but it is not something to set per scene.
- *
- * Four is deliberately modest. The intent is that scene code selects *which*
- * four matter for the current space (a galley's fixtures, then a cargo bay's)
- * rather than the renderer trying to shadow every spot at once — see CLAUDE.md
- * "Spot light shadows".
- */
-export const MAX_SHADOW_SPOTS = 4;
-
-/**
- * Per-light shadow map resolution. Lower than the sun's `SHADOW_MAP_SIZE`
- * because a spot's frustum covers a bounded cone rather than a whole cascade
- * slice, so each texel already subtends far less world space.
- *
- * VRAM = MAX_SHADOW_SPOTS × SPOT_SHADOW_MAP_SIZE² × 4 bytes (≈ 16.8 MB at 4 ×
- * 1024²). Doubling this quadruples that.
- */
-export const SPOT_SHADOW_MAP_SIZE = 1024;
+// Defined in shadowConfig.ts (a leaf module) so gpuLayouts.ts can size its
+// descriptor arrays without importing this file back — see shadowConfig.ts.
+// Re-exported here so the public import path is unchanged.
+export { MAX_SHADOW_SPOTS, SPOT_SHADOW_MAP_SIZE };
 
 const SHADOW_DEPTH_FORMAT = "depth32float" as const;
-/** 256-byte slices so one buffer can back a per-light offset bind group. */
-const RENDER_STRIDE = 256;
-/** mat4[4] (256) + texelScale vec4 (16) + params vec4 (16). Keep in sync with common.wgsl. */
-const FORWARD_UNIFORM_SIZE = 288;
 
 /**
  * Normal-offset bias, in texels of the *spot's own* map. Unlike the sun's
@@ -66,6 +45,12 @@ const SPOT_NORMAL_OFFSET_TEXELS = 1.5;
  * cropped) rather than a NaN matrix.
  */
 const MAX_SHADOW_FOV = (150 * Math.PI) / 180;
+
+/** Reused for inactive shadow layers rather than allocating an identity per frame. */
+const IDENTITY = mat4.identity();
+/** Shared up-vector constants — the choice only spins the map about its own axis. */
+const UP_X = vec3.create(1, 0, 0);
+const UP_Y = vec3.create(0, 1, 0);
 /**
  * Near plane as a fraction of the light's range. Perspective depth precision is
  * dominated by the far/near ratio, so this can't be tiny; 2% of range keeps the
@@ -120,6 +105,17 @@ export class SpotShadows {
     private readonly renderBindGroups: GpuBindGroup[];
     private readonly pipeline: GpuRenderPipeline;
     private readonly frustum: Frustum = new Float32Array(24);
+    /** Persistent staging, allocated once (see gpuLayouts.ts). */
+    private readonly renderBytes: Uint8Array;
+    private readonly renderMatrices: Float32Array[];
+    private readonly forwardBytes: Uint8Array;
+    private readonly forwardStaging: {viewProj: Float32Array; texelScale: Float32Array; params: Float32Array};
+    /** Per-frame scratch, so `render` allocates nothing for its matrix setup. */
+    private readonly dirScratch = vec3.create(0, 0, 0);
+    private readonly targetScratch = vec3.create(0, 0, 0);
+    private readonly viewScratch = mat4.identity();
+    private readonly projScratch = mat4.identity();
+    private readonly texelScaleScratch = new Float32Array(MAX_SHADOW_SPOTS);
 
     /**
      * Instances actually drawn across all spot shadow passes last frame.
@@ -156,14 +152,35 @@ export class SpotShadows {
 
         this.renderBuffer = device.createBuffer({
             label: "metis-engine/spot-shadow-render-uniforms",
-            size: MAX_SHADOW_SPOTS * RENDER_STRIDE,
+            size: MAX_SHADOW_SPOTS * SHADOW_RENDER_STRIDE,
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
         this.uniformBuffer = device.createBuffer({
             label: "metis-engine/spot-shadow-forward-uniforms",
-            size: FORWARD_UNIFORM_SIZE,
+            size: SpotShadowUniforms.byteSize,
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
+
+        // Same 256-stride slicing as the sun cascades — see SHADOW_RENDER_STRIDE.
+        this.renderBytes = new Uint8Array(MAX_SHADOW_SPOTS * SHADOW_RENDER_STRIDE);
+        this.renderMatrices = [];
+        for (let i = 0; i < MAX_SHADOW_SPOTS; i++) {
+            this.renderMatrices.push(
+                new Float32Array(this.renderBytes.buffer, i * SHADOW_RENDER_STRIDE, 16),
+            );
+        }
+
+        const fw = stage(SpotShadowUniforms);
+        this.forwardBytes = fw.bytes;
+        this.forwardStaging = {
+            viewProj: fw.f32("viewProj", MAX_SHADOW_SPOTS * 16),
+            texelScale: fw.f32("texelScale", 4),
+            params: fw.f32("params", 4),
+        };
+        // Constant for the lifetime of the object; only params[0] (the live
+        // caster count) changes per frame.
+        this.forwardStaging.params[1] = SPOT_SHADOW_MAP_SIZE;
+        this.forwardStaging.params[2] = SPOT_NORMAL_OFFSET_TEXELS;
 
         const frameBGL = device.createBindGroupLayout({
             label: "metis-engine/spot-shadow-frame-bgl",
@@ -176,7 +193,7 @@ export class SpotShadows {
                 layout: frameBGL,
                 entries: [{
                     binding: 0,
-                    buffer: {buffer: this.renderBuffer, offset: i * RENDER_STRIDE, size: 64},
+                    buffer: {buffer: this.renderBuffer, offset: i * SHADOW_RENDER_STRIDE, size: 64},
                 }],
             }));
         }
@@ -209,44 +226,46 @@ export class SpotShadows {
      * would otherwise be sampled by a light that inherited its index later.
      */
     render(encoder: GpuCommandEncoder, scene: Scene, spots: SpotLight[], profiler?: GpuProfiler) {
-        const viewProjs: Mat4Arg[] = [];
-        const texelScale = [0, 0, 0, 0];
+        const texelScale = this.texelScaleScratch;
 
         for (let i = 0; i < spots.length; i++) {
             const spot = spots[i]!;
-            const dir = vec3.normalize(spot.direction);
-            const eye = vec3.clone(spot.position);
-            const target = vec3.add(eye, dir);
+            const dir = vec3.normalize(spot.direction, this.dirScratch);
+            const target = vec3.add(spot.position, dir, this.targetScratch);
             // Any up vector not parallel to the cone axis; the choice only spins
             // the map about its own axis, which is invisible.
-            const up = Math.abs(dir[1]!) > 0.99 ? vec3.create(1, 0, 0) : vec3.create(0, 1, 0);
-            const view = mat4.lookAt(eye, target, up);
+            const up = Math.abs(dir[1]!) > 0.99 ? UP_X : UP_Y;
+            const view = mat4.lookAt(spot.position, target, up, this.viewScratch);
 
             // Full field of view is twice the cone's half-angle, plus a small
             // margin so the cone's own soft edge isn't clipped by the map border.
             const fov = Math.min(Math.max(spot.outerAngle * 2.1, 1e-3), MAX_SHADOW_FOV);
             const near = Math.max(spot.range * NEAR_FRACTION, 1e-3);
-            const proj = mat4.perspective(fov, 1, near, Math.max(spot.range, near * 2));
-            viewProjs.push(mat4.multiply(proj, view));
+            const proj = mat4.perspective(fov, 1, near, Math.max(spot.range, near * 2), this.projScratch);
+            // Straight into the 256-stride render slice — this matrix used to be
+            // allocated and then copied into two places.
+            mat4.multiply(proj, view, this.renderMatrices[i]!);
             // World size of one texel per unit distance from the light — the
             // shader multiplies this by the receiver's distance to size its
             // normal offset, since a perspective map's texels grow with depth.
             texelScale[i] = (2 * Math.tan(fov / 2)) / SPOT_SHADOW_MAP_SIZE;
         }
 
-        for (let i = 0; i < spots.length; i++) {
-            const w = new Std140Writer();
-            w.mat4(viewProjs[i]!);
-            this.device.queue.writeBuffer(this.renderBuffer, i * RENDER_STRIDE, w.toBytes());
-        }
-
-        const fw = new Std140Writer();
+        const fw = this.forwardStaging;
         for (let i = 0; i < MAX_SHADOW_SPOTS; i++) {
-            fw.mat4(viewProjs[i] ?? mat4.identity());
+            // Inactive layers get identity — they are still cleared and sampled
+            // with an activeCount guard, so the matrix only has to be finite.
+            // (Also clears a matrix left over from a previous frame's caster.)
+            if (i >= spots.length) {
+                this.renderMatrices[i]!.set(IDENTITY as Float32Array);
+            }
+            fw.viewProj.set(this.renderMatrices[i]!, i * 16);
+            fw.texelScale[i] = texelScale[i]!;
         }
-        fw.vec4(texelScale[0]!, texelScale[1]!, texelScale[2]!, texelScale[3]!);
-        fw.vec4(spots.length, SPOT_SHADOW_MAP_SIZE, SPOT_NORMAL_OFFSET_TEXELS, 0);
-        this.device.queue.writeBuffer(this.uniformBuffer, 0, fw.toBytes());
+        fw.params[0] = spots.length;
+
+        this.device.queue.writeBuffer(this.renderBuffer, 0, this.renderBytes);
+        this.device.queue.writeBuffer(this.uniformBuffer, 0, this.forwardBytes);
 
         // World bounding spheres once per frame, reused across every light's
         // frustum test rather than recomputed per (light, instance).
@@ -273,7 +292,7 @@ export class SpotShadows {
             // Unused layers still get the clear pass above — that's what makes a
             // stale layer impossible — but draw nothing.
             if (i < spots.length) {
-                frustumFromViewProj(viewProjs[i]!, this.frustum);
+                frustumFromViewProj(this.renderMatrices[i]!, this.frustum);
                 pass.setPipeline(this.pipeline);
                 pass.setBindGroup(0, this.renderBindGroups[i]!);
                 for (let k = 0; k < scene.instances.length; k++) {

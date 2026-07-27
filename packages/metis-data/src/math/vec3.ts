@@ -1,9 +1,20 @@
-import { allocate, F32, type ScalarDescriptor, Vec, type VecMemoryBuffer } from "metis-data";
-import type { TupleOf } from "type-fest";
+import { allocate, F32, type MatMemoryBuffer, type ScalarDescriptor, Vec, type VecMemoryBuffer } from "metis-data";
 
 // ============================================================================
 // Vec3 Math Object
 // ============================================================================
+//
+// Every op reads its operands through the buffer's **cached** `view()` and
+// writes components individually. It deliberately does NOT use `get()`/`set()`:
+// `get()` builds a detached tuple on every call and `set()` takes an array
+// literal, which cost 3 short-lived allocations per op and measured 10-30x
+// slower than indexing the view (`bun run bench/mathAlloc.ts`).
+//
+// **Operands are read into locals before anything is written.** That is what
+// makes `out` safe to alias with an input — `Vec3.cross(a, a, b)` would
+// otherwise poison its own remaining components mid-computation. The old
+// `get()` style got this for free by snapshotting; here it is deliberate.
+// `src/math/test/aliasing.test.ts` pins it.
 export const Vec3 = {
     /**
      * Create a new Vec3 memory buffer initialized with the given values.
@@ -16,7 +27,10 @@ export const Vec3 = {
     ): VecMemoryBuffer<S, 3> {
         const descriptor = Vec(scalar, 3);
         const buffer = allocate(descriptor);
-        buffer.set([x, y, z] as TupleOf<3, number>);
+        const v = buffer.view();
+        v[0] = x;
+        v[1] = y;
+        v[2] = z;
         return buffer;
     },
 
@@ -28,7 +42,7 @@ export const Vec3 = {
     ): VecMemoryBuffer<S, 3> {
         const descriptor = Vec(v.type.scalar, 3);
         const buffer = allocate(descriptor);
-        buffer.set(v.get());
+        buffer.view().set(v.view());
         return buffer;
     },
 
@@ -39,7 +53,7 @@ export const Vec3 = {
         out: VecMemoryBuffer<S, 3>,
         v: VecMemoryBuffer<S, 3>,
     ): VecMemoryBuffer<S, 3> {
-        out.set(v.get());
+        out.view().set(v.view());
         return out;
     },
 
@@ -52,7 +66,10 @@ export const Vec3 = {
         y: number,
         z: number,
     ): VecMemoryBuffer<S, 3> {
-        out.set([x, y, z] as TupleOf<3, number>);
+        const o = out.view();
+        o[0] = x;
+        o[1] = y;
+        o[2] = z;
         return out;
     },
 
@@ -64,9 +81,12 @@ export const Vec3 = {
         a: VecMemoryBuffer<S, 3>,
         b: VecMemoryBuffer<S, 3>,
     ): VecMemoryBuffer<S, 3> {
-        const [ax, ay, az] = a.get();
-        const [bx, by, bz] = b.get();
-        out.set([ax + bx, ay + by, az + bz] as TupleOf<3, number>);
+        const av = a.view(), bv = b.view(), o = out.view();
+        const ax = av[0] as number, ay = av[1] as number, az = av[2] as number;
+        const bx = bv[0] as number, by = bv[1] as number, bz = bv[2] as number;
+        o[0] = ax + bx;
+        o[1] = ay + by;
+        o[2] = az + bz;
         return out;
     },
 
@@ -78,9 +98,12 @@ export const Vec3 = {
         a: VecMemoryBuffer<S, 3>,
         b: VecMemoryBuffer<S, 3>,
     ): VecMemoryBuffer<S, 3> {
-        const [ax, ay, az] = a.get();
-        const [bx, by, bz] = b.get();
-        out.set([ax - bx, ay - by, az - bz] as TupleOf<3, number>);
+        const av = a.view(), bv = b.view(), o = out.view();
+        const ax = av[0] as number, ay = av[1] as number, az = av[2] as number;
+        const bx = bv[0] as number, by = bv[1] as number, bz = bv[2] as number;
+        o[0] = ax - bx;
+        o[1] = ay - by;
+        o[2] = az - bz;
         return out;
     },
 
@@ -92,9 +115,12 @@ export const Vec3 = {
         a: VecMemoryBuffer<S, 3>,
         b: VecMemoryBuffer<S, 3>,
     ): VecMemoryBuffer<S, 3> {
-        const [ax, ay, az] = a.get();
-        const [bx, by, bz] = b.get();
-        out.set([ax * bx, ay * by, az * bz] as TupleOf<3, number>);
+        const av = a.view(), bv = b.view(), o = out.view();
+        const ax = av[0] as number, ay = av[1] as number, az = av[2] as number;
+        const bx = bv[0] as number, by = bv[1] as number, bz = bv[2] as number;
+        o[0] = ax * bx;
+        o[1] = ay * by;
+        o[2] = az * bz;
         return out;
     },
 
@@ -106,9 +132,12 @@ export const Vec3 = {
         a: VecMemoryBuffer<S, 3>,
         b: VecMemoryBuffer<S, 3>,
     ): VecMemoryBuffer<S, 3> {
-        const [ax, ay, az] = a.get();
-        const [bx, by, bz] = b.get();
-        out.set([ax / bx, ay / by, az / bz] as TupleOf<3, number>);
+        const av = a.view(), bv = b.view(), o = out.view();
+        const ax = av[0] as number, ay = av[1] as number, az = av[2] as number;
+        const bx = bv[0] as number, by = bv[1] as number, bz = bv[2] as number;
+        o[0] = ax / bx;
+        o[1] = ay / by;
+        o[2] = az / bz;
         return out;
     },
 
@@ -120,8 +149,11 @@ export const Vec3 = {
         v: VecMemoryBuffer<S, 3>,
         s: number,
     ): VecMemoryBuffer<S, 3> {
-        const [x, y, z] = v.get();
-        out.set([x * s, y * s, z * s] as TupleOf<3, number>);
+        const vv = v.view(), o = out.view();
+        const x = vv[0] as number, y = vv[1] as number, z = vv[2] as number;
+        o[0] = x * s;
+        o[1] = y * s;
+        o[2] = z * s;
         return out;
     },
 
@@ -132,26 +164,29 @@ export const Vec3 = {
         a: VecMemoryBuffer<S, 3>,
         b: VecMemoryBuffer<S, 3>,
     ): number {
-        const [ax, ay, az] = a.get();
-        const [bx, by, bz] = b.get();
-        return ax * bx + ay * by + az * bz;
+        const av = a.view(), bv = b.view();
+        return (av[0] as number) * (bv[0] as number)
+            + (av[1] as number) * (bv[1] as number)
+            + (av[2] as number) * (bv[2] as number);
     },
 
     /**
      * Calculate the cross product of two Vec3s: out = a × b
+     *
+     * Safe when `out` aliases `a` or `b` — every component is read before any
+     * is written, which for this op is load-bearing rather than incidental.
      */
     cross<S extends ScalarDescriptor>(
         out: VecMemoryBuffer<S, 3>,
         a: VecMemoryBuffer<S, 3>,
         b: VecMemoryBuffer<S, 3>,
     ): VecMemoryBuffer<S, 3> {
-        const [ax, ay, az] = a.get();
-        const [bx, by, bz] = b.get();
-        out.set([
-            ay * bz - az * by,
-            az * bx - ax * bz,
-            ax * by - ay * bx,
-        ] as TupleOf<3, number>);
+        const av = a.view(), bv = b.view(), o = out.view();
+        const ax = av[0] as number, ay = av[1] as number, az = av[2] as number;
+        const bx = bv[0] as number, by = bv[1] as number, bz = bv[2] as number;
+        o[0] = ay * bz - az * by;
+        o[1] = az * bx - ax * bz;
+        o[2] = ax * by - ay * bx;
         return out;
     },
 
@@ -159,7 +194,8 @@ export const Vec3 = {
      * Calculate the length (magnitude) of a Vec3.
      */
     length<S extends ScalarDescriptor>(v: VecMemoryBuffer<S, 3>): number {
-        const [x, y, z] = v.get();
+        const vv = v.view();
+        const x = vv[0] as number, y = vv[1] as number, z = vv[2] as number;
         return Math.sqrt(x * x + y * y + z * z);
     },
 
@@ -167,7 +203,8 @@ export const Vec3 = {
      * Calculate the squared length of a Vec3.
      */
     lengthSquared<S extends ScalarDescriptor>(v: VecMemoryBuffer<S, 3>): number {
-        const [x, y, z] = v.get();
+        const vv = v.view();
+        const x = vv[0] as number, y = vv[1] as number, z = vv[2] as number;
         return x * x + y * y + z * z;
     },
 
@@ -178,11 +215,10 @@ export const Vec3 = {
         a: VecMemoryBuffer<S, 3>,
         b: VecMemoryBuffer<S, 3>,
     ): number {
-        const [ax, ay, az] = a.get();
-        const [bx, by, bz] = b.get();
-        const dx = bx - ax;
-        const dy = by - ay;
-        const dz = bz - az;
+        const av = a.view(), bv = b.view();
+        const dx = (bv[0] as number) - (av[0] as number);
+        const dy = (bv[1] as number) - (av[1] as number);
+        const dz = (bv[2] as number) - (av[2] as number);
         return Math.sqrt(dx * dx + dy * dy + dz * dz);
     },
 
@@ -193,27 +229,33 @@ export const Vec3 = {
         a: VecMemoryBuffer<S, 3>,
         b: VecMemoryBuffer<S, 3>,
     ): number {
-        const [ax, ay, az] = a.get();
-        const [bx, by, bz] = b.get();
-        const dx = bx - ax;
-        const dy = by - ay;
-        const dz = bz - az;
+        const av = a.view(), bv = b.view();
+        const dx = (bv[0] as number) - (av[0] as number);
+        const dy = (bv[1] as number) - (av[1] as number);
+        const dz = (bv[2] as number) - (av[2] as number);
         return dx * dx + dy * dy + dz * dz;
     },
 
     /**
-     * Normalize a Vec3: out = v / |v|
+     * Normalize a Vec3: out = v / |v|. A zero-length vector yields zero rather
+     * than NaN.
      */
     normalize<S extends ScalarDescriptor>(
         out: VecMemoryBuffer<S, 3>,
         v: VecMemoryBuffer<S, 3>,
     ): VecMemoryBuffer<S, 3> {
-        const [x, y, z] = v.get();
+        const vv = v.view(), o = out.view();
+        const x = vv[0] as number, y = vv[1] as number, z = vv[2] as number;
         const len = Math.sqrt(x * x + y * y + z * z);
         if (len > 0) {
-            out.set([x / len, y / len, z / len] as TupleOf<3, number>);
+            const inv = 1 / len;
+            o[0] = x * inv;
+            o[1] = y * inv;
+            o[2] = z * inv;
         } else {
-            out.set([0, 0, 0] as TupleOf<3, number>);
+            o[0] = 0;
+            o[1] = 0;
+            o[2] = 0;
         }
         return out;
     },
@@ -225,8 +267,11 @@ export const Vec3 = {
         out: VecMemoryBuffer<S, 3>,
         v: VecMemoryBuffer<S, 3>,
     ): VecMemoryBuffer<S, 3> {
-        const [x, y, z] = v.get();
-        out.set([-x, -y, -z] as TupleOf<3, number>);
+        const vv = v.view(), o = out.view();
+        const x = vv[0] as number, y = vv[1] as number, z = vv[2] as number;
+        o[0] = -x;
+        o[1] = -y;
+        o[2] = -z;
         return out;
     },
 
@@ -239,13 +284,12 @@ export const Vec3 = {
         b: VecMemoryBuffer<S, 3>,
         t: number,
     ): VecMemoryBuffer<S, 3> {
-        const [ax, ay, az] = a.get();
-        const [bx, by, bz] = b.get();
-        out.set([
-            ax + t * (bx - ax),
-            ay + t * (by - ay),
-            az + t * (bz - az),
-        ] as TupleOf<3, number>);
+        const av = a.view(), bv = b.view(), o = out.view();
+        const ax = av[0] as number, ay = av[1] as number, az = av[2] as number;
+        const bx = bv[0] as number, by = bv[1] as number, bz = bv[2] as number;
+        o[0] = ax + t * (bx - ax);
+        o[1] = ay + t * (by - ay);
+        o[2] = az + t * (bz - az);
         return out;
     },
 
@@ -257,8 +301,9 @@ export const Vec3 = {
         v: VecMemoryBuffer<S, 3>,
         q: VecMemoryBuffer<S, 4>,
     ): VecMemoryBuffer<S, 3> {
-        const [x, y, z] = v.get();
-        const [qx, qy, qz, qw] = q.get();
+        const vv = v.view(), qv = q.view(), o = out.view();
+        const x = vv[0] as number, y = vv[1] as number, z = vv[2] as number;
+        const qx = qv[0] as number, qy = qv[1] as number, qz = qv[2] as number, qw = qv[3] as number;
 
         // Calculate quat * vec
         const ix = qw * x + qy * z - qz * y;
@@ -267,11 +312,103 @@ export const Vec3 = {
         const iw = -qx * x - qy * y - qz * z;
 
         // Calculate result * inverse quat
-        out.set([
-            ix * qw + iw * -qx + iy * -qz - iz * -qy,
-            iy * qw + iw * -qy + iz * -qx - ix * -qz,
-            iz * qw + iw * -qz + ix * -qy - iy * -qx,
-        ] as TupleOf<3, number>);
+        o[0] = ix * qw + iw * -qx + iy * -qz - iz * -qy;
+        o[1] = iy * qw + iw * -qy + iz * -qx - ix * -qz;
+        o[2] = iz * qw + iw * -qz + ix * -qy - iy * -qx;
+        return out;
+    },
+
+    /**
+     * Transform a Vec3 as a **point** by a Mat4: `out = (m * vec4(v, 1)).xyz`,
+     * divided by the resulting `w`.
+     *
+     * The `w` divide is what makes this correct through a projection matrix (a
+     * frustum corner unprojected by an inverse-projection needs it). Through an
+     * affine matrix — a view or model matrix — `w` comes out 1 and the divide is
+     * a no-op, so this is also the right call for "put this world position into
+     * view space". A `w` of exactly 0 (a point on the projection's plane at
+     * infinity) is treated as 1 rather than producing `Infinity`.
+     *
+     * To transform a **direction** — a normal or an axis, where translation must
+     * not apply — use {@link transformMat3} with the model's linear part, or
+     * `Mat4.getLinearTransform` first. Passing a direction here silently adds
+     * the translation column.
+     */
+    transformMat4<S extends ScalarDescriptor>(
+        out: VecMemoryBuffer<S, 3>,
+        v: VecMemoryBuffer<S, 3>,
+        m: MatMemoryBuffer<S, 4>,
+    ): VecMemoryBuffer<S, 3> {
+        const mv = m.view(), vv = v.view(), o = out.view();
+        const c = m.columnElements;
+        const x = vv[0] as number, y = vv[1] as number, z = vv[2] as number;
+
+        const w = (mv[3] as number) * x + (mv[c + 3] as number) * y + (mv[2 * c + 3] as number) * z + (mv[3 * c + 3] as number);
+        const iw = w === 0 ? 1 : 1 / w;
+
+        const rx = (mv[0] as number) * x + (mv[c] as number) * y + (mv[2 * c] as number) * z + (mv[3 * c] as number);
+        const ry = (mv[1] as number) * x + (mv[c + 1] as number) * y + (mv[2 * c + 1] as number) * z + (mv[3 * c + 1] as number);
+        const rz = (mv[2] as number) * x + (mv[c + 2] as number) * y + (mv[2 * c + 2] as number) * z + (mv[3 * c + 2] as number);
+
+        o[0] = rx * iw;
+        o[1] = ry * iw;
+        o[2] = rz * iw;
+        return out;
+    },
+
+    /**
+     * Transform a Vec3 as a **direction** by a Mat3: `out = m * v`. No
+     * translation, no divide.
+     *
+     * This is the normal-transform path: pass the inverse-transpose of the
+     * model's upper 3x3 and normals stay perpendicular to the surface under
+     * non-uniform scale. Feeding the plain linear part instead is the classic
+     * skewed-lighting bug, and it looks plausible right up until something is
+     * scaled unevenly.
+     */
+    transformMat3<S extends ScalarDescriptor>(
+        out: VecMemoryBuffer<S, 3>,
+        v: VecMemoryBuffer<S, 3>,
+        m: MatMemoryBuffer<S, 3>,
+    ): VecMemoryBuffer<S, 3> {
+        const mv = m.view(), vv = v.view(), o = out.view();
+        const c = m.columnElements;
+        const x = vv[0] as number, y = vv[1] as number, z = vv[2] as number;
+
+        const rx = (mv[0] as number) * x + (mv[c] as number) * y + (mv[2 * c] as number) * z;
+        const ry = (mv[1] as number) * x + (mv[c + 1] as number) * y + (mv[2 * c + 1] as number) * z;
+        const rz = (mv[2] as number) * x + (mv[c + 2] as number) * y + (mv[2 * c + 2] as number) * z;
+
+        o[0] = rx;
+        o[1] = ry;
+        o[2] = rz;
+        return out;
+    },
+
+    /**
+     * Transform a Vec3 as a **direction** by a Mat4's upper 3x3, ignoring the
+     * translation column and without a `w` divide.
+     *
+     * The convenience form of {@link transformMat3} when you already hold the
+     * full matrix and its scale is uniform (under non-uniform scale a normal
+     * still needs the inverse-transpose, which this does not compute).
+     */
+    transformMat4Upper3x3<S extends ScalarDescriptor>(
+        out: VecMemoryBuffer<S, 3>,
+        v: VecMemoryBuffer<S, 3>,
+        m: MatMemoryBuffer<S, 4>,
+    ): VecMemoryBuffer<S, 3> {
+        const mv = m.view(), vv = v.view(), o = out.view();
+        const c = m.columnElements;
+        const x = vv[0] as number, y = vv[1] as number, z = vv[2] as number;
+
+        const rx = (mv[0] as number) * x + (mv[c] as number) * y + (mv[2 * c] as number) * z;
+        const ry = (mv[1] as number) * x + (mv[c + 1] as number) * y + (mv[2 * c + 1] as number) * z;
+        const rz = (mv[2] as number) * x + (mv[c + 2] as number) * y + (mv[2 * c + 2] as number) * z;
+
+        o[0] = rx;
+        o[1] = ry;
+        o[2] = rz;
         return out;
     },
 
@@ -282,8 +419,7 @@ export const Vec3 = {
         a: VecMemoryBuffer<S, 3>,
         b: VecMemoryBuffer<S, 3>,
     ): boolean {
-        const [ax, ay, az] = a.get();
-        const [bx, by, bz] = b.get();
-        return ax === bx && ay === by && az === bz;
+        const av = a.view(), bv = b.view();
+        return av[0] === bv[0] && av[1] === bv[1] && av[2] === bv[2];
     },
 };

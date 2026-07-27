@@ -82,10 +82,22 @@ export class Camera {
         return mat4.perspectiveReverseZ(this.fovYRadians, this.aspect, this.near, undefined, dst);
     }
 
-    /** `projection * view`. Allocates two intermediates per call, so hoist it out of inner loops. */
+    /**
+     * `projection * view`. Pass `dst` and this allocates **nothing** — the two
+     * intermediates go into per-camera scratch. Omit it and only the result is
+     * allocated.
+     *
+     * The scratch is reused across calls, so a matrix returned by
+     * `viewMatrix()`/`projectionMatrix()` is *not* aliased by it — those still
+     * allocate (or write your `dst`) as before. Only this method touches it.
+     */
     viewProjectionMatrix(dst?: Mat4Arg): Mat4Arg {
-        const v = this.viewMatrix();
-        const p = this.projectionMatrix();
+        const v = this.viewMatrix(this.viewScratch);
+        const p = this.projectionMatrix(this.projScratch);
         return mat4.multiply(p, v, dst);
     }
+
+    /** Scratch for {@link viewProjectionMatrix}, so the per-frame path doesn't allocate. */
+    private readonly viewScratch: Mat4Arg = mat4.identity();
+    private readonly projScratch: Mat4Arg = mat4.identity();
 }

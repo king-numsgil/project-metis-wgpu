@@ -10,16 +10,27 @@ typed views over them — it never touches the GPU, WebGPU, or SDL. It has no
 dependency on any other package in the monorepo (its only runtime dependency is
 `type-fest`, for tuple/index type helpers); `metis-engine` consumes *it*.
 
-Its reason to exist is the engine's data path. `metis-engine`'s archetype ECS
-stores each archetype's entities as **packed array-of-structs rows in one
-growable `ArrayBuffer`**, and every component is a `metis-data` descriptor
-(`StructOf`, `Vec`, `F32`, …); `getComponent` returns a live `metis-data` view
-into that buffer, not a copy. The same descriptors describe the std140/std430
-uniform and storage buffers the renderer uploads. So this package sits on the
-hottest data path in the engine — it is built and read every frame, for
-potentially tens of thousands of entities — which is why **speed is a
-first-class concern here alongside correctness** (see "Performance intent" and
-the benchmark below).
+Its reason to exist is the engine's **GPU upload path**. `metis-engine`'s
+renderer describes every std140/std430 uniform and storage buffer it uploads —
+camera, environment, per-instance model, the packed light array, the cascade and
+spot-shadow uniforms, AO params — as `metis-data` descriptors (`StructOf`,
+`ArrayOf`, `Vec`, `Mat`, `F32`, …), allocates each one once, and writes into it
+in place every frame. The renderer's math also runs on this package's
+`Vec`/`Mat`/`Quat`, so a computed matrix lands directly in the bytes that get
+uploaded, with no intermediate copy.
+
+**It is not on the ECS's path, and that is deliberate.** The ECS used to store
+archetype rows as `metis-data` AoS structs and was migrated off it entirely: it
+now owns SoA typed-array columns with **no `metis-data` dependency**. AoS is the
+wrong shape for per-frame entity iteration, and this package is AoS by design
+because a packed GPU buffer *is* interleaved. See "Performance intent" below —
+that section is the authority here, and this paragraph exists so the Overview
+stops contradicting it.
+
+So the workload to optimize for is **packing and uploading**: hundreds to a few
+thousand writes per frame into pre-allocated buffers, not iteration over tens of
+thousands of entities. Correctness of layout is the first-class concern; speed
+matters in the narrower sense that the per-frame write path must not allocate.
 
 Three layers, each an independent subtree of `src/`:
 
@@ -50,6 +61,15 @@ This `CLAUDE.md` explains *why* (the layout rules, the design split, the
 debugging history below). `DOC.md` explains *what to call*. Keep that split —
 don't duplicate war stories into `DOC.md`, don't grow an API listing here.
 
+**No measured numbers in either file.** Timings and ops/sec are properties of the
+machine that ran them, not of this package: the same unmodified code reports
+wildly different figures on another box, which reads as "something is broken"
+when nothing is. Record the *finding* ("the matrix ops still pay the tuple
+cost"), the *reasoning*, and **how to re-measure** (`bun run bench/mathAlloc.ts`,
+`bun run bench`). Derived facts that follow from the layout rules — byte sizes,
+strides, alignments — are fine; they're properties of the design. This mirrors
+`metis-engine`'s CLAUDE.md, which carries the same rule for the same reason.
+
 ## Commands
 
 Run from `packages/metis-data/` unless noted.
@@ -69,6 +89,11 @@ bunx tsc --noEmit
 
 # Performance + memory benchmark vs flat typed arrays and plain objects
 bun run bench
+
+# Math-layer allocation overhead: races each op against a hand-written
+# view-based equivalent computing identical arithmetic. The gap IS the
+# get()/set() tuple cost — see "out-first is not allocation-free" above.
+bun run bench/mathAlloc.ts
 ```
 
 The tests live next to what they cover: `src/descriptors/test/`,
@@ -187,9 +212,68 @@ which is the ECS's layer. **Don't reintroduce a hot-path iteration abstraction
 here.** The `bench/buffers.ts` numbers (convenient vs hand-indexed `flat` vs plain
 objects, on a *mixed-type* component) exist to keep that conclusion honest.
 
-The math layer is built for allocation-free steady state: every producing op is
-**out-first** (`Vec3.add(out, a, b)` writes into `out` and returns it), so a loop
-can pre-allocate its scratch buffers and allocate nothing per frame.
+The math layer is **out-first** — every producing op writes into a leading `out`
+buffer and returns it, so a loop pre-allocates its scratch buffers and never
+allocates the *result*.
+
+**That is not the same as allocation-free, and the distinction was found the
+hard way.** Most ops are written in terms of `get()`/`set()`, and `get()` builds
+a fresh tuple array on every call — so `Vec3.add(out, a, b)` allocates three
+short-lived arrays, and `Mat4.multiply` reached roughly two dozen once
+`MatMemoryBuffer.at()` minted a sub-buffer (and a TypedArray view) per column
+access. The doc here claimed "allocate nothing per frame" for years while that
+was false.
+
+Fixed at the root: `MatMemoryBufferImpl` caches its view like
+`VecMemoryBufferImpl` always did, and exposes `columnElements` so callers can
+walk a matrix through `view()` without allocating.
+
+**`Vec2`/`Vec3`/`Vec4` are rewritten** — every op reads through the cached view
+and writes components individually, and they now land close enough to
+hand-written arithmetic that the remainder is function-call overhead rather than
+style. `vec3.ts` is the reference implementation of the pattern; the other two
+point at it rather than repeating the rationale.
+
+**For the matrices, the biggest win was not in the ops at all.**
+`MatMemoryBuffer.get(col)`/`set(col)` routed through `at()`, which minted a whole
+sub-buffer (and its TypedArray view) just to read or write N numbers — so *every*
+matrix op paid two allocations per column access. Reading and writing the cached
+view directly there is a handful of lines and it lifted every one of the ~100
+matrix and quaternion ops at once, without touching any of them. **Look for the
+shared bottleneck before rewriting a hundred call sites**; the vectors had no
+such layer, which is why they genuinely needed the per-op work.
+
+On top of that, the hot ops are rewritten view-based: `Mat4.multiply`,
+`Mat4.invert`, `Mat3.multiply`, `Quat.multiply`. The long tail (constructors,
+decompose, the 2D helpers) still uses `get()`/`set()` and is now cheap enough
+that it has not been worth the churn.
+
+**Which ops are done is a question for the benchmark, not this file.**
+`bun run bench/mathAlloc.ts` races each one against an open-coded equivalent
+computing identical arithmetic and labels it `at parity` or `NOT YET REWRITTEN`.
+That output is the answer on whatever machine you are actually on; a number
+written down here would only describe a machine you aren't.
+
+**Two ways that benchmark lied before it was trusted**, both worth knowing since
+the same traps apply to any op added later. Its `Mat4.invert` reference computed
+only 4 of the 16 adjugate entries, making the library op look several times
+slower than it was — a baseline that does less work than the thing it measures
+is a wrong answer with a confident label. And its iteration count left the vector
+ops finishing in about a millisecond, so scheduler noise flipped unchanged ops
+between verdicts run to run. Iterations are now high enough that every op runs
+for tens of milliseconds, and the parity threshold is deliberately loose, because
+a thin function wrapper cannot reach 1.0x however it is written.
+
+**The aliasing hazard is the reason this needs care, and it is invisible.** The
+old `get()` style was alias-safe *by accident* — it snapshotted every operand
+into a tuple before writing, so `Vec3.cross(a, a, b)` worked. View-based code
+reads and writes the same memory, so an op that interleaves them corrupts its own
+input, and **only** in the aliased case. The existing suite would not have caught
+it: nothing else in it passes the same buffer twice. `src/math/test/aliasing.test.ts`
+now pins it, and was written and made to pass against the *old* implementation
+first — otherwise it would only have been testing the new code's own assumptions.
+Read all operands into locals before writing any output. Do the same when
+rewriting the matrix ops.
 
 ### Known limitations (not yet done)
 

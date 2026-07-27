@@ -33,7 +33,11 @@ export { Scene, SceneInstance } from "./scene/scene.ts";
 export { ClusteredForwardRenderer } from "./shading/clusteredForwardRenderer.ts";
 export { MAX_SHADOW_SPOTS, SPOT_SHADOW_MAP_SIZE } from "./shading/spotShadows.ts";
 export * from "./shading/clusterConfig.ts";
-export { Std140Writer } from "./shading/std140.ts";
+export { CASCADE_COUNT, SHADOW_MAP_SIZE } from "./shading/shadowConfig.ts";
+// GPU struct layouts — the TypeScript half of wgsl/common.wgsl. Exported so a
+// caller adding its own pass can size a buffer from the same descriptors the
+// renderer uses, rather than recomputing an offset by hand.
+export * from "./shading/gpuLayouts.ts";
 
 export { AmbientOcclusion } from "./ao/ambientOcclusion.ts";
 export {
