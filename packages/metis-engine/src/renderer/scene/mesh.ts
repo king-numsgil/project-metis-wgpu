@@ -27,6 +27,20 @@ function toBytes(view: Float32Array | Uint32Array): Uint8Array {
     return new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
 }
 
+/**
+ * GPU vertex + index buffers for one piece of geometry, uploaded once at
+ * construction. Immutable afterwards — there is no update path; rebuild a `Mesh`
+ * if the geometry changes.
+ *
+ * Freely shared between `SceneInstance`s (that's the point: per-instance state
+ * lives in the instance's model matrix, not here).
+ *
+ * **Triangles must wind CCW as seen from the outside** — the forward pipeline
+ * culls back faces. Getting this wrong renders the interior of a solid with
+ * outward normals attached to the far side, which reads as lights appearing on
+ * the wrong side and specular vanishing, not as an obviously broken mesh (see
+ * `uvSphere` in assets/primitives.ts for the shipped instance of that bug).
+ */
 export class Mesh {
     readonly vertexBuffer: GpuBuffer;
     readonly indexBuffer: GpuBuffer;
@@ -36,6 +50,10 @@ export class Mesh {
     /** Debug name, as passed to the constructor. Names this mesh's GPU buffers and its per-draw zone in the profiler tree. */
     readonly label: string | undefined;
 
+    /**
+     * @param data interleaved vertices in {@link MESH_VERTEX_LAYOUT}'s layout, plus u32 indices.
+     * @param label debug name for the GPU buffers and the profiler's per-draw zone.
+     */
     constructor(device: GpuDevice, data: MeshData, label?: string) {
         this.label = label;
         let maxDistSq = 0;
@@ -71,15 +89,18 @@ export class Mesh {
         this.indexCount = data.indices.length;
     }
 
+    /** Sets this mesh's vertex + index buffers on `pass`. Call before {@link draw}. */
     bind(pass: GpuRenderPassEncoder) {
         pass.setVertexBuffer(0, this.vertexBuffer);
         pass.setIndexBuffer(this.indexBuffer, "uint32");
     }
 
+    /** Issues the indexed draw. Requires a prior {@link bind} on the same pass. */
     draw(pass: GpuRenderPassEncoder, instanceCount = 1) {
         pass.drawIndexed(this.indexCount, instanceCount);
     }
 
+    /** Releases both buffers. Every instance referencing this mesh becomes unusable. */
     destroy() {
         this.vertexBuffer.destroy();
         this.indexBuffer.destroy();

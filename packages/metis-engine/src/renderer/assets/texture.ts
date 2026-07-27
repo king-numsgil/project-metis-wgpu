@@ -9,6 +9,7 @@ import {
     loadImageTexture,
 } from "metis-native";
 
+/** What {@link loadTexture} returns: the texture (for `.format`, or to destroy) and a default view (for a `Material` slot). */
 export interface LoadedTexture {
     texture: GpuTexture;
     view: GpuTextureView;
@@ -50,7 +51,9 @@ function createSolidTexture(device: GpuDevice, rgba: [number, number, number, nu
     return texture.createView();
 }
 
+/** The shared placeholder bindings every material falls back to — see {@link getMaterialDefaults}. */
 export interface MaterialDefaults {
+    /** Linear-filtered, repeat-addressed sampler shared by every material. */
     sampler: GpuSampler;
     /** 1x1 white, sRGB — multiply-identity for baseColorFactor. */
     albedo: GpuTextureView;
@@ -71,6 +74,9 @@ const defaultsCache = new WeakMap<GpuDevice, MaterialDefaults>();
  * conditional bind-group layouts) — materials without a given map fall back
  * to one of these neutral 1x1 placeholders, so sampling one is always a
  * mathematical no-op against the material's own factors.
+ *
+ * Cached per device in a `WeakMap`, so calling it per material is free and the
+ * textures are never destroyed by any one material's teardown.
  */
 export function getMaterialDefaults(device: GpuDevice): MaterialDefaults {
     let defaults = defaultsCache.get(device);

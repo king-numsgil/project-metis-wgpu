@@ -28,6 +28,11 @@ export class SceneInstance {
     private buffer: GpuBuffer | null = null;
     private bindGroup: GpuBindGroup | null = null;
 
+    /**
+     * @param mesh geometry to draw; shared freely between instances.
+     * @param material shading parameters; also shareable.
+     * @param transform initial placement — unset fields take `createTransform`'s defaults.
+     */
     constructor(
         public mesh: Mesh,
         public material: Material,
@@ -63,6 +68,7 @@ export class SceneInstance {
         return this.bindGroup!;
     }
 
+    /** Releases this instance's model uniform buffer. Does **not** touch the shared mesh or material. */
     destroy() {
         this.buffer?.destroy();
         this.buffer = null;
@@ -70,14 +76,29 @@ export class SceneInstance {
     }
 }
 
-/** A camera + environment + the set of instances/lights to draw this frame. */
+/**
+ * A camera + environment + the set of instances/lights to draw this frame.
+ *
+ * Plain mutable data with no GPU resources of its own — build one however you
+ * like and hand it to `ClusteredForwardRenderer.render()` each frame. (The ECS
+ * does not feed this yet; nothing extracts a `Scene` from ECS data.)
+ */
 export class Scene {
     camera = new Camera();
+    /** Sun + ambient fill. Defaults to `createExteriorEnvironment()` (near-zero ambient). */
     environment: Environment = createExteriorEnvironment();
+    /** Everything drawn, in order. Each is one draw call per pass. */
     instances: SceneInstance[] = [];
-    /** Point + spot lights, culled per-cluster. Discriminate on `kind`. */
+    /**
+     * Point + spot lights, culled per-cluster. Discriminate on `kind`.
+     *
+     * Order matters in two places: lights past `MAX_LIGHTS` are dropped with a
+     * warning, and when more spots are flagged `castsShadow` than
+     * `MAX_SHADOW_SPOTS`, the first ones in **this array's** order win.
+     */
     lights: Light[] = [];
 
+    /** Creates a `SceneInstance`, appends it to {@link instances}, and returns it for further tweaking. */
     add(mesh: Mesh, material: Material, transform?: Partial<Transform>): SceneInstance {
         const instance = new SceneInstance(mesh, material, transform);
         this.instances.push(instance);

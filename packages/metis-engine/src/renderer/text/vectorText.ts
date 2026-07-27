@@ -39,6 +39,12 @@ export const MAX_PALETTE_COLORS = 64;
  * the plain-HUD-text case.
  */
 export class VectorText {
+    /**
+     * The underlying `metis-native` context. Reach for it directly to stage
+     * non-text vector geometry (`beginPath`/`lineTo`/`fill`/`stroke`), to
+     * `setId(slot)` before staging for palette colouring, or to `measureText`
+     * for layout.
+     */
     readonly context: VectorContext;
 
     private readonly device: GpuDevice;
@@ -70,6 +76,12 @@ export class VectorText {
     /** Palette from the last `render()`, so `renderCached` can repaint without re-staging. */
     private lastPalette: readonly Rgba[] = [];
 
+    /**
+     * @param outputFormat the format of the view `render()` will draw into —
+     *   the **swapchain/output** format, never `HDR_COLOR_FORMAT`. Text
+     *   composites on top of the tonemapped image; drawing it into the HDR
+     *   target puts it through ACES and washes it out.
+     */
     constructor(device: GpuDevice, outputFormat: GPUTextureFormat) {
         this.device = device;
         this.context = new VectorContext(device);
@@ -155,6 +167,14 @@ export class VectorText {
         this.context.loadFont(name, path);
     }
 
+    /**
+     * Stages a string for the next `render()`. `(x, y)` is the **baseline**
+     * origin, in y-down pixel space from the top-left.
+     *
+     * Expensive: every glyph outline is re-tessellated on every call, which is
+     * why a HUD that re-stages each frame can cost more than the scene. Use
+     * `DebugOverlay.due()` + {@link renderCached}, or stage once and replay.
+     */
     drawText(text: string, fontName: string, sizePx: number, x: number, y: number) {
         this.context.drawText(text, fontName, sizePx, x, y);
         // drawText() only stages a fillable glyph path — same as
@@ -284,6 +304,7 @@ export class VectorText {
         this.encodePass(encoder, view, loadOp, calls, Math.min(this.lastPalette.length, MAX_PALETTE_COLORS));
     }
 
+    /** Releases the frame + palette buffers. The underlying `VectorContext`'s geometry buffers go with the device. */
     destroy() {
         this.frameBuffer.destroy();
         this.paletteBuffer.destroy();

@@ -1,3 +1,12 @@
+/**
+ * The renderer's public surface, reached from outside as `metis-engine/renderer`.
+ *
+ * The three pieces a frame needs are `RenderTargets`, `ClusteredForwardRenderer`,
+ * and `createDefaultPostProcessPipeline` — all derived from a `GpuDevice` alone.
+ * `RenderContext` is an optional bootstrapper that creates the device, window and
+ * surface for you; skip it if your app already owns those (DOC.md §1.3).
+ */
+
 export { RenderContext } from "./rhi/context.ts";
 export type { Backend, FrameTarget, PowerPreference, RenderContextOptions } from "./rhi/context.ts";
 export { DEPTH_FORMAT, HDR_COLOR_FORMAT, RenderTargets } from "./rhi/targets.ts";

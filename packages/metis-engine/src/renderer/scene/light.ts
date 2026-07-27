@@ -2,7 +2,9 @@ import type { Vec3Arg } from "wgpu-matrix";
 
 /** Fields every local (clustered) light shares, whatever its shape. */
 interface LightBase {
+    /** World-space position. For a spot this is the cone's apex. */
     position: Vec3Arg;
+    /** Linear RGB tint, conventionally 0..1. Multiplied by `intensity`, so values above 1 are legal, just redundant. */
     color: [number, number, number];
     /** Radiant intensity scale — same linear units as `Environment.sunIntensity`. */
     intensity: number;

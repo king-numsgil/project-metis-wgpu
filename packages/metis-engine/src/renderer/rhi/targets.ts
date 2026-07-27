@@ -1,7 +1,17 @@
 import { type GpuDevice, type GpuTexture, GPUTextureUsage, type GpuTextureView } from "metis-native";
 
-/** Renderer-owned formats — fixed, not user-tunable (changing them means touching every shader that reads them). */
+/**
+ * The forward pass's colour format — fixed, not user-tunable (changing it means
+ * touching every shader that reads it). Float, because the whole point is to
+ * carry unbounded radiance through to the tonemap without clipping.
+ */
 export const HDR_COLOR_FORMAT = "rgba16float" as const;
+/**
+ * The main depth format. **`depth32float` is a precondition, not a preference**:
+ * the reverse-Z projection only buys constant relative precision because the
+ * float's dense-near-zero region lands where `1/z` is coarsest. A unorm depth
+ * buffer would make reversing pointless. See CLAUDE.md "Reverse-Z".
+ */
 export const DEPTH_FORMAT = "depth32float" as const;
 /** 4x MSAA — the one sample count every WebGPU implementation is required to support (besides 1). */
 export const MSAA_SAMPLE_COUNT = 4;
@@ -21,18 +31,32 @@ export class RenderTargets {
     width: number;
     height: number;
     hdrColorMultisampled!: GpuTexture;
+    /** What the forward pass draws into (4x MSAA). **Never** what post-process reads. */
     hdrColorMultisampledView!: GpuTextureView;
     hdrColorResolved!: GpuTexture;
+    /** The resolved, single-sampled colour — this is the view the post chain takes as `hdrColorView`. */
     hdrColorResolvedView!: GpuTextureView;
     depth!: GpuTexture;
+    /**
+     * The main depth buffer (4x MSAA, reverse-Z). Anything writing it needs
+     * `depthCompare: "greater"` + `depthClearValue: 0.0`; anything reading it
+     * tests background as `depth <= 0`, not `>= 1`.
+     */
     depthView!: GpuTextureView;
 
+    /** Allocates all three textures at `width x height`. Construct one directly when you own the device. */
     constructor(device: GpuDevice, width: number, height: number) {
         this.width = width;
         this.height = height;
         this.create(device);
     }
 
+    /**
+     * Reallocates every target at the new size (a no-op if unchanged). On the
+     * caller-owned-device path this must be called alongside
+     * `surface.configure(...)` — forget it and the forward pass keeps drawing at
+     * the old size while the swapchain moves on.
+     */
     resize(device: GpuDevice, width: number, height: number) {
         if (width === this.width && height === this.height) {
             return;
@@ -45,6 +69,7 @@ export class RenderTargets {
         this.create(device);
     }
 
+    /** Releases all three textures. `RenderContext.destroy()` does this for you. */
     destroy() {
         this.hdrColorMultisampled.destroy();
         this.hdrColorResolved.destroy();

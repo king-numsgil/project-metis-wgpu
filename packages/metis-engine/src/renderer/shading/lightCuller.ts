@@ -176,7 +176,16 @@ export class LightCuller {
         });
     }
 
-    /** Uploads the cluster params + packed point-light array for this frame. Call before `cull`. */
+    /**
+     * Uploads the cluster params + packed light array for this frame. Call
+     * before {@link cull}. Lights past `MAX_LIGHTS` are dropped with a warning.
+     *
+     * @param targets only its `width`/`height` are read — the grid's screen tiling.
+     * @param shadowSpots exactly what `selectShadowCastingSpots` returned this
+     *   frame. These are packed **first**, so a light's buffer index doubles as
+     *   its spot-shadow-map layer; `SpotShadows.render` must be handed the same
+     *   array, or fragments get shadowed by the wrong light's map.
+     */
     write(scene: Scene, targets: RenderTargets, shadowSpots: SpotLight[] = []) {
         const invProj = mat4.invert(scene.camera.projectionMatrix());
         const params = new Std140Writer();
@@ -263,6 +272,7 @@ export class LightCuller {
         cullPass.end();
     }
 
+    /** Releases every cluster/light buffer. The bind groups referencing them become unusable. */
     destroy() {
         this.clusterParamsBuffer.destroy();
         this.lightsBuffer.destroy();

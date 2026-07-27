@@ -20,10 +20,15 @@ import { mat4, type Mat4Arg, vec3, type Vec3Arg } from "wgpu-matrix";
  *   (not the projection's far, which doesn't exist). See `clusterFar`.
  */
 export class Camera {
+    /** Eye position in world space. */
     position: Vec3Arg = vec3.create(0, 0, 5);
+    /** Point the camera looks at. This is a look-at camera — there is no orientation field; move the target to turn. */
     target: Vec3Arg = vec3.create(0, 0, 0);
+    /** World up hint. Degenerate when parallel to `target - position`. */
     up: Vec3Arg = vec3.create(0, 1, 0);
+    /** Vertical field of view, in **radians**. */
     fovYRadians = Math.PI / 4;
+    /** Width / height. Keep it in sync with the render targets via {@link setAspectFromSize}. */
     aspect = 16 / 9;
     /** Near plane. Cheap to make small under reverse-Z — it does not cost distant precision. */
     near = 0.01;
@@ -62,10 +67,12 @@ export class Camera {
      */
     clusterNear = 2.0;
 
+    /** Sets {@link aspect} from a viewport size, guarding against a zero height. Call on every resize. */
     setAspectFromSize(width: number, height: number) {
         this.aspect = width / Math.max(1, height);
     }
 
+    /** World -> view. Right-handed, looking down -Z. */
     viewMatrix(dst?: Mat4Arg): Mat4Arg {
         return mat4.lookAt(this.position, this.target, this.up, dst);
     }
@@ -75,6 +82,7 @@ export class Camera {
         return mat4.perspectiveReverseZ(this.fovYRadians, this.aspect, this.near, undefined, dst);
     }
 
+    /** `projection * view`. Allocates two intermediates per call, so hoist it out of inner loops. */
     viewProjectionMatrix(dst?: Mat4Arg): Mat4Arg {
         const v = this.viewMatrix();
         const p = this.projectionMatrix();

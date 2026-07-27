@@ -26,6 +26,11 @@ const TILE_SIZE = 16;
 export class LuminanceAveragePass implements PostProcessPass {
     readonly name = "luminance-average";
 
+    /**
+     * Records the two compute passes (per-tile reduction, then a single-workgroup
+     * final reduction) and leaves the result in {@link resultBuffer}. Reallocates
+     * the partial-sum buffers when the viewport grows.
+     */
     execute(encoder: GpuCommandEncoder, ctx: PostProcessFrameContext): void {
         const {tileCountX, tileCountY, tileCount} = this.ensureCapacity(ctx.width, ctx.height);
 

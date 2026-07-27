@@ -21,14 +21,22 @@ import { gpuProfilerFeatures } from "../debug/gpuProfiler.ts";
 import { COMPUTE_WORKGROUP_SIZE, MAX_LIGHTS_PER_CLUSTER, NUM_CLUSTERS } from "../shading/clusterConfig.ts";
 import { RenderTargets } from "./targets.ts";
 
+/** Adapter-selection hint. Only a *hint* — see `selectUsableAdapter` for why it isn't trusted alone. */
 export type PowerPreference = "low-power" | "high-performance";
+/** Force a specific wgpu backend instead of letting it choose. Mostly a debugging lever. */
 export type Backend = "vulkan" | "dx12" | "metal" | "gl";
 
+/** Construction options shared by {@link RenderContext.createWindowed} and {@link RenderContext.createOffscreen}. */
 export interface RenderContextOptions {
+    /** Initial width in pixels — the window's client area, or the offscreen capture texture. */
     width: number;
+    /** Initial height in pixels. */
     height: number;
+    /** Adapter desirability hint. Windowed defaults to `"high-performance"`. */
     powerPreference?: PowerPreference;
+    /** Pin the wgpu backend. Omit to let wgpu pick (windowed only). */
     backend?: Backend;
+    /** Debug label for the created device, surfaced in wgpu diagnostics. */
     label?: string;
     /**
      * Swapchain present mode (windowed only). Omit to take the binding default,
@@ -51,10 +59,14 @@ export interface RenderContextOptions {
     profiling?: boolean;
 }
 
+/** One frame's final output, as handed back by {@link RenderContext.beginFrame}. */
 export interface FrameTarget {
+    /** Render target for the last pass of the post chain (the tonemap). */
     view: GpuTextureView;
+    /** `view`'s format — pass this as `outputFormat`; never hardcode one (see `offscreenFormat`). */
     format: GPUTextureFormat;
 
+    /** Presents the swapchain image. Call **after** `queue.submit()`; a no-op offscreen. */
     present(): void;
 }
 
@@ -176,12 +188,35 @@ function warnIfSoftwareAdapter(adapter: GpuAdapter) {
  * window for interactive demos, or a plain offscreen texture for headless
  * fixtures — so the rest of the engine can target "whatever `beginFrame()`
  * hands back" without caring which mode it's in.
+ *
+ * **This is a convenience bootstrapper, not the engine's entry point.** It
+ * bundles four separable jobs (SDL/window lifetime, adapter+device creation, the
+ * surface/swapchain, and `RenderTargets` allocation), none of which the render
+ * path requires: `ClusteredForwardRenderer.render()` takes an encoder, a
+ * `RenderTargets` and a `Scene`, and nothing in it references a window or a
+ * surface. An app that already owns a device and a surface constructs
+ * `RenderTargets`/`ClusteredForwardRenderer`/the post chain directly and never
+ * touches this class — `packages/metis-game` is the working reference for that
+ * path (DOC.md §1.3).
+ *
+ * ```ts
+ * const ctx = await RenderContext.createWindowed("title", { width: 1280, height: 720 });
+ * const frame = ctx.beginFrame();
+ * const encoder = ctx.device.createCommandEncoder();
+ * // … forward.render(encoder, ctx.targets, scene); post.pipeline.run(encoder, { … });
+ * ctx.device.queue.submit([encoder.finish()]);
+ * frame.present();
+ * ```
  */
 export class RenderContext {
     readonly device: GpuDevice;
+    /** The adapter the device came from. `adapter.info.description` is the human-readable GPU name. */
     readonly adapter: GpuAdapter;
+    /** The shared HDR colour + depth attachments, sized to this context and resized with it. */
     readonly targets: RenderTargets;
+    /** Current output width. Updated by {@link resize}; assigning it directly resizes nothing. */
     width: number;
+    /** Current output height. Updated by {@link resize}; assigning it directly resizes nothing. */
     height: number;
 
     private readonly window: SdlWindow | null;
@@ -250,10 +285,12 @@ export class RenderContext {
         }
     }
 
+    /** The SDL window, or `null` offscreen. Poll events and read `.width`/`.height` off it. */
     get sdlWindow(): SdlWindow | null {
         return this.window;
     }
 
+    /** `true` when presenting to a real swapchain, `false` for the headless capture path. */
     get isWindowed(): boolean {
         return this.surface !== null;
     }
@@ -268,7 +305,15 @@ export class RenderContext {
         return this.offscreenTarget;
     }
 
-    /** Headless target for the fixture / any automated screenshot check — no SDL window. */
+    /**
+     * Headless target for the fixture / any automated screenshot check — no SDL
+     * window. `beginFrame()` returns the same view every frame and its
+     * `present()` is a no-op, so nothing paces the loop; read results back from
+     * {@link captureTexture}.
+     *
+     * Auto-exposure adapts over frames, so render a warmup burst (~30 frames)
+     * before capturing or the image is the first frame's transient.
+     */
     static async createOffscreen(options: RenderContextOptions): Promise<RenderContext> {
         const preferred = await requestAdapter({powerPreference: options.powerPreference});
         if (!preferred) {
@@ -361,6 +406,10 @@ export class RenderContext {
         }
     }
 
+    /**
+     * Tears everything this context created down, in dependency order. Destroy
+     * anything built *on* the device (renderer, post chain, HUD) first.
+     */
     destroy() {
         this.targets.destroy();
         this.offscreenTarget?.destroy();

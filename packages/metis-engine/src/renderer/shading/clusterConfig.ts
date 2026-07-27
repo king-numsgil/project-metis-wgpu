@@ -3,9 +3,20 @@
  * independent of viewport resolution (tiles just scale to fit); Z uses
  * exponential slicing so near-camera clusters stay thin.
  */
+/** Screen tiles across. Resolution-independent — tiles stretch to fit the viewport. */
 export const CLUSTER_COUNT_X = 16;
+/** Screen tiles down. */
 export const CLUSTER_COUNT_Y = 9;
+/**
+ * Depth slices, distributed **exponentially** over `[camera.clusterNear,
+ * camera.clusterFar]`. Slice density is
+ * `CLUSTER_COUNT_Z / log2(clusterFar / clusterNear)`, so the camera's two
+ * cluster bounds matter more than this count does — widen the range and every
+ * slice coarsens. Slice 0 is a catch-all covering everything nearer than
+ * `clusterNear`.
+ */
 export const CLUSTER_COUNT_Z = 24;
+/** Total clusters — the compute dispatch size and the stride basis for every per-cluster buffer. */
 export const NUM_CLUSTERS = CLUSTER_COUNT_X * CLUSTER_COUNT_Y * CLUSTER_COUNT_Z;
 
 /**
@@ -36,4 +47,10 @@ export const MAX_LIGHTS_PER_CLUSTER = 96;
  */
 export const MAX_LIGHTS = 384;
 
+/**
+ * Workgroup size of both compute passes — one invocation per cluster, so they
+ * dispatch `ceil(NUM_CLUSTERS / COMPUTE_WORKGROUP_SIZE)` groups. Keep in sync
+ * with the `@workgroup_size` in `cluster_build.wgsl` / `light_cull.wgsl`; it
+ * also feeds the adapter's minimum-limits check in `rhi/context.ts`.
+ */
 export const COMPUTE_WORKGROUP_SIZE = 64;

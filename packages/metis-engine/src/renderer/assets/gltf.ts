@@ -83,6 +83,19 @@ function nodeLocalMatrix(node: GltfNode): Mat4Arg {
     return m;
 }
 
+/**
+ * Loads a `.gltf` file into ready-to-add `SceneInstance`s — one per mesh-bearing
+ * node, with the node's world matrix baked into `modelMatrixOverride`. Meshes
+ * and materials are deduped across nodes.
+ *
+ * See this file's header for the exact supported subset; it is deliberately
+ * narrow. The instances are *not* added to any `Scene` — push them onto
+ * `scene.instances` yourself.
+ *
+ * @param gltfPath path to the `.gltf`; its `.bin` is resolved relative to it.
+ * @throws on anything outside the subset — multiple/embedded buffers, a
+ *   non-triangle primitive mode, or an unreadable accessor.
+ */
 export async function loadGltf(device: GpuDevice, gltfPath: string): Promise<SceneInstance[]> {
     const doc = JSON.parse(await Bun.file(gltfPath).text()) as GltfDocument;
     const dir = dirname(gltfPath);

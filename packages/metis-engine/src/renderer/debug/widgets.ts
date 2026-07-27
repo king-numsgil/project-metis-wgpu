@@ -40,6 +40,7 @@ export class History {
         this.buf = new Float64Array(capacity);
     }
 
+    /** Appends a sample, overwriting the oldest once full. */
     push(v: number) {
         this.buf[this.head] = v;
         this.head = (this.head + 1) % this.capacity;
@@ -48,6 +49,7 @@ export class History {
         }
     }
 
+    /** Samples held so far — below `capacity` until the buffer has filled once. */
     get length(): number {
         return this.count;
     }
@@ -63,10 +65,12 @@ export class History {
         return res;
     }
 
+    /** The most recently pushed sample, or 0 when empty. */
     get latest(): number {
         return this.count === 0 ? 0 : this.buf[(this.head - 1 + this.capacity) % this.capacity]!;
     }
 
+    /** Mean over the retained window — a stable read where `latest` jitters. 0 when empty. */
     get mean(): number {
         if (this.count === 0) {
             return 0;
@@ -78,6 +82,7 @@ export class History {
         return s / this.count;
     }
 
+    /** Peak over the retained window — where frame hitches show up. 0 when empty. */
     get max(): number {
         let m = -Infinity;
         for (let i = 0; i < this.count; i++) {
@@ -87,36 +92,47 @@ export class History {
     }
 }
 
+/** One plotted line in a {@link GraphSpec}. */
 export interface GraphSeries {
+    /** Shown in the legend alongside the latest value. */
     label: string;
+    /** Samples, oldest first. A {@link History} is read via `values()`. */
     values: readonly number[] | History;
+    /** Line colour. Defaults to `DEBUG_THEME.series` cycled by series index. */
     color?: Rgba;
 }
 
+/** A line graph. All coordinates are pixels, y-down from the top-left. */
 export interface GraphSpec {
     x: number;
     y: number;
     width: number;
+    /** Total height including the title bar and legend, not just the plot area. */
     height: number;
     title?: string;
+    /** One or more series sharing one Y axis. A series with fewer than 2 samples is skipped. */
     series: GraphSeries[];
     /** Y-axis bounds. Omit `max` to autoscale to the data (`min` defaults to 0). */
     min?: number;
     max?: number;
+    /** Appended to the axis and legend numbers, e.g. `"ms"`. */
     unit?: string;
     fontSize?: number;
 }
 
+/** One row of a {@link TreeSpec}; nest via `children`. */
 export interface TreeRow {
     label: string;
     /** Right-aligned value text, e.g. `"1.24 ms"`. */
     value?: string;
     /** 0..1 — draws a proportional bar behind the row. Omit for no bar. */
     fraction?: number;
+    /** Label colour. Defaults to `DEBUG_THEME.series` cycled by nesting depth. */
     color?: Rgba;
     children?: TreeRow[];
 }
 
+/** A hierarchical row list. Height is derived from the row count — there is no `height` field. */
 export interface TreeSpec {
     x: number;
     y: number;
@@ -151,6 +167,7 @@ export interface TreeSpec {
  * dedupes them, so widgets just name a color.
  */
 export class DebugOverlay {
+    /** The underlying text renderer. Reach for it to stage custom vector geometry alongside the widgets. */
     readonly text: VectorText;
     /**
      * How often `due()` lets widgets be re-staged, in milliseconds. Vector text
@@ -168,6 +185,7 @@ export class DebugOverlay {
     private staged = false;
     private lastBuildMs = -Infinity;
 
+    /** @param outputFormat the final output's format — the overlay composites on top of the tonemapped image. */
     constructor(device: GpuDevice, outputFormat: GPUTextureFormat) {
         this.text = new VectorText(device, outputFormat);
         this.text.profileLabel = "debug-overlay";
@@ -213,6 +231,11 @@ export class DebugOverlay {
         return false;
     }
 
+    /**
+     * Loads a TTF and makes it the font every widget draws with. `path` is a
+     * filesystem path (absolute, or relative to the process CWD). Required —
+     * widgets draw no text until this is called.
+     */
     loadFont(name: string, path: string) {
         this.text.loadFont(name, path);
         this.fontName = name;
@@ -420,6 +443,7 @@ export class DebugOverlay {
         this.staged = false;
     }
 
+    /** Destroys the underlying `VectorText`. */
     destroy() {
         this.text.destroy();
     }

@@ -9,10 +9,15 @@ import {
 import { getMaterialDefaults } from "../assets/texture.ts";
 import { Std140Writer } from "../shading/std140.ts";
 
+/** Constructor parameters for {@link Material}. Every field is optional; the defaults are a plain white dielectric. */
 export interface MaterialParams {
+    /** Linear RGBA albedo factor. Default `[1,1,1,1]`. Alpha is carried but nothing blends yet. */
     baseColor?: [number, number, number, number];
+    /** 0 = dielectric, 1 = metal. Intermediate values aren't physical, they're a blend. Default 0. */
     metallic?: number;
+    /** Perceptual roughness, 0 = mirror to 1 = fully diffuse. Default 0.5. */
     roughness?: number;
+    /** Linear RGB light emitted regardless of lighting. Not a light source — it lights nothing else. Default `[0,0,0]`. */
     emissive?: [number, number, number];
     /** Multiplied by `baseColor` (sRGB source data — see math/PBR shading formulas.md). */
     albedoTexture?: GpuTextureView;
@@ -34,9 +39,13 @@ export interface MaterialParams {
  * branching on "has texture" flags).
  */
 export class Material {
+    /** Linear RGBA albedo factor; multiplied by `albedoTexture` if present. */
     baseColor: [number, number, number, number];
+    /** Metalness factor; multiplied by `metallicTexture`'s red channel if present. */
     metallic: number;
+    /** Roughness factor; multiplied by `roughnessTexture`'s red channel if present. */
     roughness: number;
+    /** Emissive factor; multiplied by `emissiveTexture` if present. */
     emissive: [number, number, number];
 
     albedoTexture?: GpuTextureView;
@@ -94,6 +103,11 @@ export class Material {
         return this.bindGroup!;
     }
 
+    /**
+     * Releases this material's uniform buffer. Does **not** destroy the texture
+     * views it was given — those are the caller's (and the shared 1x1 defaults
+     * are cached per device and outlive any one material).
+     */
     destroy() {
         this.buffer?.destroy();
         this.buffer = null;

@@ -35,8 +35,11 @@ import forwardWgsl from "./wgsl/forward.wgsl" with { type: "text" };
  * frame bind group.
  */
 export class ClusteredForwardRenderer {
+    /** Group 0: camera + environment + shadow/AO resources. Exposed so a custom pass can match the layout. */
     readonly frameBindGroupLayout: GpuBindGroupLayout;
+    /** Group 1: material factors + its 5 textures and sampler. */
     readonly materialBindGroupLayout: GpuBindGroupLayout;
+    /** Group 2: the per-instance model + normal matrices. Also used by the shadow, AO-prepass, and depth-prepass pipelines. */
     readonly modelBindGroupLayout: GpuBindGroupLayout;
     /** Screen-space ambient occlusion (None/SSAO/HBAO). Set `.technique` to switch; applied to the ambient term only. */
     readonly ao: AmbientOcclusion;
@@ -241,6 +244,24 @@ ${depthPrepassWgsl}`,
         });
     }
 
+    /**
+     * Records everything needed to produce one HDR frame into
+     * `targets.hdrColorMultisampled` (auto-resolving into
+     * `targets.hdrColorResolved`, which is what the post chain reads).
+     *
+     * Encodes, in order:
+     * 1. camera + environment uniforms, and the packed light array;
+     * 2. four cascaded sun-shadow depth passes;
+     * 3. one depth pass per shadow-casting spot (frustum-culled per light);
+     * 4. cluster build + light cull (two compute passes);
+     * 5. ambient occlusion, or a clear-to-white when the technique is `None`;
+     * 6. the optional depth prepass;
+     * 7. the forward pass — one draw per `SceneInstance`.
+     *
+     * Nothing here touches a window or a surface: the caller owns the encoder,
+     * the submit, and the present. This does **not** run the post chain — the
+     * output is still HDR and untonemapped.
+     */
     render(encoder: GpuCommandEncoder, targets: RenderTargets, scene: Scene) {
         this.writeFrameUniforms(scene);
         // Derived once and shared: LightCuller packs these lights first so a
@@ -339,6 +360,11 @@ ${depthPrepassWgsl}`,
         pass.end();
     }
 
+    /**
+     * Releases the renderer's buffers and every collaborator it constructed
+     * (culler, cascades, spot shadows, AO). Does not touch the `RenderTargets`
+     * or anything in the `Scene` — those are the caller's.
+     */
     destroy() {
         this.cameraBuffer.destroy();
         this.environmentBuffer.destroy();

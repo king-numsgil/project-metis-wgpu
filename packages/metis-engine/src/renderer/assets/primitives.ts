@@ -2,7 +2,9 @@ import { vec3, type Vec3Arg } from "wgpu-matrix";
 
 /** Interleaved `[px,py,pz, nx,ny,nz, tx,ty,tz,tw, u,v]` per vertex (stride 48 bytes) — see scene/mesh.ts's vertex layout. */
 export interface MeshData {
+    /** 12 floats per vertex. Length must be a multiple of 12. */
     vertices: Float32Array;
+    /** Triangle list, u32. Wind CCW as seen from the outside — the forward pipeline culls back faces. */
     indices: Uint32Array;
 }
 
@@ -79,7 +81,13 @@ class MeshBuilder {
     }
 }
 
-/** A single-quad plane on the XZ plane, facing +Y, centered at the origin. */
+/**
+ * A single-quad plane on the XZ plane, facing +Y, centered at the origin.
+ *
+ * Two triangles total, so per-vertex lighting artifacts are impossible but so is
+ * any geometric detail — fine as a ground plane, useless as a shadow receiver
+ * that needs to bend.
+ */
 export function plane(width: number, depth: number): MeshData {
     const b = new MeshBuilder();
     const hw = width / 2;
@@ -88,14 +96,28 @@ export function plane(width: number, depth: number): MeshData {
     return b.build();
 }
 
-/** An axis-aligned box centered at the origin with outward-facing normals. */
+/**
+ * An axis-aligned box centered at the origin with outward-facing normals. Faces
+ * are separate quads, so normals are flat and edges are hard.
+ *
+ * @param sx full X extent (not a half-extent).
+ * @param sy full Y extent.
+ * @param sz full Z extent.
+ */
 export function cube(sx: number, sy: number, sz: number): MeshData {
     const b = new MeshBuilder();
     b.addBox(vec3.create(-sx / 2, -sy / 2, -sz / 2), vec3.create(sx / 2, sy / 2, sz / 2));
     return b.build();
 }
 
-/** A UV sphere with outward-facing normals, centered at the origin. */
+/**
+ * A UV sphere with outward-facing normals, centered at the origin. Tangents
+ * follow increasing longitude and degenerate at the poles — the singularity
+ * every UV sphere has.
+ *
+ * @param latBands rings from pole to pole.
+ * @param lonBands segments around the equator.
+ */
 export function uvSphere(radius: number, latBands = 24, lonBands = 32): MeshData {
     const b = new MeshBuilder();
     const positions: Vec3Arg[] = [];
@@ -144,12 +166,15 @@ export function uvSphere(radius: number, latBands = 24, lonBands = 32): MeshData
     return b.build();
 }
 
+/** An opening in {@link roomBox}'s front (-Z) wall, given as fractions of that wall rather than world units. */
 export interface WindowCutout {
-    /** Horizontal opening as a fraction [0,1] of the front wall's width. */
+    /** Left edge, as a fraction [0,1] of the front wall's width. */
     s0: number;
+    /** Right edge, as a fraction [0,1] of the front wall's width. */
     s1: number;
-    /** Vertical opening as a fraction [0,1] of the front wall's height. */
+    /** Bottom edge, as a fraction [0,1] of the front wall's height (0 = floor). */
     t0: number;
+    /** Top edge, as a fraction [0,1] of the front wall's height. */
     t1: number;
 }
 
@@ -171,6 +196,13 @@ export interface WindowCutout {
  * reconstruction threshold, eliminating the leak outright rather than
  * shrinking it. Slabs are tiled without overlap so no coplanar exterior
  * faces z-fight in exterior views.
+ */
+/**
+ * @param width **interior** width; the slabs extend outward from it.
+ * @param height interior floor-to-ceiling height.
+ * @param depth interior depth.
+ * @param window opening cut through the front (-Z) wall.
+ * @param thickness wall/floor/ceiling slab thickness. Don't set this to 0 — see above.
  */
 export function roomBox(width: number, height: number, depth: number, window: WindowCutout, thickness = 0.2): MeshData {
     const b = new MeshBuilder();

@@ -1,7 +1,15 @@
 import type { ComponentDef } from "./component.ts";
 import { AXES, type EcsTypedArray, type FieldType } from "./field.ts";
 
+/**
+ * An entity handle: a bare incrementing number, with **no generation tag**. Ids
+ * are never reused today (there is no free list), but that is a property of the
+ * current implementation, not a safety guarantee — don't build anything that
+ * relies on a stale id staying invalid forever.
+ */
 export type EntityId = number;
+
+/** Identifies an archetype by its component set — see {@link makeSignatureKey}. */
 export type SignatureKey = string;
 
 /** Canonical key for a set of component names (order-independent). */
@@ -32,7 +40,9 @@ export type ColumnsView = Record<string, ComponentView>;
  * handle across despawns; the `EntityId -> row` map is the stable lookup.
  */
 export class Archetype {
+    /** This archetype's component set, canonicalised — see {@link makeSignatureKey}. */
     readonly signatureKey: SignatureKey;
+    /** The components every entity here has, in the order they were registered. */
     readonly componentNames: readonly string[];
 
     private _capacity = INITIAL_CAPACITY;
@@ -57,10 +67,12 @@ export class Archetype {
         this.rebuildColumnsView();
     }
 
+    /** Rows each column can currently hold. Doubles on overflow; never shrinks. */
     get capacity(): number {
         return this._capacity;
     }
 
+    /** Live entities here. Rows `0..count-1` are populated; the rest is stale or zeroed. */
     get count(): number {
         return this._count;
     }
@@ -79,10 +91,20 @@ export class Archetype {
         return this.rowOfEntity.has(entityId);
     }
 
+    /**
+     * This entity's current row, or `undefined` if it doesn't live here. Only
+     * valid until the next add/remove — a despawn swaps the last row down.
+     */
     rowOf(entityId: EntityId): number | undefined {
         return this.rowOfEntity.get(entityId);
     }
 
+    /**
+     * Appends an entity and returns its row, growing the columns if needed. All
+     * of its fields read back as zero.
+     *
+     * @throws if `entityId` is already in this archetype.
+     */
     addEntity(entityId: EntityId): number {
         if (this.rowOfEntity.has(entityId)) {
             throw new Error(`Entity ${entityId} already in archetype "${this.signatureKey}"`);
@@ -107,6 +129,14 @@ export class Archetype {
         return row;
     }
 
+    /**
+     * Removes an entity by **swapping the last row into its slot**, so the rows
+     * stay dense and one other entity's row index changes. Never call this
+     * during a `query` — the callback is holding the columns and count it
+     * invalidates.
+     *
+     * @throws if `entityId` is not in this archetype.
+     */
     removeEntity(entityId: EntityId): void {
         const row = this.rowOfEntity.get(entityId);
         if (row === undefined) {

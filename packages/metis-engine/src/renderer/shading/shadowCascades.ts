@@ -20,9 +20,14 @@ import { Std140Writer } from "./std140.ts";
 import commonWgsl from "./wgsl/common.wgsl" with { type: "text" };
 import shadowWgsl from "./wgsl/shadow.wgsl" with { type: "text" };
 
-// Per-cascade resolution. 2048 (down from a former 4096 single map) is enough
-// because roomBox's solid-slab walls give corner depth gaps ~wall-thickness, far
-// wider than any shadow test here needs to resolve.
+/**
+ * Per-cascade resolution. 2048 (down from a former 4096 single map) is enough
+ * because roomBox's solid-slab walls give corner depth gaps ~wall-thickness, far
+ * wider than any shadow test here needs to resolve.
+ *
+ * The normal-offset bias is texel-scaled, so this can be changed without
+ * retuning bias. VRAM is `CASCADE_COUNT * SHADOW_MAP_SIZE² * 4` bytes.
+ */
 export const SHADOW_MAP_SIZE = 2048;
 const SHADOW_DEPTH_FORMAT = "depth32float" as const;
 
@@ -52,10 +57,15 @@ const SHADOW_NORMAL_OFFSET_MIN = 0.04;
 // is the only bias needed. See CLAUDE.md "Cascaded shadow maps".
 //
 // VRAM at 2048²: 4 × depth32float (4 × 17 MB) ≈ 67 MB.
+/**
+ * Cascades in the directional shadow. **Compile-time**: it sizes the depth
+ * array and the `array<mat4x4>` in `CascadeUniforms`, and WGSL array lengths
+ * must be constant, so changing it means editing `common.wgsl` to match.
+ */
 export const CASCADE_COUNT = 4;
-// Default practical-split blend and shadowed reach — the renderer surfaces these
-// as tunable fields and passes the live values into `render`.
+/** Default for `ClusteredForwardRenderer.cascadeSplitLambda` — see that field for what it does. */
 export const CASCADE_SPLIT_LAMBDA_DEFAULT = 0.85;
+/** Default for `ClusteredForwardRenderer.shadowDistance`, in world units. */
 export const SHADOW_DISTANCE_DEFAULT = 400;
 // Each cascade cross-fades into the next over this fraction of its depth span,
 // hiding the resolution step at the boundary.
@@ -185,9 +195,18 @@ export class ShadowCascades {
     }
 
     /**
-     * Records all cascade shadow passes for this frame: cascade 0's MSAA depth +
-     * moment resolve, then cascades 1..N single-sample depth into the array. Fit
-     * to `[camera.near, shadowDistance]` by the practical split (`splitLambda`).
+     * Records this frame's cascade shadow passes: one single-sample depth-only
+     * pass per cascade into its own layer of the depth array, fit to
+     * `[camera.near, shadowDistance]` by the practical split (`splitLambda`).
+     * Also uploads the per-frame cascade matrices/splits/offsets the forward
+     * pass reads from {@link uniformBuffer}.
+     *
+     * Every cascade redraws every instance — there is no per-cascade frustum
+     * culling (deliberate: a cascade's ortho frustum is fit to a slice of the
+     * camera frustum, so almost nothing the camera sees falls outside it).
+     *
+     * @param shadowDistance far reach of the shadowed region, in world units.
+     * @param splitLambda practical-split blend: 1 = logarithmic, 0 = uniform.
      */
     render(
         encoder: GpuCommandEncoder,
@@ -242,6 +261,7 @@ export class ShadowCascades {
         }
     }
 
+    /** Releases the depth array and both uniform buffers. */
     destroy() {
         this.pcfDepthArray.destroy();
         this.cascadeRenderBuffer.destroy();

@@ -12,8 +12,11 @@ import {
 
 /** One measured GPU span. `children` are spans nested inside it (draws within a pass). */
 export interface ProfileSpan {
+    /** Whatever was passed to `pass()`/`beginZone()` — e.g. `"forward"`, `"light-cull"`. */
     label: string;
+    /** Elapsed GPU time in milliseconds. Clamped at 0 for a pass that never executed. */
     gpuMs: number;
+    /** Nested spans — per-draw zones under a pass, or every pass under the `"GPU frame"` root. */
     children: ProfileSpan[];
 }
 

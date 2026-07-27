@@ -1,31 +1,40 @@
-// Software frame limiter — paces a render loop to a target frame rate.
-//
-// The engine's default present mode is `mailbox`, which is tear-free but does
-// NOT cap the frame rate: an idle loop will render as fast as it can, burning
-// GPU/CPU on frames the display never shows. This caps *submission* to a target
-// rate — the power/heat half of what vsync gives you — without the periodic
-// getCurrentTexture() stall that native `fifo`/`auto-vsync` exhibit on some
-// Vulkan drivers (that stall is exactly why the default moved off Fifo).
-//
-// Precision: a plain setTimeout/scheduler.wait oversleeps by 1–15 ms on Windows,
-// which would reintroduce visible judder. So we sleep for all but the last ~2 ms
-// and busy-spin the tail to hit the deadline exactly. The spin costs <2 ms of one
-// core per frame — cheap next to the ~14 ms we're giving back at 60 fps.
-//
-// Construct with the desired cap; `0` (the default) means uncapped — `wait()`
-// then just yields to the event loop, so it is safe to use unconditionally in a
-// loop. Reading a cap from the environment / CLI is the caller's job:
-//
-//   const limiter = new FrameLimiter(Number(process.env.METIS_FPS) || 0);
-//   // ... each frame, after present():
-//   await limiter.wait();
-
 import { scheduler } from "node:timers/promises";
 
 const SPIN_TAIL_MS = 2; // busy-spin the final stretch for jitter-free pacing
 
+/**
+ * Software frame limiter — paces a render loop to a target frame rate. This is
+ * the engine's "vsync on" knob, and it is deliberately **separate from the
+ * present mode**.
+ *
+ * The default present mode is `mailbox`, which is tear-free but does NOT cap
+ * the frame rate: an idle loop renders as fast as it can, burning GPU/CPU on
+ * frames the display never shows. This caps *submission* to a target rate — the
+ * power/heat half of what vsync gives you — without the periodic
+ * `getCurrentTexture()` stall that native `fifo`/`auto-vsync` exhibit on some
+ * Vulkan drivers (that stall is exactly why the default moved off Fifo). So:
+ * tearing is the present mode's job, the cap is this class's. Don't reach for
+ * `fifo` to get a cap back.
+ *
+ * ```ts
+ * const limiter = new FrameLimiter(Number(process.env.METIS_FPS) || 0);
+ * // … each frame, after present():
+ * await limiter.wait();
+ * ```
+ *
+ * Reading a cap from the environment / CLI is the caller's job. When
+ * benchmarking, call `wait()` *after* any GPU-timing readback so the cap never
+ * lands inside what's being measured.
+ *
+ * Precision: a plain `setTimeout`/`scheduler.wait` oversleeps by 1–15 ms on
+ * Windows, which would reintroduce visible judder. So it sleeps for all but the
+ * last ~2 ms and busy-spins the tail to hit the deadline exactly — under 2 ms of
+ * one core per frame, cheap next to the ~14 ms being given back at 60 fps.
+ */
 export class FrameLimiter {
+    /** The cap this limiter was constructed with; `0` means uncapped. */
     readonly targetFps: number;
+    /** `false` when `targetFps` is 0 — `wait()` then only yields to the event loop. */
     readonly enabled: boolean;
     private readonly period: number;
     private next = 0; // performance.now() timestamp of the next frame deadline

@@ -16,6 +16,15 @@ import tonemapWgsl from "./wgsl/tonemap.wgsl" with { type: "text" };
 export class TonemapPass implements PostProcessPass {
     readonly name = "tonemap";
 
+    /**
+     * Draws a fullscreen triangle from `ctx.hdrColorView` into `ctx.outputView`.
+     *
+     * The shader emits **linear** values and does no sRGB encoding of its own —
+     * it relies on `ctx.outputFormat`'s `-srgb` suffix for the hardware
+     * encode-on-write. A non-sRGB target therefore silently skips the encode and
+     * produces a markedly darker image, with no error anywhere. Pipelines are
+     * built lazily and cached per output format.
+     */
     execute(encoder: GpuCommandEncoder, ctx: PostProcessFrameContext): void {
         const pipeline = this.getPipeline(ctx.outputFormat);
         const bindGroup = this.device.createBindGroup({

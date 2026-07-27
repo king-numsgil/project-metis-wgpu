@@ -50,10 +50,20 @@ const NOISE_BUFFER_SIZE = AO_NOISE_DIM * AO_NOISE_DIM * 16; // vec4 per texel
  * white (`clearToWhite`) so the forward shader can multiply unconditionally.
  */
 export class AmbientOcclusion {
-    /** Occlusion radius (world units), self-occlusion bias, strength, and contrast — seeded per technique; see aoConfig.ts. */
+    /**
+     * Occlusion sampling radius, in **world units** — the neighbourhood a point
+     * can be occluded from. The one tunable here with a physical meaning, so
+     * scale it with your scene's geometry.
+     *
+     * All four tunables are reseeded from the technique's defaults whenever
+     * {@link technique} is assigned; set them *after* switching, not before.
+     */
     radius = SSAO_DEFAULTS.radius;
+    /** Self-occlusion guard. SSAO: a view-space depth bias. HBAO: a tangent-angle bias in radians. Different units per technique — hence the reseed. */
     bias = SSAO_DEFAULTS.bias;
+    /** Strength multiplier on the raw occlusion before it darkens ambient (1 = as measured). */
     intensity = SSAO_DEFAULTS.intensity;
+    /** Contrast exponent on the final AO factor; above 1 darkens creases harder. */
     power = SSAO_DEFAULTS.power;
     private readonly device: GpuDevice;
     private width = 0;
@@ -176,6 +186,7 @@ export class AmbientOcclusion {
 
     private _technique: AoTechnique = AoTechnique.None;
 
+    /** The active technique. Safe to switch at runtime — every pipeline is built up front. */
     get technique(): AoTechnique {
         return this._technique;
     }
@@ -197,7 +208,12 @@ export class AmbientOcclusion {
         return this.aoResultView;
     }
 
-    /** (Re)allocates the screen-sized targets when the viewport changes. */
+    /**
+     * (Re)allocates the screen-sized targets when the viewport changes. Cheap
+     * and idempotent when the size is unchanged, which is why the renderer calls
+     * it unconditionally every frame. Must run at least once before
+     * {@link resultView} is read.
+     */
     ensureSize(width: number, height: number) {
         if (width === this.width && height === this.height && this.normalTex) {
             return;
@@ -320,6 +336,7 @@ export class AmbientOcclusion {
         blur.end();
     }
 
+    /** Releases the screen-sized targets and the kernel/noise/uniform buffers. */
     destroy() {
         this.destroyTextures();
         this.uniforms.destroy();

@@ -121,8 +121,13 @@ export class SpotShadows {
     private readonly pipeline: GpuRenderPipeline;
     private readonly frustum: Frustum = new Float32Array(24);
 
-    /** Instances drawn across all spot shadow passes last frame, vs. the unculled total. Diagnostic only. */
+    /**
+     * Instances actually drawn across all spot shadow passes last frame.
+     * Diagnostic only — the demos show `lastDrawnInstances / lastCandidateInstances`
+     * live as a read on how much the frustum cull is buying.
+     */
     lastDrawnInstances = 0;
+    /** Instances *considered* across all spot shadow passes last frame (casters x scene instances). */
     lastCandidateInstances = 0;
 
     constructor(device: GpuDevice, modelBindGroupLayout: GpuBindGroupLayout) {
@@ -288,6 +293,7 @@ export class SpotShadows {
         }
     }
 
+    /** Releases the depth array and both uniform buffers. */
     destroy() {
         this.depthArray.destroy();
         this.renderBuffer.destroy();

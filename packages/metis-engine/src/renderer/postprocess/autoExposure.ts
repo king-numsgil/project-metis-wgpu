@@ -23,6 +23,7 @@ import autoExposureWgsl from "./wgsl/auto_exposure.wgsl" with { type: "text" };
 export class AutoExposurePass implements PostProcessPass {
     readonly name = "auto-exposure";
 
+    /** Records the single-workgroup compute pass that steps `ExposureState` toward the metered target by `ctx.deltaTime`. */
     execute(encoder: GpuCommandEncoder, ctx: PostProcessFrameContext): void {
         const params = new Std140Writer();
         params.vec4(ctx.deltaTime, this.adaptationTau, this.exposureCompensation, 0);

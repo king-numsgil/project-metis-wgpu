@@ -11,18 +11,21 @@ export class Std140Writer {
     private words: number[] = [];
     private kinds: Array<"f32" | "u32"> = [];
 
+    /** One `f32`, 4-byte aligned (i.e. wherever the cursor is). */
     f32(v: number): this {
         this.words.push(v);
         this.kinds.push("f32");
         return this;
     }
 
+    /** One `u32`. Written with `setUint32`, so the *bits* differ from `f32(v)` for the same `v`. */
     u32(v: number): this {
         this.words.push(v);
         this.kinds.push("u32");
         return this;
     }
 
+    /** `vec2<f32>`, aligned to 8 bytes. */
     vec2(x: number, y: number): this {
         this.align(2);
         return this.f32(x).f32(y);
@@ -40,16 +43,19 @@ export class Std140Writer {
         return this.f32(w);
     }
 
+    /** `vec4<f32>`, aligned to 16 bytes. */
     vec4(x: number, y: number, z: number, w: number): this {
         this.align(4);
         return this.f32(x).f32(y).f32(z).f32(w);
     }
 
+    /** `vec4<u32>`, aligned to 16 bytes. Use this (not `vec4`) for counts and indices — the bit patterns differ. */
     vec4u(x: number, y: number, z: number, w: number): this {
         this.align(4);
         return this.u32(x).u32(y).u32(z).u32(w);
     }
 
+    /** `mat4x4<f32>` — 4 vec4 columns, 64 bytes. Column-major, matching wgpu-matrix and WGSL. */
     mat4(m: Mat4Arg): this {
         this.align(4);
         for (let i = 0; i < 16; i++) {
@@ -73,10 +79,16 @@ export class Std140Writer {
         return this;
     }
 
+    /** Bytes written so far, including alignment padding. Useful for sizing a buffer from a writer built once. */
     byteLength(): number {
         return this.words.length * 4;
     }
 
+    /**
+     * Serialises everything written, little-endian, into a fresh `Uint8Array`
+     * ready for `queue.writeBuffer`. Allocates — build the writer once per
+     * upload, not once per field.
+     */
     toBytes(): Uint8Array {
         const buf = new ArrayBuffer(this.words.length * 4);
         const dv = new DataView(buf);
