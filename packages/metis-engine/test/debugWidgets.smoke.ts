@@ -21,7 +21,8 @@ import {
     RenderContext,
     Scene,
 } from "metis-engine/renderer";
-import { vec3 } from "wgpu-matrix";
+
+import { vec3f } from "metis-engine/renderer";
 
 const W = 900;
 const H = 620;
@@ -56,8 +57,8 @@ async function main() {
 
     const scene = new Scene();
     scene.environment = createExteriorEnvironment();
-    scene.camera.position = vec3.create(0, 1.6, 4.5);
-    scene.camera.target = vec3.create(0, 0.3, 0);
+    scene.camera.position = vec3f(0, 1.6, 4.5);
+    scene.camera.target = vec3f(0, 0.3, 0);
     scene.camera.setAspectFromSize(W, H);
     scene.add(new Mesh(ctx.device, plane(20, 20), "floor"), new Material({baseColor: [0.5, 0.5, 0.55, 1]}));
     scene.add(new Mesh(ctx.device, cube(1, 1, 1), "crate"), new Material({baseColor: [0.8, 0.3, 0.2, 1], roughness: 0.6}));

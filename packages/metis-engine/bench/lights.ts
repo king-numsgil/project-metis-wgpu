@@ -50,7 +50,8 @@ import {
     RenderContext,
     Scene,
 } from "metis-engine/renderer";
-import { vec3 } from "wgpu-matrix";
+import { Vec3 } from "metis-data";
+import { vec3f } from "metis-engine/renderer";
 
 const FONT_PATH = new URL("../../../assets/JetBrainsMono-Regular.ttf", import.meta.url).pathname.replace(
     /^\/([A-Za-z]:)/,
@@ -205,10 +206,10 @@ function buildLightField(count: number): AnimatedLight[] {
             light: isSpot
                 ? {
                       kind: "spot",
-                      position: vec3.create(0, 0, 0),
+                      position: vec3f(0, 0, 0),
                       // Overwritten every frame by animateLights; a placeholder
                       // rather than a meaningful value.
-                      direction: vec3.create(0, -1, 0),
+                      direction: vec3f(0, -1, 0),
                       color,
                       // Brighter than the point lights: a cone concentrates the
                       // same nominal intensity into a much smaller footprint, so
@@ -223,7 +224,7 @@ function buildLightField(count: number): AnimatedLight[] {
                   }
                 : {
                       kind: "point",
-                      position: vec3.create(0, 0, 0),
+                      position: vec3f(0, 0, 0),
                       color,
                       intensity,
                       range,
@@ -239,7 +240,7 @@ function animateLights(lights: AnimatedLight[], t: number) {
         const x = a.cx + Math.cos(angle) * a.orbitRadius;
         const z = a.cz + Math.sin(angle) * a.orbitRadius;
         const y = a.baseY + Math.sin(t * a.bobSpeed + a.phase) * a.bobAmp;
-        a.light.position = vec3.set(x, y, z, a.light.position as Float32Array);
+        Vec3.set(a.light.position, x, y, z);
 
         if (a.light.kind === "spot") {
             // Searchlight sweep: an axis held `coneTilt` off straight-down,
@@ -248,12 +249,9 @@ function animateLights(lights: AnimatedLight[], t: number) {
             // the animation readable.
             const sweep = a.spinPhase + a.spinSpeed * t;
             const s = Math.sin(a.coneTilt);
-            a.light.direction = vec3.set(
-                s * Math.cos(sweep),
+            Vec3.set(a.light.direction, s * Math.cos(sweep),
                 -Math.cos(a.coneTilt),
-                s * Math.sin(sweep),
-                a.light.direction as Float32Array,
-            );
+                s * Math.sin(sweep));
         }
     }
 }
@@ -319,8 +317,8 @@ const gpuHistory = new History(120);
 
 const scene = new Scene();
 scene.environment = createExteriorEnvironment({ambientIntensity: 0.02});
-scene.camera.position = vec3.create(0, 11, 30);
-scene.camera.target = vec3.create(0, 1, 0);
+scene.camera.position = vec3f(0, 11, 30);
+scene.camera.target = vec3f(0, 1, 0);
 scene.camera.clusterFar = 200; // light-culling range; the projection itself is infinite
 scene.camera.setAspectFromSize(ctx.width, ctx.height);
 

@@ -1,4 +1,4 @@
-import type { Mat4Arg } from "wgpu-matrix";
+import type { Mat4f } from "./types.ts";
 
 /**
  * Frustum culling against a view-projection matrix.
@@ -15,8 +15,9 @@ export type Frustum = Float32Array;
 
 /**
  * Extracts the six clip-space planes from a view-projection matrix
- * (Gribb & Hartmann). `m` is column-major, as every `wgpu-matrix` mat4 is, so
- * row *i* of the logical matrix is `(m[i], m[4+i], m[8+i], m[12+i])`.
+ * (Gribb & Hartmann). `m` is column-major, as every `metis-data` mat4 is, so
+ * row *i* of the logical matrix is `(m[i], m[c+i], m[2c+i], m[3c+i])` for a
+ * column stride of `c` elements.
  *
  * **Depth range is WebGPU's `[0, 1]`, not OpenGL's `[-1, 1]`.** The near plane
  * is therefore `row2` alone rather than `row3 + row2`; using the GL form here
@@ -24,9 +25,12 @@ export type Frustum = Float32Array;
  * visible — the sort of bug that shows up as objects vanishing near the light
  * rather than as anything obviously wrong with the maths.
  */
-export function frustumFromViewProj(m: Mat4Arg, dst?: Frustum): Frustum {
+export function frustumFromViewProj(m: Mat4f, dst?: Frustum): Frustum {
     const out = dst ?? new Float32Array(24);
-    const row = (i: number) => [m[i]!, m[4 + i]!, m[8 + i]!, m[12 + i]!] as const;
+    const v = m.view();
+    // Column stride in *elements*, not always 4 — see MatMemoryBuffer.columnElements.
+    const c = m.columnElements;
+    const row = (i: number) => [v[i]!, v[c + i]!, v[2 * c + i]!, v[3 * c + i]!] as const;
     const [x0, y0, z0, w0] = row(0);
     const [x1, y1, z1, w1] = row(1);
     const [x2, y2, z2, w2] = row(2);
@@ -81,14 +85,16 @@ export function sphereInFrustum(f: Frustum, cx: number, cy: number, cz: number, 
  * the matrix's fourth column; the scale factor is the longest of its three basis
  * columns, which is the correct conservative choice under non-uniform scale.
  */
-export function worldBoundingSphere(model: Mat4Arg, localRadius: number): {x: number; y: number; z: number; r: number} {
-    const sx = Math.hypot(model[0]!, model[1]!, model[2]!);
-    const sy = Math.hypot(model[4]!, model[5]!, model[6]!);
-    const sz = Math.hypot(model[8]!, model[9]!, model[10]!);
+export function worldBoundingSphere(model: Mat4f, localRadius: number): {x: number; y: number; z: number; r: number} {
+    const m = model.view();
+    const c = model.columnElements;
+    const sx = Math.hypot(m[0]!, m[1]!, m[2]!);
+    const sy = Math.hypot(m[c]!, m[c + 1]!, m[c + 2]!);
+    const sz = Math.hypot(m[2 * c]!, m[2 * c + 1]!, m[2 * c + 2]!);
     return {
-        x: model[12]!,
-        y: model[13]!,
-        z: model[14]!,
+        x: m[3 * c]!,
+        y: m[3 * c + 1]!,
+        z: m[3 * c + 2]!,
         r: localRadius * Math.max(sx, sy, sz),
     };
 }

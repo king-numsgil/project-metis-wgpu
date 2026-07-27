@@ -20,9 +20,10 @@ import {
     Scene,
     type SpotLight,
 } from "metis-engine/renderer";
-import { vec3 } from "wgpu-matrix";
+
+import { Mat4 } from "metis-data";
+import { mat4f, vec3f } from "metis-engine/renderer";
 import { frustumFromViewProj, sphereInFrustum } from "../src/renderer/math/frustum.ts";
-import { mat4 } from "wgpu-matrix";
 
 const W = 256;
 const H = 192;
@@ -48,19 +49,19 @@ async function renderBlockedSpot(castsShadow: boolean, extraDistantBoxes = 0): P
     // The spot is the only meaningful light, so the deck's brightness is a
     // direct readout of how much of it the shadow covers.
     scene.environment = createExteriorEnvironment({ambientIntensity: 0.0, sunIntensity: 0.0});
-    scene.camera.position = vec3.create(0, 5, 7);
-    scene.camera.target = vec3.create(0, 0, 0);
+    scene.camera.position = vec3f(0, 5, 7);
+    scene.camera.target = vec3f(0, 0, 0);
     scene.camera.setAspectFromSize(W, H);
 
     scene.add(
         new Mesh(ctx.device, plane(20, 20), "deck"),
         new Material({baseColor: [0.8, 0.8, 0.8, 1], metallic: 0, roughness: 0.9}),
-        {position: vec3.create(0, -1, 0)},
+        {position: vec3f(0, -1, 0)},
     );
     scene.add(
         new Mesh(ctx.device, cube(2.2, 0.3, 2.2), "blocker"),
         new Material({baseColor: [0.8, 0.8, 0.8, 1], metallic: 0, roughness: 0.9}),
-        {position: vec3.create(0, 1.2, 0)},
+        {position: vec3f(0, 1.2, 0)},
     );
 
     // Optional far-away geometry, used only to prove the frustum cull rejects
@@ -69,14 +70,14 @@ async function renderBlockedSpot(castsShadow: boolean, extraDistantBoxes = 0): P
         scene.add(
             new Mesh(ctx.device, cube(1, 1, 1), `distant-${i}`),
             new Material({baseColor: [0.8, 0.8, 0.8, 1], metallic: 0, roughness: 0.9}),
-            {position: vec3.create(500 + i * 10, 0, 500)},
+            {position: vec3f(500 + i * 10, 0, 500)},
         );
     }
 
     const spot: SpotLight = {
         kind: "spot",
-        position: vec3.create(0, 5, 0),
-        direction: vec3.create(0, -1, 0),
+        position: vec3f(0, 5, 0),
+        direction: vec3f(0, -1, 0),
         color: [1, 1, 1],
         intensity: 120,
         range: 20,
@@ -160,9 +161,9 @@ test("frustum planes accept what is inside and reject what is outside", () => {
     // The WebGPU [0,1] depth convention is the easy thing to get wrong here
     // (the OpenGL form puts the near plane in the wrong place), so the near/far
     // cases are tested explicitly rather than only the side planes.
-    const view = mat4.lookAt(vec3.create(0, 0, 0), vec3.create(0, 0, -1), vec3.create(0, 1, 0));
-    const proj = mat4.perspective(Math.PI / 2, 1, 1, 100);
-    const f = frustumFromViewProj(mat4.multiply(proj, view));
+    const view = Mat4.setLookAt(mat4f(), vec3f(0, 0, 0), vec3f(0, 0, -1), vec3f(0, 1, 0));
+    const proj = Mat4.setPerspective(mat4f(), Math.PI / 2, 1, 1, 100);
+    const f = frustumFromViewProj(Mat4.multiply(mat4f(), proj, view));
 
     expect(sphereInFrustum(f, 0, 0, -50, 1)).toBe(true); // dead centre
     expect(sphereInFrustum(f, 0, 0, 50, 1)).toBe(false); // behind the camera

@@ -11,8 +11,9 @@ import {
     GPUTextureUsage,
     type GpuTextureView,
 } from "metis-native";
-import { mat4 } from "wgpu-matrix";
+import { Mat4 } from "metis-data";
 import type { GpuProfiler } from "../debug/gpuProfiler.ts";
+import type { Mat4f } from "../math/types.ts";
 import type { RenderTargets } from "../rhi/targets.ts";
 import { MESH_VERTEX_LAYOUT } from "../scene/mesh.ts";
 import type { Scene } from "../scene/scene.ts";
@@ -81,10 +82,10 @@ export class AmbientOcclusion {
     /** Persistent staging, allocated once (see gpuLayouts.ts). */
     private readonly uniformBytes: Uint8Array;
     private readonly uniformStaging: {
-        view: Float32Array;
-        viewProj: Float32Array;
-        proj: Float32Array;
-        invProj: Float32Array;
+        view: Mat4f;
+        viewProj: Mat4f;
+        proj: Mat4f;
+        invProj: Mat4f;
         screenAndDepth: Float32Array;
         tuning: Float32Array;
     };
@@ -115,10 +116,12 @@ export class AmbientOcclusion {
         const s = stage(AoUniforms);
         this.uniformBytes = s.bytes;
         this.uniformStaging = {
-            view: s.f32("view", 16),
-            viewProj: s.f32("viewProj", 16),
-            proj: s.f32("proj", 16),
-            invProj: s.f32("invProj", 16),
+            // Matrix members alias the upload bytes, so `writeUniforms`
+            // computes all four straight into what gets uploaded.
+            view: s.mat4("view"),
+            viewProj: s.mat4("viewProj"),
+            proj: s.mat4("proj"),
+            invProj: s.mat4("invProj"),
             screenAndDepth: s.f32("screenAndDepth", 4),
             tuning: s.f32("tuning", 4),
         };
@@ -364,12 +367,15 @@ export class AmbientOcclusion {
     }
 
     private writeUniforms(scene: Scene) {
-        const proj = scene.camera.projectionMatrix();
+        // All four matrices are computed directly into the upload bytes — no
+        // intermediates, no copies. `viewProj` is built from the two above it
+        // rather than via `camera.viewProjectionMatrix()`, which would recompute
+        // both into the camera's own scratch first.
         const s = this.uniformStaging;
-        s.view.set(scene.camera.viewMatrix() as Float32Array);
-        s.viewProj.set(scene.camera.viewProjectionMatrix() as Float32Array);
-        s.proj.set(proj as Float32Array);
-        s.invProj.set(mat4.invert(proj) as Float32Array);
+        scene.camera.viewMatrix(s.view);
+        scene.camera.projectionMatrix(s.proj);
+        Mat4.multiply(s.viewProj, s.proj, s.view);
+        Mat4.invert(s.invProj, s.proj);
         // z/w are informational only (the AO shaders reconstruct through invProj
         // and read just params0.xy). `clusterFar` stands in for the projection's
         // far plane, which is infinite under reverse-Z and would poison the f32.

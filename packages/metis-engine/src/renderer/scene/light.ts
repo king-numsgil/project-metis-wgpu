@@ -1,9 +1,9 @@
-import type { Vec3Arg } from "wgpu-matrix";
+import type { Vec3f } from "../math/types.ts";
 
 /** Fields every local (clustered) light shares, whatever its shape. */
 interface LightBase {
     /** World-space position. For a spot this is the cone's apex. */
-    position: Vec3Arg;
+    position: Vec3f;
     /** Linear RGB tint, conventionally 0..1. Multiplied by `intensity`, so values above 1 are legal, just redundant. */
     color: [number, number, number];
     /** Radiant intensity scale — same linear units as `Environment.sunIntensity`. */
@@ -33,7 +33,7 @@ export interface SpotLight extends LightBase {
      * `position`. Same convention as `Environment.sunDirection`. Normalized on
      * upload, so any nonzero vector works.
      */
-    direction: Vec3Arg;
+    direction: Vec3f;
     /**
      * Half-angle of the full-brightness core, in **radians**. Inside this cone
      * the light is at full intensity.

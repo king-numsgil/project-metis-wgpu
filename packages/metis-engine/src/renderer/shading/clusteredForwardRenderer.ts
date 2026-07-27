@@ -8,10 +8,11 @@ import {
     type GpuRenderPipeline,
     GPUShaderStage,
 } from "metis-native";
-import { mat4 } from "wgpu-matrix";
+import { Mat4 } from "metis-data";
 import { AmbientOcclusion } from "../ao/ambientOcclusion.ts";
 import { AoTechnique } from "../ao/aoConfig.ts";
 import type { GpuProfiler } from "../debug/gpuProfiler.ts";
+import { type Mat4f, mat4f } from "../math/types.ts";
 import { DEPTH_FORMAT, HDR_COLOR_FORMAT, MSAA_SAMPLE_COUNT, type RenderTargets } from "../rhi/targets.ts";
 import { MESH_VERTEX_LAYOUT } from "../scene/mesh.ts";
 import type { Scene } from "../scene/scene.ts";
@@ -110,10 +111,10 @@ export class ClusteredForwardRenderer {
     private readonly cameraBuffer: GpuBuffer;
     private readonly environmentBuffer: GpuBuffer;
     /** Scratch for the projection in `writeFrameUniforms`, so that path allocates nothing. */
-    private readonly projScratch = mat4.identity();
+    private readonly projScratch = mat4f();
     /** Persistent CPU staging — allocated once, rewritten in place each frame. */
     private readonly cameraBytes: Uint8Array;
-    private readonly cameraStaging: {viewProj: Float32Array; view: Float32Array; position: Float32Array};
+    private readonly cameraStaging: {viewProj: Mat4f; view: Mat4f; position: Float32Array};
     private readonly environmentBytes: Uint8Array;
     private readonly environmentStaging: {
         sunDirection: Float32Array;
@@ -254,8 +255,10 @@ ${depthPrepassWgsl}`,
         const camStage = stage(CameraUniforms);
         this.cameraBytes = camStage.bytes;
         this.cameraStaging = {
-            viewProj: camStage.f32("viewProj", 16),
-            view: camStage.f32("view", 16),
+            // Matrix members alias the upload bytes (see gpuLayouts.ts's
+            // `stage`), so `writeFrameUniforms` computes into them directly.
+            viewProj: camStage.mat4("viewProj"),
+            view: camStage.mat4("view"),
             position: camStage.f32("position", 3),
         };
         const envStage = stage(EnvironmentUniforms);
@@ -409,15 +412,15 @@ ${depthPrepassWgsl}`,
         // calling viewProjectionMatrix() (which would recompute it internally).
         const cam = this.cameraStaging;
         scene.camera.viewMatrix(cam.view);
-        mat4.multiply(scene.camera.projectionMatrix(this.projScratch), cam.view, cam.viewProj);
-        const p = scene.camera.position;
+        Mat4.multiply(cam.viewProj, scene.camera.projectionMatrix(this.projScratch), cam.view);
+        const p = scene.camera.position.view();
         cam.position[0] = p[0]!;
         cam.position[1] = p[1]!;
         cam.position[2] = p[2]!;
         this.device.queue.writeBuffer(this.cameraBuffer, 0, this.cameraBytes);
 
         const env = this.environmentStaging;
-        const sd = scene.environment.sunDirection;
+        const sd = scene.environment.sunDirection.view();
         env.sunDirection[0] = sd[0]!;
         env.sunDirection[1] = sd[1]!;
         env.sunDirection[2] = sd[2]!;

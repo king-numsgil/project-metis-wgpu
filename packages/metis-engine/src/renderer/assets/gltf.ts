@@ -1,6 +1,7 @@
 import type { GpuDevice } from "metis-native";
 import { dirname, join } from "node:path";
-import { mat4, type Mat4Arg, quat, vec3 } from "wgpu-matrix";
+import { Mat4, Vec3 } from "metis-data";
+import { type Mat4f, mat4f, quatf, vec3f } from "../math/types.ts";
 import { Material, type MaterialParams } from "../scene/material.ts";
 import { Mesh } from "../scene/mesh.ts";
 import { SceneInstance } from "../scene/scene.ts";
@@ -70,17 +71,24 @@ interface GltfDocument {
 const COMPONENT_SIZE: Record<number, number> = {5121: 1, 5123: 2, 5125: 4, 5126: 4};
 const TYPE_COMPONENT_COUNT: Record<string, number> = {SCALAR: 1, VEC2: 2, VEC3: 3, VEC4: 4};
 
-function nodeLocalMatrix(node: GltfNode): Mat4Arg {
+function nodeLocalMatrix(node: GltfNode): Mat4f {
+    const m = mat4f();
     if (node.matrix) {
-        return mat4.clone(new Float32Array(node.matrix));
+        // glTF stores a node matrix column-major, same as a metis-data mat4.
+        m.view().set(node.matrix);
+        return m;
     }
     const t = node.translation ?? [0, 0, 0];
     const r = node.rotation ?? [0, 0, 0, 1];
     const s = node.scale ?? [1, 1, 1];
-    const m = mat4.fromQuat(quat.fromValues(r[0], r[1], r[2], r[3]));
-    mat4.multiply(mat4.translation(vec3.fromValues(...t)), m, m);
-    mat4.scale(m, vec3.fromValues(...s), m);
-    return m;
+    // T * R * S, closed-form. glTF's rotation is XYZW, which is `Quatf`'s
+    // storage order too.
+    return Mat4.composeTRS(
+        m,
+        t[0]!, t[1]!, t[2]!,
+        quatf(r[0]!, r[1]!, r[2]!, r[3]!),
+        s[0]!, s[1]!, s[2]!,
+    );
 }
 
 /**
@@ -159,8 +167,8 @@ export async function loadGltf(device: GpuDevice, gltfPath: string): Promise<Sce
             const nx = normals[i * 3 + 0]!;
             const ny = normals[i * 3 + 1]!;
             const nz = normals[i * 3 + 2]!;
-            const up = Math.abs(ny) > 0.99 ? vec3.create(1, 0, 0) : vec3.create(0, 1, 0);
-            const tangent = vec3.normalize(vec3.cross(up, vec3.create(nx, ny, nz)));
+            const up = Math.abs(ny) > 0.99 ? vec3f(1, 0, 0) : vec3f(0, 1, 0);
+            const tangent = Vec3.normalize(vec3f(), Vec3.cross(vec3f(), up, vec3f(nx, ny, nz))).view();
             vertices[i * 12 + 0] = positions[i * 3 + 0]!;
             vertices[i * 12 + 1] = positions[i * 3 + 1]!;
             vertices[i * 12 + 2] = positions[i * 3 + 2]!;
@@ -210,14 +218,14 @@ export async function loadGltf(device: GpuDevice, gltfPath: string): Promise<Sce
     // non-uniform scale, which can't be losslessly decomposed back into
     // Transform's position/Euler-rotation/scale fields — SceneInstance's
     // `modelMatrixOverride` bypasses that decomposition entirely.
-    const visit = (nodeIndex: number, parentWorld: Mat4Arg) => {
+    const visit = (nodeIndex: number, parentWorld: Mat4f) => {
         const node = doc.nodes[nodeIndex]!;
-        const world = mat4.multiply(parentWorld, nodeLocalMatrix(node));
+        const world = Mat4.multiply(mat4f(), parentWorld, nodeLocalMatrix(node));
 
         if (node.mesh !== undefined) {
             const primitive = doc.meshes[node.mesh]!.primitives[0]!;
             const instance = new SceneInstance(getMesh(node.mesh), getMaterial(primitive.material));
-            instance.modelMatrixOverride = mat4.clone(world);
+            instance.modelMatrixOverride = Mat4.copy(mat4f(), world);
             instances.push(instance);
         }
 
@@ -227,7 +235,7 @@ export async function loadGltf(device: GpuDevice, gltfPath: string): Promise<Sce
     };
 
     for (const rootIndex of sceneNodes) {
-        visit(rootIndex, mat4.identity());
+        visit(rootIndex, mat4f());
     }
 
     return instances;

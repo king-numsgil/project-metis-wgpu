@@ -8,8 +8,9 @@ import {
     type GpuDevice,
     GPUShaderStage,
 } from "metis-native";
-import { mat4, vec3 } from "wgpu-matrix";
+import { Mat4, Vec3 } from "metis-data";
 import type { GpuProfiler } from "../debug/gpuProfiler.ts";
+import { type Mat4f, mat4f, type Vec3f } from "../math/types.ts";
 import type { RenderTargets } from "../rhi/targets.ts";
 import type { Light, SpotLight } from "../scene/light.ts";
 import type { Scene } from "../scene/scene.ts";
@@ -51,7 +52,7 @@ export class LightCuller {
     private readonly device: GpuDevice;
     private readonly paramsBytes: Uint8Array;
     private readonly paramsStaging: {
-        invProj: Float32Array;
+        invProj: Mat4f;
         screenAndDepth: Float32Array;
         counts: Uint32Array;
         lightCount: Uint32Array;
@@ -60,10 +61,16 @@ export class LightCuller {
     private readonly lightsBytes: Uint8Array;
     private readonly lightStaging: Array<{
         worldPositionRange: Float32Array;
+        worldPosition: Vec3f;
         viewPositionIntensity: Float32Array;
+        viewPosition: Vec3f;
         colorCosOuter: Float32Array;
         directionSpotScale: Float32Array;
+        worldDirection: Vec3f;
     }>;
+    /** Per-frame scratch, so `write` allocates no matrices. */
+    private readonly viewScratch = mat4f();
+    private readonly projScratch = mat4f();
     private readonly clusterParamsBuffer: GpuBuffer;
     private readonly lightsBuffer: GpuBuffer;
     private readonly clusterAABBsBuffer: GpuBuffer;
@@ -83,7 +90,8 @@ export class LightCuller {
         const params = stage(ClusterParams);
         this.paramsBytes = params.bytes;
         this.paramsStaging = {
-            invProj: params.f32("invProj", 16),
+            // Aliases the upload bytes — `Mat4.invert` writes its result there.
+            invProj: params.mat4("invProj"),
             screenAndDepth: params.f32("screenAndDepth", 4),
             counts: params.u32("counts", 4),
             lightCount: params.u32("lightCount", 4),
@@ -104,11 +112,16 @@ export class LightCuller {
         for (let i = 0; i < MAX_LIGHTS; i++) {
             this.lightStaging.push({
                 // Each vec3 is followed by its paired scalar in the same 16-byte
-                // slot, so a 4-element view covers both: [x, y, z, scalar].
+                // slot, so a 4-element view covers both: [x, y, z, scalar]. The
+                // `Vec3f` beside it aliases the same three floats, so a vec3 op
+                // writes xyz in place and the line after it stores the scalar.
                 worldPositionRange: lights.elementF32(i, "worldPosition", 4),
+                worldPosition: lights.elementVec3(i, "worldPosition"),
                 viewPositionIntensity: lights.elementF32(i, "viewPosition", 4),
+                viewPosition: lights.elementVec3(i, "viewPosition"),
                 colorCosOuter: lights.elementF32(i, "color", 4),
                 directionSpotScale: lights.elementF32(i, "worldDirection", 4),
+                worldDirection: lights.elementVec3(i, "worldDirection"),
             });
         }
 
@@ -231,7 +244,7 @@ export class LightCuller {
      */
     write(scene: Scene, targets: RenderTargets, shadowSpots: SpotLight[] = []) {
         const p = this.paramsStaging;
-        p.invProj.set(mat4.invert(scene.camera.projectionMatrix()) as Float32Array);
+        Mat4.invert(p.invProj, scene.camera.projectionMatrix(this.projScratch));
         // clusterFar, not a projection far plane — the reverse-Z projection is
         // infinite. The cluster grid needs a finite range to slice
         // exponentially; lights past it simply aren't culled into any cluster.
@@ -260,23 +273,22 @@ export class LightCuller {
         p.cameraNear[0] = scene.camera.near;
         this.device.queue.writeBuffer(this.clusterParamsBuffer, 0, this.paramsBytes);
 
-        const view = scene.camera.viewMatrix();
+        const view = scene.camera.viewMatrix(this.viewScratch);
         for (let i = 0; i < lightCount; i++) {
             const light = ordered[i]!;
             const s = this.lightStaging[i]!;
 
             // Every write below lands *directly* in the packed GpuLight slot —
             // there is no intermediate vector anywhere in this loop. The vec3
-            // ops take a `dst`, and each staging view is the 4-float
-            // [x, y, z, scalar] slot, so a vec3 op fills xyz and leaves the
-            // paired scalar for the assignment on the next line. Passing no
-            // `dst` (the obvious way to write this) allocates a Float32Array per
-            // call and then needs three stores to copy it in — two allocations
-            // and six stores per light, at up to MAX_LIGHTS a frame.
-            vec3.copy(light.position, s.worldPositionRange);
+            // ops are out-first onto a `Vec3f` that aliases the slot's xyz, so
+            // each fills xyz and leaves the paired scalar for the assignment on
+            // the next line. Producing a fresh vector and copying it in (the
+            // obvious way to write this) would cost an allocation and three
+            // extra stores per light, at up to MAX_LIGHTS a frame.
+            Vec3.copy(s.worldPosition, light.position);
             s.worldPositionRange[3] = light.range;
 
-            vec3.transformMat4(light.position, view, s.viewPositionIntensity);
+            Vec3.transformMat4(s.viewPosition, light.position, view);
             s.viewPositionIntensity[3] = light.intensity;
 
             s.colorCosOuter[0] = light.color[0];
@@ -294,7 +306,7 @@ export class LightCuller {
                 // or inverted cone) would divide by ~0. Clamping the
                 // denominator turns that into a hard-edged cone instead of Inf.
                 s.colorCosOuter[3] = cosOuter;
-                vec3.normalize(light.direction, s.directionSpotScale);
+                Vec3.normalize(s.worldDirection, light.direction);
                 s.directionSpotScale[3] = 1 / Math.max(cosInner - cosOuter, 1e-4);
             } else {
                 s.colorCosOuter[3] = -2;

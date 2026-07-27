@@ -38,7 +38,8 @@ import {
     uvSphere,
     VectorText,
 } from "metis-engine/renderer";
-import { vec3 } from "wgpu-matrix";
+import { Vec3 } from "metis-data";
+import { vec3f } from "metis-engine/renderer";
 
 const FONT_PATH = new URL("../../../assets/JetBrainsMono-Regular.ttf", import.meta.url).pathname.replace(
     /^\/([A-Za-z]:)/,
@@ -83,20 +84,20 @@ const scene = new Scene();
 // shadows correctly become subtler — they only remove the spot's contribution,
 // never the sun's (that's the cascades' job).
 scene.environment = createExteriorEnvironment({
-    sunDirection: vec3.normalize(vec3.create(0.05, -1, 0.12)),
+    sunDirection: Vec3.normalize(vec3f(), vec3f(0.05, -1, 0.12)),
     sunIntensity: 0.4,
     ambientIntensity: 0.01,
 });
-scene.camera.position = vec3.create(0, 7.5, 8.5);
-scene.camera.target = vec3.create(0, 0.2, 0);
+scene.camera.position = vec3f(0, 7.5, 8.5);
+scene.camera.target = vec3f(0, 0.2, 0);
 scene.camera.setAspectFromSize(ctx.width, ctx.height);
 
 /** Centre of the sphere — every spot aims here, and the orbit is around it. */
-const FOCUS = vec3.create(0, 0.3, 0);
+const FOCUS = vec3f(0, 0.3, 0);
 
 const deckMesh = new Mesh(ctx.device, cube(24, 0.2, 24), "deck");
 const deckMaterial = new Material({baseColor: [0.42, 0.43, 0.46, 1], metallic: 0.05, roughness: 0.75});
-scene.add(deckMesh, deckMaterial, {position: vec3.create(0, -1.0, 0)});
+scene.add(deckMesh, deckMaterial, {position: vec3f(0, -1.0, 0)});
 
 // Metallic and fairly smooth, so each coloured spot also leaves a distinct
 // specular highlight — a second, independent read on whether the lights are
@@ -135,8 +136,8 @@ const spots: OrbitingSpot[] = PALETTE.map((entry, i) => ({
     height: 4.2 + (i % 3) * 0.3,
     light: {
         kind: "spot",
-        position: vec3.create(0, 0, 0),
-        direction: vec3.create(0, -1, 0),
+        position: vec3f(0, 0, 0),
+        direction: vec3f(0, -1, 0),
         color: entry.color,
         intensity: 55,
         range: 16,
@@ -167,17 +168,24 @@ function animateSpots(t: number) {
         const a = s.phase + s.speed * t;
         const x = Math.cos(a) * s.radius;
         const z = Math.sin(a) * s.radius;
-        s.light.position = vec3.set(x, s.height, z, s.light.position as Float32Array);
+        Vec3.set(s.light.position, x, s.height, z);
         // Aim at the sphere: `direction` is the way light TRAVELS, so it points
         // from the light toward the focus, not the other way round.
-        s.light.direction = vec3.set(
-            FOCUS[0]! - x,
-            FOCUS[1]! - s.height,
-            FOCUS[2]! - z,
-            s.light.direction as Float32Array,
+        Vec3.set(
+            s.light.direction,
+            FOCUS.getComponent(0) - x,
+            FOCUS.getComponent(1) - s.height,
+            FOCUS.getComponent(2) - z,
         );
     }
 }
+
+// Fly-camera scratch. The control block below runs every frame, so its
+// intermediates are pre-allocated rather than minted per key press.
+const WORLD_UP = vec3f(0, 1, 0);
+const flyForward = vec3f();
+const flyRight = vec3f();
+const flyStep = vec3f();
 
 let yaw = Math.PI;
 let pitch = -0.62;
@@ -245,28 +253,28 @@ while (running) {
         pitch = Math.max(pitch - turnSpeed, -1.4);
     }
 
-    const forwardDir = vec3.create(Math.sin(yaw) * Math.cos(pitch), Math.sin(pitch), Math.cos(yaw) * Math.cos(pitch));
-    const right = vec3.normalize(vec3.cross(forwardDir, vec3.create(0, 1, 0)));
+    const forwardDir = Vec3.set(flyForward, Math.sin(yaw) * Math.cos(pitch), Math.sin(pitch), Math.cos(yaw) * Math.cos(pitch));
+    const right = Vec3.normalize(flyRight, Vec3.cross(flyRight, forwardDir, WORLD_UP));
     const moveSpeed = 4 * dt;
     if (keys.has(SdlKeycode.W)) {
-        vec3.add(scene.camera.position, vec3.scale(forwardDir, moveSpeed), scene.camera.position);
+        Vec3.add(scene.camera.position, scene.camera.position, Vec3.scale(flyStep, forwardDir, moveSpeed));
     }
     if (keys.has(SdlKeycode.S)) {
-        vec3.add(scene.camera.position, vec3.scale(forwardDir, -moveSpeed), scene.camera.position);
+        Vec3.add(scene.camera.position, scene.camera.position, Vec3.scale(flyStep, forwardDir, -moveSpeed));
     }
     if (keys.has(SdlKeycode.A)) {
-        vec3.add(scene.camera.position, vec3.scale(right, -moveSpeed), scene.camera.position);
+        Vec3.add(scene.camera.position, scene.camera.position, Vec3.scale(flyStep, right, -moveSpeed));
     }
     if (keys.has(SdlKeycode.D)) {
-        vec3.add(scene.camera.position, vec3.scale(right, moveSpeed), scene.camera.position);
+        Vec3.add(scene.camera.position, scene.camera.position, Vec3.scale(flyStep, right, moveSpeed));
     }
     if (keys.has(SdlKeycode.Q)) {
-        scene.camera.position[1]! -= moveSpeed;
+        scene.camera.position.setComponent(1, scene.camera.position.getComponent(1) - moveSpeed);
     }
     if (keys.has(SdlKeycode.E)) {
-        scene.camera.position[1]! += moveSpeed;
+        scene.camera.position.setComponent(1, scene.camera.position.getComponent(1) + moveSpeed);
     }
-    vec3.add(scene.camera.position, forwardDir, scene.camera.target);
+    Vec3.add(scene.camera.target, scene.camera.position, forwardDir);
 
     const frame = ctx.beginFrame();
     const encodeStart = performance.now();

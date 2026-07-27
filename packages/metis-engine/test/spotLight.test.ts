@@ -21,7 +21,8 @@ import {
     RenderContext,
     Scene,
 } from "metis-engine/renderer";
-import { vec3 } from "wgpu-matrix";
+
+import { vec3f } from "metis-engine/renderer";
 
 const W = 320;
 const H = 240;
@@ -42,8 +43,8 @@ async function scanlineOf(light: Light): Promise<{luma: number[]; tanHalfX: numb
     // The light under test is the *only* light: outside its cone the wall must
     // be genuinely black, so the boundary is unambiguous.
     scene.environment = createExteriorEnvironment({ambientIntensity: 0.0, sunIntensity: 0.0});
-    scene.camera.position = vec3.create(0, 0, 0);
-    scene.camera.target = vec3.create(0, 0, -1);
+    scene.camera.position = vec3f(0, 0, 0);
+    scene.camera.target = vec3f(0, 0, -1);
     scene.camera.near = 0.01;
     scene.camera.setAspectFromSize(W, H);
 
@@ -52,7 +53,7 @@ async function scanlineOf(light: Light): Promise<{luma: number[]; tanHalfX: numb
     scene.add(
         new Mesh(ctx.device, cube(40, 40, 0.1), "wall"),
         new Material({baseColor: [0.8, 0.8, 0.8, 1], metallic: 0, roughness: 0.9}),
-        {position: vec3.create(0, 0, -WALL_DEPTH - 0.05)},
+        {position: vec3f(0, 0, -WALL_DEPTH - 0.05)},
     );
     scene.lights.push(light);
 
@@ -108,8 +109,8 @@ test("outerAngle is the cone's half-angle, in radians", async () => {
     const rad = (outerDeg * Math.PI) / 180;
     const {luma, tanHalfX} = await scanlineOf({
         kind: "spot",
-        position: vec3.create(0, 0, 0),
-        direction: vec3.create(0, 0, -1),
+        position: vec3f(0, 0, 0),
+        direction: vec3f(0, 0, -1),
         color: [1, 1, 1],
         intensity: 30,
         range: 20,
@@ -129,8 +130,8 @@ test("a spot light is dark outside its cone", async () => {
     const rad = (20 * Math.PI) / 180;
     const {luma} = await scanlineOf({
         kind: "spot",
-        position: vec3.create(0, 0, 0),
-        direction: vec3.create(0, 0, -1),
+        position: vec3f(0, 0, 0),
+        direction: vec3f(0, 0, -1),
         color: [1, 1, 1],
         intensity: 30,
         range: 20,
@@ -149,7 +150,7 @@ test("a point light is unaffected by the spot encoding", async () => {
     // this goes black.
     const {luma} = await scanlineOf({
         kind: "point",
-        position: vec3.create(0, 0, 0),
+        position: vec3f(0, 0, 0),
         color: [1, 1, 1],
         intensity: 30,
         range: 20,

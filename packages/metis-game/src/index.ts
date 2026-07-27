@@ -45,7 +45,8 @@ import {
     uvSphere,
     VectorText,
 } from "metis-engine/renderer";
-import { vec3 } from "wgpu-matrix";
+import { Vec3 } from "metis-data";
+import { vec3f } from "metis-engine/renderer";
 import { FrameProfiler } from "./frameProfiler";
 
 const LIGHT_COUNT = 100;
@@ -122,11 +123,11 @@ hud.loadFont("mono", FONT_PATH);
 const scene = new Scene();
 // Sun at 45 degrees elevation (sunDirection is the direction light *travels*).
 scene.environment = createExteriorEnvironment({
-    sunDirection: vec3.normalize(vec3.create(-1, -1, 0)),
+    sunDirection: Vec3.normalize(vec3f(), vec3f(-1, -1, 0)),
     ambientIntensity: 0.02,
 });
-scene.camera.position = vec3.create(0, 8, 22);
-scene.camera.target = vec3.create(0, 1, 0);
+scene.camera.position = vec3f(0, 8, 22);
+scene.camera.target = vec3f(0, 1, 0);
 scene.camera.clusterFar = 200; // light-culling range; the projection itself is infinite
 scene.camera.setAspectFromSize(width, height);
 
@@ -141,7 +142,7 @@ forward.shadowDistance = SHADOW_DISTANCE;
 // over a 100 m patch is 0.8 mm.
 const earth = new Mesh(device, uvSphere(EARTH_R, 32, 64), "earth");
 const earthMaterial = new Material({baseColor: [0.5, 0.5, 0.52, 1], metallic: 0.0, roughness: 0.85});
-scene.add(earth, earthMaterial, {position: vec3.create(0, -EARTH_R, 0)});
+scene.add(earth, earthMaterial, {position: vec3f(0, -EARTH_R, 0)});
 
 // The Moon, 1:1, directly overhead. Angular diameter 2*MOON_R/MOON_DIST = 9.0
 // mrad = 0.52 degrees — the real thing, and about 8 px tall at this fov/height.
@@ -149,7 +150,7 @@ scene.add(earth, earthMaterial, {position: vec3.create(0, -EARTH_R, 0)});
 // infinite): the old far = 200 would have clipped it away entirely.
 const moon = new Mesh(device, uvSphere(MOON_R, 32, 48), "moon");
 const moonMaterial = new Material({baseColor: [0.62, 0.6, 0.57, 1], metallic: 0.0, roughness: 0.95});
-scene.add(moon, moonMaterial, {position: vec3.create(0, MOON_DIST, 0)});
+scene.add(moon, moonMaterial, {position: vec3f(0, MOON_DIST, 0)});
 
 // A few surface structures spread across the near-to-mid distance, so the
 // cascades each have something to cast — near ones land in the crisp cascade 0,
@@ -158,7 +159,7 @@ const block = new Mesh(device, cube(3, 5, 3), "structure");
 const blockMaterial = new Material({baseColor: [0.35, 0.36, 0.4, 1], metallic: 0.3, roughness: 0.6});
 // Spread from underfoot out to ~120 m so a shadow lands in each cascade.
 for (const [x, z] of [[-8, -2], [6, 1], [0, -6], [9, -5], [-14, -22], [18, -40], [-30, -80], [10, -120]] as [number, number][]) {
-    scene.add(block, blockMaterial, {position: vec3.create(x, 2.5, z)});
+    scene.add(block, blockMaterial, {position: vec3f(x, 2.5, z)});
 }
 
 // ── The light field ─────────────────────────────────────────────────────────
@@ -195,7 +196,7 @@ function buildLightField(count: number): AnimatedLight[] {
             bobSpeed: 0.5 + rand() * 2.0,
             light: {
                 kind: "point",
-                position: vec3.create(0, 0, 0),
+                position: vec3f(0, 0, 0),
                 color,
                 intensity: 6 + rand() * 10,
                 range: 5 + rand() * 10,
@@ -214,7 +215,7 @@ function animateLights(t: number) {
         const x = a.cx + Math.cos(angle) * a.orbitRadius;
         const z = a.cz + Math.sin(angle) * a.orbitRadius;
         const y = a.baseY + Math.sin(t * a.bobSpeed + a.phase) * a.bobAmp;
-        a.light.position = vec3.set(x, y, z, a.light.position as Float32Array);
+        Vec3.set(a.light.position, x, y, z);
     }
 }
 
@@ -261,6 +262,13 @@ function hatValueToString(value: SdlJoyHat): string {
 }
 
 // ── Frame loop ──────────────────────────────────────────────────────────────
+// Fly-camera scratch. The control block below runs every frame, so its
+// intermediates are pre-allocated rather than minted per key press.
+const WORLD_UP = vec3f(0, 1, 0);
+const flyForward = vec3f();
+const flyRight = vec3f();
+const flyStep = vec3f();
+
 let yaw = Math.PI; // looking -Z, back toward the origin
 let pitch = -0.32;
 let elapsed = 0;
@@ -322,28 +330,28 @@ while (running) {
         pitch = Math.max(pitch - turn, -1.4);
     }
 
-    const forwardDir = vec3.create(Math.sin(yaw) * Math.cos(pitch), Math.sin(pitch), Math.cos(yaw) * Math.cos(pitch));
-    const right = vec3.normalize(vec3.cross(forwardDir, vec3.create(0, 1, 0)));
+    const forwardDir = Vec3.set(flyForward, Math.sin(yaw) * Math.cos(pitch), Math.sin(pitch), Math.cos(yaw) * Math.cos(pitch));
+    const right = Vec3.normalize(flyRight, Vec3.cross(flyRight, forwardDir, WORLD_UP));
     const speed = 12 * dt;
     if (keyboard.get(SdlScancode.W)) {
-        vec3.add(scene.camera.position, vec3.scale(forwardDir, speed), scene.camera.position);
+        Vec3.add(scene.camera.position, scene.camera.position, Vec3.scale(flyStep, forwardDir, speed));
     }
     if (keyboard.get(SdlScancode.S)) {
-        vec3.add(scene.camera.position, vec3.scale(forwardDir, -speed), scene.camera.position);
+        Vec3.add(scene.camera.position, scene.camera.position, Vec3.scale(flyStep, forwardDir, -speed));
     }
     if (keyboard.get(SdlScancode.A)) {
-        vec3.add(scene.camera.position, vec3.scale(right, -speed), scene.camera.position);
+        Vec3.add(scene.camera.position, scene.camera.position, Vec3.scale(flyStep, right, -speed));
     }
     if (keyboard.get(SdlScancode.D)) {
-        vec3.add(scene.camera.position, vec3.scale(right, speed), scene.camera.position);
+        Vec3.add(scene.camera.position, scene.camera.position, Vec3.scale(flyStep, right, speed));
     }
     if (keyboard.get(SdlScancode.Q)) {
-        scene.camera.position[1]! -= speed;
+        scene.camera.position.setComponent(1, scene.camera.position.getComponent(1) - speed);
     }
     if (keyboard.get(SdlScancode.E)) {
-        scene.camera.position[1]! += speed;
+        scene.camera.position.setComponent(1, scene.camera.position.getComponent(1) + speed);
     }
-    vec3.add(scene.camera.position, forwardDir, scene.camera.target);
+    Vec3.add(scene.camera.target, scene.camera.position, forwardDir);
 
     animateLights(elapsed);
     profiler.lap("update+encode"); // CPU: input, sim, light animation

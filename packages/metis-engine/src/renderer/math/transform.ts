@@ -1,4 +1,5 @@
-import { mat3, type Mat3Arg, mat4, type Mat4Arg, vec3, type Vec3Arg } from "wgpu-matrix";
+import { Mat3, Mat4, Quat } from "metis-data";
+import { type Mat3f, type Mat4f, mat3f, quatf, type Vec3f, vec3f } from "./types.ts";
 
 /**
  * Position + Euler rotation (radians, applied X then Y then Z) + scale.
@@ -9,36 +10,70 @@ import { mat3, type Mat3Arg, mat4, type Mat4Arg, vec3, type Vec3Arg } from "wgpu
  * `SceneInstance.modelMatrixOverride`.
  */
 export interface Transform {
-    position: Vec3Arg;
+    position: Vec3f;
     /** Rotation in **radians** per axis, applied X, then Y, then Z. */
-    rotationEuler: Vec3Arg;
+    rotationEuler: Vec3f;
     /** Per-axis scale. Non-uniform values are handled correctly — the normal matrix compensates. */
-    scale: Vec3Arg;
+    scale: Vec3f;
 }
 
 /** A `Transform` at the origin, unrotated, unit scale, with any `overrides` applied. */
 export function createTransform(overrides?: Partial<Transform>): Transform {
     return {
-        position: overrides?.position ?? vec3.create(0, 0, 0),
-        rotationEuler: overrides?.rotationEuler ?? vec3.create(0, 0, 0),
-        scale: overrides?.scale ?? vec3.create(1, 1, 1),
+        position: overrides?.position ?? vec3f(0, 0, 0),
+        rotationEuler: overrides?.rotationEuler ?? vec3f(0, 0, 0),
+        scale: overrides?.scale ?? vec3f(1, 1, 1),
     };
 }
 
-/** Composes T * Rx * Ry * Rz * S — scale first, then rotate, then translate. */
-export function transformToMat4(t: Transform, dst?: Mat4Arg): Mat4Arg {
-    const m = mat4.translation(t.position, dst);
-    mat4.rotateX(m, t.rotationEuler[0]!, m);
-    mat4.rotateY(m, t.rotationEuler[1]!, m);
-    mat4.rotateZ(m, t.rotationEuler[2]!, m);
-    mat4.scale(m, t.scale, m);
-    return m;
+/**
+ * Module-level scratch for the Euler → quaternion step. `transformToMat4` runs
+ * once per instance per frame (twice, with the spot-shadow frustum cull), so it
+ * must not allocate; the renderer is single-threaded and never re-enters this.
+ */
+const eulerScratch = quatf();
+
+/**
+ * Composes T * Rx * Ry * Rz * S into `out` — scale first, then rotate, then
+ * translate.
+ *
+ * **Out-first, with no allocating variant, deliberately.** Its result always
+ * lands in a GPU staging buffer (`SceneInstance`'s model uniform), so an
+ * allocating form would only ever be a copy away from the buffer that wanted
+ * it. `Mat4.composeTRS` writes the composition closed-form rather than
+ * multiplying three intermediates.
+ */
+export function transformToMat4(t: Transform, out: Mat4f): Mat4f {
+    const r = t.rotationEuler.view();
+    const s = t.scale.view();
+    const p = t.position.view();
+    // Quat.fromEuler is XYZ order (qX·qY·qZ), matching the field's documented
+    // "applied X, then Y, then Z" — and matching Mat4.composeTRS's convention,
+    // which is tied to Mat4.rotation's.
+    Quat.fromEuler(eulerScratch, r[0] as number, r[1] as number, r[2] as number);
+    return Mat4.composeTRS(
+        out,
+        p[0] as number, p[1] as number, p[2] as number,
+        eulerScratch,
+        s[0] as number, s[1] as number, s[2] as number,
+    );
 }
 
-/** Inverse-transpose of the model's upper 3x3 — required so normals stay correct under non-uniform scale. */
-export function normalMatrixFromModel(model: Mat4Arg, dst?: Mat3Arg): Mat3Arg {
-    const m3 = mat3.fromMat4(model);
-    mat3.invert(m3, m3);
-    mat3.transpose(m3, m3);
-    return dst ? mat3.copy(m3, dst) : m3;
+/** Scratch for {@link normalMatrixFromModel}'s intermediate 3x3. */
+const linearScratch = mat3f();
+
+/**
+ * Inverse-transpose of the model's upper 3x3, into `out` — required so normals
+ * stay correct under non-uniform scale.
+ *
+ * Out-first for the same reason {@link transformToMat4} is: this runs per
+ * instance per frame and the result belongs in the model uniform's std140
+ * `mat3x3` slot. `out` must be **std140-packed** (`mat3f()` is) — a Dense mat3
+ * type-checks identically and writes its columns 4 bytes apart from where the
+ * shader reads them.
+ */
+export function normalMatrixFromModel(model: Mat4f, out: Mat3f): Mat3f {
+    Mat4.getLinearTransform(linearScratch, model);
+    Mat3.invert(linearScratch, linearScratch);
+    return Mat3.transpose(out, linearScratch);
 }

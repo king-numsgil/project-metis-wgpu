@@ -15,6 +15,12 @@ export { FrameLimiter } from "./frameLimiter.ts";
 export { Camera } from "./math/camera.ts";
 export { createTransform, normalMatrixFromModel, transformToMat4 } from "./math/transform.ts";
 export type { Transform } from "./math/transform.ts";
+// The renderer's math types and their constructors. Everything positional in
+// the public API (`Camera.position`, `Light.position`, `Transform.*`,
+// `Environment.sunDirection`) is one of these, so a consumer needs them; the
+// ops themselves come straight from `metis-data` (`Vec3`, `Mat4`, `Quat`, …).
+export { mat3f, mat4f, quatf, vec2f, vec3f, vec4f } from "./math/types.ts";
+export type { Mat3f, Mat4f, Quatf, Vec2f, Vec3f, Vec4f } from "./math/types.ts";
 
 export { cube, plane, roomBox, uvSphere } from "./assets/primitives.ts";
 export type { MeshData, WindowCutout } from "./assets/primitives.ts";

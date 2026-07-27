@@ -363,3 +363,21 @@ Mat4.rotate(out, m, quat)
 Mat4.decompose(m, outT, outR, outS);  Mat4.toQuat(out, m)
 Mat4.getLinearTransform(out3x3, m4x4)                   // upper-left 3×3
 ```
+
+**The constructors above allocate — every one of them mints a buffer.** For
+anything on a per-frame path use the out-first twin instead; the allocating form
+delegates to it, so they cannot disagree:
+
+```ts
+Mat4.setLookAt(out, eye, center, up)
+Mat4.setPerspective(out, fovy, aspect, near, far)
+Mat4.setPerspectiveReverseZ(out, fovy, aspect, near, far?)
+Mat4.setOrthographic(out, left, right, bottom, top, near, far)
+Mat4.composeTRS(out, tx, ty, tz, quat, sx, sy, sz)     // closed-form T·R·S, == fromTRS
+```
+
+Each writes **all sixteen** components, zeros included, so `out` may be scratch
+holding an unrelated matrix — `src/math/test/setConstructors.test.ts` asserts
+that against a deliberately dirtied `out`, which is the failure the allocating
+forms structurally cannot have. `composeTRS`'s quaternion convention is tied to
+`Mat4.rotation`; changing one silently breaks the other.

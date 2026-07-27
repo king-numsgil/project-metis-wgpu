@@ -244,9 +244,25 @@ shared bottleneck before rewriting a hundred call sites**; the vectors had no
 such layer, which is why they genuinely needed the per-op work.
 
 On top of that, the hot ops are rewritten view-based: `Mat4.multiply`,
-`Mat4.invert`, `Mat3.multiply`, `Quat.multiply`. The long tail (constructors,
-decompose, the 2D helpers) still uses `get()`/`set()` and is now cheap enough
-that it has not been worth the churn.
+`Mat4.invert`, `Mat3.multiply`, `Quat.multiply`. The long tail (decompose, the
+2D helpers) still uses `get()`/`set()` and is now cheap enough that it has not
+been worth the churn.
+
+**The `Mat4` *constructors* were the remaining hole, and it was a structural one
+rather than a tuple-churn one.** `lookAt`/`perspective`/`perspectiveReverseZ`/
+`orthographic`/`fromTRS` were scalar-first (`(F32, …) → new buffer`), so they
+allocated *by signature* — no calling convention could avoid it. That is fine
+for setup and wrong for a renderer, which rebuilds a view matrix, a projection,
+and four cascade orthos every frame. Each now has an out-first primary
+(`setLookAt`, `setPerspective`, `setPerspectiveReverseZ`, `setOrthographic`,
+`composeTRS`) with the allocating form delegating to it, so there is exactly one
+copy of each formula. Prefer adding new constructors in that shape.
+
+Their test (`src/math/test/setConstructors.test.ts`) asserts against a
+deliberately **dirtied** `out`, and that is the point of it: an out-first
+constructor that skips a component silently inherits whatever the scratch buffer
+held, which is a bug the allocating twin cannot have — it starts from zeroed
+memory. Comparing the two against a *fresh* `out` would pass either way.
 
 **Which ops are done is a question for the benchmark, not this file.**
 `bun run bench/mathAlloc.ts` races each one against an open-coded equivalent

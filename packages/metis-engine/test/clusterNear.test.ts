@@ -24,7 +24,8 @@ import {
     RenderContext,
     Scene,
 } from "metis-engine/renderer";
-import { vec3 } from "wgpu-matrix";
+
+import { vec3f } from "metis-engine/renderer";
 
 const W = 160;
 const H = 120;
@@ -39,8 +40,8 @@ async function meanLuma(clusterNear: number, wallDepth: number): Promise<number>
     // Sun AND ambient off: the point light is the *only* light source, so if
     // clustering loses it the frame goes black rather than merely dimmer.
     scene.environment = createExteriorEnvironment({ambientIntensity: 0.0, sunIntensity: 0.0});
-    scene.camera.position = vec3.create(0, 0, 0);
-    scene.camera.target = vec3.create(0, 0, -1);
+    scene.camera.position = vec3f(0, 0, 0);
+    scene.camera.target = vec3f(0, 0, -1);
     scene.camera.near = 0.01;
     scene.camera.clusterNear = clusterNear;
     scene.camera.clusterFar = 200;
@@ -57,11 +58,11 @@ async function meanLuma(clusterNear: number, wallDepth: number): Promise<number>
     scene.add(
         new Mesh(ctx.device, cube(40, 40, 0.1), "wall"),
         new Material({baseColor: [0.8, 0.8, 0.8, 1], metallic: 0, roughness: 0.9}),
-        {position: vec3.create(0, 0, -wallDepth - 0.05)},
+        {position: vec3f(0, 0, -wallDepth - 0.05)},
     );
     scene.lights.push({
         kind: "point",
-        position: vec3.create(0, 0, -wallDepth + 0.1),
+        position: vec3f(0, 0, -wallDepth + 0.1),
         color: [1, 1, 1],
         intensity: 3,
         range: 0.6,

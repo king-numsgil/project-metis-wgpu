@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-`metis-engine` is a WebGPU clustered-forward PBR renderer for the space-sim game — built directly on `metis-native`'s raw WebGPU/SDL3 bindings. Two other dependencies: `metis-data` (GPU struct layouts — every uniform/storage buffer the renderer uploads is a descriptor; see "GPU layouts are descriptors now") and `wgpu-matrix` (matrix/vector math). **Moving the math onto `metis-data`'s own `Vec`/`Mat`/`Quat` is intended but not done** — the blocker is that most of metis-data's math ops allocate a tuple per call, so porting today would trade a large packing win for a per-frame allocation regression in the light loop. See that package's CLAUDE.md, "out-first is not allocation-free". It's a standalone package with no dependency on `metis-tui`. `metis-game` consumes it (a 100-point-light demo), and does so via the caller-owned-device path — it never touches `RenderContext`. See "The engine does not own the window" below.
+`metis-engine` is a WebGPU clustered-forward PBR renderer for the space-sim game — built directly on `metis-native`'s raw WebGPU/SDL3 bindings. It has exactly **one** other dependency: `metis-data`, which supplies both the GPU struct layouts (every uniform/storage buffer the renderer uploads is a descriptor — see "GPU layouts are descriptors now") *and* all the vector/matrix math (see "The math is metis-data's"). `wgpu-matrix` is gone. It's a standalone package with no dependency on `metis-tui`. `metis-game` consumes it (a 100-point-light demo), and does so via the caller-owned-device path — it never touches `RenderContext`. See "The engine does not own the window" below.
 
 **`src/` is split into two independent subtrees.** `src/renderer/` is the entire renderer described in this doc (including `renderer/debug/` — the opt-in GPU profiler and the debug widgets); `src/ecs/` is a young archetype ECS (Structure-of-Arrays storage, no `metis-data` dependency) that will eventually feed the renderer. They do not depend on each other yet — the renderer still takes a hand-built `Scene`, not ECS data. The root `src/index.ts` re-exports them as namespaces (`export * as Renderer`, `export * as ECS`), but consumers import through the package's **subpath exports** — `metis-engine/renderer` and `metis-engine/ecs` — which is what `examples/`, `test/`, `bench/`, and `metis-game` now do (`import { ClusteredForwardRenderer, … } from "metis-engine/renderer"`). The ECS's current shape and limits are in "The ECS" below.
 
@@ -89,8 +89,11 @@ src/renderer/   — the entire renderer; import via "metis-engine/renderer"
                                  multisampled (see "Why MSAA" below); color auto-resolves into a
                                  single-sampled texture every post-process pass reads, resized
                                  alongside the swapchain/offscreen capture texture
-  math/         camera.ts, transform.ts — thin wrappers over wgpu-matrix (Camera is look-at based;
-                                            Transform is position/Euler-rotation/scale -> mat4)
+  math/         types.ts      — Vec2f/Vec3f/Vec4f/Mat3f/Mat4f/Quatf (metis-data buffer types) and
+                                 their constructors; the whole renderer's positional vocabulary
+                camera.ts, transform.ts — thin wrappers over metis-data's math (Camera is look-at
+                                 based; Transform is position/Euler-rotation/scale -> mat4)
+                frustum.ts    — Gribb-Hartmann plane extraction + sphere test, for the spot-shadow cull
   scene/        mesh.ts       — GPU vertex/index buffers + the one shared vertex layout
                                  (pos/normal/tangent/uv, stride 48) every mesh in the engine uses
                 material.ts   — metallic-roughness factors, each optionally multiplied by a texture
@@ -525,6 +528,65 @@ instance), not `SHADOW_MAP_SIZE`. This section previously proposed halving
 pass; deleting that pass outright turned out to be strictly better and cost no
 quality.
 
+### The math is metis-data's, and the win was the copy, not the speed
+
+The renderer's vectors and matrices used to be `wgpu-matrix`'s bare
+`Float32Array`s (`Vec3Arg`/`Mat4Arg`). They are now `metis-data` memory buffers
+(`Vec3f`/`Mat4f`/… in `math/types.ts`), and `wgpu-matrix` is no longer a
+dependency of this package or of `metis-game`.
+
+**Do not justify this on speed, and do not accept a speed claim about it that
+isn't an alternating A/B.** Two controlled A/Bs (one before the migration, one
+after — four alternating 300-light runs in one sitting) put the two libraries at
+parity: GPU frame time moved by well under the run-to-run drift, and the *same*
+build measured 273 / 215 / 273 fps in three consecutive runs, which is the
+machine, not the code. The reason to do this was **consolidation onto one math
+library**, plus the structural win below.
+
+**The structural win is that a matrix can now be computed directly into the
+bytes that get uploaded.** A `metis-data` buffer is a view over an
+`ArrayBuffer`, so it can be `wrap`ped over a GPU staging allocation — which is
+what `gpuLayouts.ts`'s `stage().mat4(member)` / `.mat3(member)` /
+`stageArray().elementVec3(i, member)` and the standalone `wrapMat4` return. The
+camera's `viewProj`, the AO pass's four matrices, the cluster `invProj`, every
+cascade and spot `viewProj`, and every instance's model + normal matrix are all
+built *in place* now. Each of those was previously a compute-then-`.set()` copy.
+When adding a pass, reach for `mat4`/`mat3` over `f32` whenever the member is a
+matrix that a math op produces.
+
+**The two constraints that make this workable**, both of which had to be built
+first:
+
+- **Out-first constructors.** `Mat4.lookAt`/`perspective`/`orthographic`/… are
+  scalar-first (`(F32, …) → new buffer`) and allocate *by signature*, and the
+  renderer calls roughly twenty of them per frame. metis-data grew
+  `setLookAt`/`setPerspective`/`setPerspectiveReverseZ`/`setOrthographic`
+  alongside the existing `composeTRS`, each out-first with the allocating twin
+  delegating to it. `transformToMat4`/`normalMatrixFromModel` became out-first
+  here for the same reason, with no allocating variant at all.
+- **`mat3` packing is invisible to the type system.** `Mat3f` is
+  `MatMemoryBuffer<F32Descriptor, 3>` and carries no packing, but a Dense mat3
+  packs its columns at 12 bytes where std140 pads them to 16. A Dense mat3 in a
+  uniform slot type-checks perfectly and writes the normal matrix 4 bytes off
+  from where the shader reads it. Hence `mat3f()` allocates std140 and there is
+  deliberately no Dense alternative. `mat4` has no such hazard — the two packings
+  are byte-identical — which is exactly why this trap is easy to walk into.
+
+**The migration had to land atomically**, and that is worth remembering if
+anything like it comes up again: it changed the calling convention (`vec3.add(a,
+b)` returns, `Vec3.add(out, a, b)` writes) *and* the public types at once, so
+`Transform`, `Camera`, `Light`, `Environment` and `SceneInstance` all changed
+signature together and there was no green intermediate state. Converting
+`transform.ts` alone produced 40 type errors. 26 files, one pass.
+
+**Verified by the goldens, which is the strong claim here.** Seven of fourteen
+fixtures came back **byte-identical**; five differ by a max of **1** on between 2
+and 942 pixels; `textured` peaks at Δ2 with exactly one pixel above Δ1. Nothing
+structured, nothing localised. That is the signature of the same math in a
+different float implementation — and the identical half says the conversion
+isn't merely close. `test/ao.test.ts`, `clusterNear`, `spotLight` and
+`spotShadow` passed 20/20, and `metis-game` plus all three demos run clean.
+
 ### GPU layouts are descriptors now, not a hand-rolled writer
 
 Every uniform and storage struct the renderer uploads is a `metis-data`
@@ -542,15 +604,22 @@ a growable `number[]`, a *parallel* `string[]` of `"f32"|"u32"` type tags, an
 through `setFloat32`. It ran `~17 + 2 × instanceCount` times per frame, and the
 light array alone pushed 6144 entries onto two JS arrays and made 6144 `DataView`
 calls at `MAX_LIGHTS`. Staging buffers are allocated once at construction and
-rewritten in place now; a matrix upload is one `Float32Array.set`.
+rewritten in place now; since the math moved onto metis-data, a matrix upload
+isn't even a copy — see "The math is metis-data's" above.
 
-**Descriptors are the layout authority, but the writes deliberately bypass
-metis-data's accessors.** Every offset comes from `offsetOf`, so metis-data's
-packing rules and their tests govern the layout — but `MemoryBuffer.get()/set()`
-allocate a tuple per call, which is wrong for a per-instance-per-frame path. The
-`stage()` helper takes raw typed-array views at descriptor-computed offsets. Keep
-that split if you add a pass: get the offset from the descriptor, do the store
-yourself.
+**Descriptors are the layout authority; how you *write* through them depends on
+what produces the value.** Every offset comes from `offsetOf`, so metis-data's
+packing rules and their tests govern the layout regardless. Then:
+
+- If a **math op produces it**, take a `Mat4f`/`Mat3f`/`Vec3f` from
+  `stage().mat4/.mat3` or `stageArray().elementVec3` and pass that as the op's
+  `out`. The result lands in the upload bytes with no copy.
+- Otherwise (loose scalars, a `u32` count, a packed `[x,y,z,scalar]` slot), take
+  a raw typed-array view from `stage().f32/.u32` and store into it yourself.
+
+What you must *not* do on a per-frame path is reach for `MemoryBuffer.get()` /
+`set()` / `at()`: those allocate a tuple or a sub-buffer per call. `getComponent`
+/ `setComponent` / `view()` are the allocation-free accessors.
 
 **What descriptors do NOT check:** agreement with the WGSL. metis-data validates
 std140/std430 packing, not that your field order matches `common.wgsl`. That is

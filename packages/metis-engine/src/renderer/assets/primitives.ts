@@ -1,4 +1,5 @@
-import { vec3, type Vec3Arg } from "wgpu-matrix";
+import { Vec3 } from "metis-data";
+import { type Vec3f, vec3f } from "../math/types.ts";
 
 /** Interleaved `[px,py,pz, nx,ny,nz, tx,ty,tz,tw, u,v]` per vertex (stride 48 bytes) — see scene/mesh.ts's vertex layout. */
 export interface MeshData {
@@ -23,19 +24,24 @@ class MeshBuilder {
      * this file uses perpendicular `u`/`v`, which makes `cross(normal, u)`
      * exactly parallel to `v` (see math/PBR shading formulas.md).
      */
-    addQuad(origin: Vec3Arg, u: Vec3Arg, v: Vec3Arg) {
-        const normal = vec3.normalize(vec3.cross(u, v));
-        const tangent = vec3.normalize(u);
+    addQuad(origin: Vec3f, u: Vec3f, v: Vec3f) {
+        const normal = Vec3.normalize(vec3f(), Vec3.cross(vec3f(), u, v)).view();
+        const tangent = Vec3.normalize(vec3f(), u).view();
         const base = this.verts.length / FLOATS_PER_VERTEX;
-        const corners: [Vec3Arg, number, number][] = [
-            [origin, 0, 0],
-            [vec3.add(origin, u), 1, 0],
-            [vec3.add(vec3.add(origin, u), v), 1, 1],
-            [vec3.add(origin, v), 0, 1],
+        const ov = origin.view();
+        const uv3 = u.view();
+        const vv3 = v.view();
+        // The four corners, unrolled as scalars — mesh generation runs once at
+        // load, so this is about keeping the winding legible, not about speed.
+        const corners: [number, number, number, number, number][] = [
+            [ov[0]!, ov[1]!, ov[2]!, 0, 0],
+            [ov[0]! + uv3[0]!, ov[1]! + uv3[1]!, ov[2]! + uv3[2]!, 1, 0],
+            [ov[0]! + uv3[0]! + vv3[0]!, ov[1]! + uv3[1]! + vv3[1]!, ov[2]! + uv3[2]! + vv3[2]!, 1, 1],
+            [ov[0]! + vv3[0]!, ov[1]! + vv3[1]!, ov[2]! + vv3[2]!, 0, 1],
         ];
-        for (const [p, uu, vv] of corners) {
+        for (const [px, py, pz, uu, vv] of corners) {
             this.verts.push(
-                p[0]!, p[1]!, p[2]!,
+                px, py, pz,
                 normal[0]!, normal[1]!, normal[2]!,
                 tangent[0]!, tangent[1]!, tangent[2]!, 1,
                 uu, vv,
@@ -45,27 +51,29 @@ class MeshBuilder {
     }
 
     /** Adds an axis-aligned box spanning `[min, max]` with outward-facing quads. */
-    addBox(min: Vec3Arg, max: Vec3Arg) {
-        const sx = max[0]! - min[0]!;
-        const sy = max[1]! - min[1]!;
-        const sz = max[2]! - min[2]!;
+    addBox(min: Vec3f, max: Vec3f) {
+        const lo = min.view();
+        const hi = max.view();
+        const sx = hi[0]! - lo[0]!;
+        const sy = hi[1]! - lo[1]!;
+        const sz = hi[2]! - lo[2]!;
         // +X / -X
-        this.addQuad(vec3.create(max[0]!, min[1]!, max[2]!), vec3.create(0, 0, -sz), vec3.create(0, sy, 0));
-        this.addQuad(vec3.create(min[0]!, min[1]!, min[2]!), vec3.create(0, 0, sz), vec3.create(0, sy, 0));
+        this.addQuad(vec3f(hi[0]!, lo[1]!, hi[2]!), vec3f(0, 0, -sz), vec3f(0, sy, 0));
+        this.addQuad(vec3f(lo[0]!, lo[1]!, lo[2]!), vec3f(0, 0, sz), vec3f(0, sy, 0));
         // +Y / -Y
-        this.addQuad(vec3.create(min[0]!, max[1]!, min[2]!), vec3.create(0, 0, sz), vec3.create(sx, 0, 0));
-        this.addQuad(vec3.create(min[0]!, min[1]!, min[2]!), vec3.create(sx, 0, 0), vec3.create(0, 0, sz));
+        this.addQuad(vec3f(lo[0]!, hi[1]!, lo[2]!), vec3f(0, 0, sz), vec3f(sx, 0, 0));
+        this.addQuad(vec3f(lo[0]!, lo[1]!, lo[2]!), vec3f(sx, 0, 0), vec3f(0, 0, sz));
         // +Z / -Z
-        this.addQuad(vec3.create(min[0]!, min[1]!, max[2]!), vec3.create(sx, 0, 0), vec3.create(0, sy, 0));
-        this.addQuad(vec3.create(max[0]!, min[1]!, min[2]!), vec3.create(-sx, 0, 0), vec3.create(0, sy, 0));
+        this.addQuad(vec3f(lo[0]!, lo[1]!, hi[2]!), vec3f(sx, 0, 0), vec3f(0, sy, 0));
+        this.addQuad(vec3f(hi[0]!, lo[1]!, lo[2]!), vec3f(-sx, 0, 0), vec3f(0, sy, 0));
     }
 
-    addTriIndexed(positions: Vec3Arg[], normals: Vec3Arg[], tangents: Vec3Arg[], uvs: [number, number][]) {
+    addTriIndexed(positions: Vec3f[], normals: Vec3f[], tangents: Vec3f[], uvs: [number, number][]) {
         const base = this.verts.length / FLOATS_PER_VERTEX;
         for (let i = 0; i < positions.length; i++) {
-            const p = positions[i]!;
-            const n = normals[i]!;
-            const t = tangents[i]!;
+            const p = positions[i]!.view();
+            const n = normals[i]!.view();
+            const t = tangents[i]!.view();
             const uv = uvs[i]!;
             this.verts.push(p[0]!, p[1]!, p[2]!, n[0]!, n[1]!, n[2]!, t[0]!, t[1]!, t[2]!, 1, uv[0]!, uv[1]!);
         }
@@ -92,7 +100,7 @@ export function plane(width: number, depth: number): MeshData {
     const b = new MeshBuilder();
     const hw = width / 2;
     const hd = depth / 2;
-    b.addQuad(vec3.create(-hw, 0, hd), vec3.create(width, 0, 0), vec3.create(0, 0, -depth));
+    b.addQuad(vec3f(-hw, 0, hd), vec3f(width, 0, 0), vec3f(0, 0, -depth));
     return b.build();
 }
 
@@ -106,7 +114,7 @@ export function plane(width: number, depth: number): MeshData {
  */
 export function cube(sx: number, sy: number, sz: number): MeshData {
     const b = new MeshBuilder();
-    b.addBox(vec3.create(-sx / 2, -sy / 2, -sz / 2), vec3.create(sx / 2, sy / 2, sz / 2));
+    b.addBox(vec3f(-sx / 2, -sy / 2, -sz / 2), vec3f(sx / 2, sy / 2, sz / 2));
     return b.build();
 }
 
@@ -120,9 +128,9 @@ export function cube(sx: number, sy: number, sz: number): MeshData {
  */
 export function uvSphere(radius: number, latBands = 24, lonBands = 32): MeshData {
     const b = new MeshBuilder();
-    const positions: Vec3Arg[] = [];
-    const normals: Vec3Arg[] = [];
-    const tangents: Vec3Arg[] = [];
+    const positions: Vec3f[] = [];
+    const normals: Vec3f[] = [];
+    const tangents: Vec3f[] = [];
     const uvs: [number, number][] = [];
 
     for (let lat = 0; lat <= latBands; lat++) {
@@ -134,12 +142,12 @@ export function uvSphere(radius: number, latBands = 24, lonBands = 32): MeshData
             const x = Math.cos(phi) * sinT;
             const y = cosT;
             const z = Math.sin(phi) * sinT;
-            positions.push(vec3.create(x * radius, y * radius, z * radius));
-            normals.push(vec3.create(x, y, z));
+            positions.push(vec3f(x * radius, y * radius, z * radius));
+            normals.push(vec3f(x, y, z));
             // Tangent = d(position)/d(longitude), i.e. the direction U
             // increases along — degenerates at the poles (sinT = 0), same
             // known singularity every UV sphere has.
-            tangents.push(vec3.create(-Math.sin(phi), 0, Math.cos(phi)));
+            tangents.push(vec3f(-Math.sin(phi), 0, Math.cos(phi)));
             uvs.push([lon / lonBands, lat / latBands]);
         }
     }
@@ -210,21 +218,21 @@ export function roomBox(width: number, height: number, depth: number, window: Wi
     const hd = depth / 2;
     const t = thickness;
 
-    b.addBox(vec3.create(-hw - t, -t, -hd - t), vec3.create(hw + t, 0, hd + t)); // floor
-    b.addBox(vec3.create(-hw - t, height, -hd - t), vec3.create(hw + t, height + t, hd + t)); // ceiling
-    b.addBox(vec3.create(-hw - t, 0, -hd - t), vec3.create(-hw, height, hd + t)); // left wall
-    b.addBox(vec3.create(hw, 0, -hd - t), vec3.create(hw + t, height, hd + t)); // right wall
-    b.addBox(vec3.create(-hw, 0, hd), vec3.create(hw, height, hd + t)); // back wall
+    b.addBox(vec3f(-hw - t, -t, -hd - t), vec3f(hw + t, 0, hd + t)); // floor
+    b.addBox(vec3f(-hw - t, height, -hd - t), vec3f(hw + t, height + t, hd + t)); // ceiling
+    b.addBox(vec3f(-hw - t, 0, -hd - t), vec3f(-hw, height, hd + t)); // left wall
+    b.addBox(vec3f(hw, 0, -hd - t), vec3f(hw + t, height, hd + t)); // right wall
+    b.addBox(vec3f(-hw, 0, hd), vec3f(hw, height, hd + t)); // back wall
 
     // Front wall (-Z, holds the window): four slabs framing the opening.
     const x0 = -hw + window.s0 * width;
     const x1 = -hw + window.s1 * width;
     const y0 = window.t0 * height;
     const y1 = window.t1 * height;
-    b.addBox(vec3.create(-hw, 0, -hd - t), vec3.create(hw, y0, -hd)); // below window
-    b.addBox(vec3.create(-hw, y1, -hd - t), vec3.create(hw, height, -hd)); // above window
-    b.addBox(vec3.create(-hw, y0, -hd - t), vec3.create(x0, y1, -hd)); // left of window
-    b.addBox(vec3.create(x1, y0, -hd - t), vec3.create(hw, y1, -hd)); // right of window
+    b.addBox(vec3f(-hw, 0, -hd - t), vec3f(hw, y0, -hd)); // below window
+    b.addBox(vec3f(-hw, y1, -hd - t), vec3f(hw, height, -hd)); // above window
+    b.addBox(vec3f(-hw, y0, -hd - t), vec3f(x0, y1, -hd)); // left of window
+    b.addBox(vec3f(x1, y0, -hd - t), vec3f(hw, y1, -hd)); // right of window
 
     return b.build();
 }

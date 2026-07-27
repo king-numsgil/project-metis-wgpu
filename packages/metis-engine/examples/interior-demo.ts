@@ -22,7 +22,8 @@ import {
     Scene,
     VectorText,
 } from "metis-engine/renderer";
-import { vec3 } from "wgpu-matrix";
+import { Vec3 } from "metis-data";
+import { vec3f } from "metis-engine/renderer";
 import { loadMetalPlateTextures, makeEmissivePanelTexture } from "./demoAssets";
 
 const FONT_PATH = new URL("../../../assets/JetBrainsMono-Regular.ttf", import.meta.url).pathname.replace(
@@ -78,9 +79,9 @@ const scene = new Scene();
 // Sunlight enters through the front-wall window: the room spans z in
 // [-5, 5] with the window cut into the wall at z = -5, so the sun must
 // travel in +Z (into the room) to pass through it.
-scene.environment = createInteriorEnvironment({sunDirection: vec3.normalize(vec3.create(0.15, -0.5, 0.85))});
-scene.camera.position = vec3.create(0, 1.8, 3.5);
-scene.camera.target = vec3.create(0, 1.6, -5);
+scene.environment = createInteriorEnvironment({sunDirection: Vec3.normalize(vec3f(), vec3f(0.15, -0.5, 0.85))});
+scene.camera.position = vec3f(0, 1.8, 3.5);
+scene.camera.target = vec3f(0, 1.6, -5);
 scene.camera.setAspectFromSize(ctx.width, ctx.height);
 
 const roomMesh = new Mesh(ctx.device, roomBox(8, 4, 10, {s0: 0.3, s1: 0.7, t0: 0.4, t1: 0.85}), "room");
@@ -88,14 +89,14 @@ const roomMaterial = new Material({baseColor: [0.55, 0.54, 0.52, 1], metallic: 0
 scene.add(roomMesh, roomMaterial);
 
 scene.lights.push(
-    {kind: "point", position: vec3.create(-2, 3.6, 1), color: [1, 0.92, 0.75], intensity: 5, range: 6},
-    {kind: "point", position: vec3.create(2, 3.6, 1), color: [1, 0.92, 0.75], intensity: 5, range: 6},
+    {kind: "point", position: vec3f(-2, 3.6, 1), color: [1, 0.92, 0.75], intensity: 5, range: 6},
+    {kind: "point", position: vec3f(2, 3.6, 1), color: [1, 0.92, 0.75], intensity: 5, range: 6},
     // A ceiling spot aimed down at the console, for eyeballing the cone
     // interactively (the fixture's `spotlights` scene is the pinned version).
     {
         kind: "spot",
-        position: vec3.create(0, 3.8, 3),
-        direction: vec3.create(0, -1, -0.25),
+        position: vec3f(0, 3.8, 3),
+        direction: vec3f(0, -1, -0.25),
         castsShadow: true,
         color: [0.7, 0.85, 1],
         intensity: 40,
@@ -119,7 +120,7 @@ const crateMaterial = new Material({
     metallicTexture: metalPlate.metallic,
     roughnessTexture: metalPlate.roughness,
 });
-scene.add(crateMesh, crateMaterial, {position: vec3.create(1.2, 0.5, -2), rotationEuler: vec3.create(0, 0.3, 0)});
+scene.add(crateMesh, crateMaterial, {position: vec3f(1.2, 0.5, -2), rotationEuler: vec3f(0, 0.3, 0)});
 
 const consoleMesh = new Mesh(ctx.device, plane(1, 0.7), "control-console");
 const consoleMaterial = new Material({
@@ -132,9 +133,16 @@ const consoleMaterial = new Material({
 // Right wall is at x = 4 with normal -X into the room; rotating the plane's
 // default +Y normal by 90 degrees around Z points it at -X to face the room.
 scene.add(consoleMesh, consoleMaterial, {
-    position: vec3.create(3.85, 1.8, -2.5),
-    rotationEuler: vec3.create(0, 0, Math.PI / 2),
+    position: vec3f(3.85, 1.8, -2.5),
+    rotationEuler: vec3f(0, 0, Math.PI / 2),
 });
+
+// Fly-camera scratch. The control block below runs every frame, so its
+// intermediates are pre-allocated rather than minted per key press.
+const WORLD_UP = vec3f(0, 1, 0);
+const flyForward = vec3f();
+const flyRight = vec3f();
+const flyStep = vec3f();
 
 let yaw = Math.PI;
 let pitch = 0;
@@ -189,28 +197,28 @@ while (running) {
         pitch = Math.max(pitch - turnSpeed, -1.4);
     }
 
-    const forwardDir = vec3.create(Math.sin(yaw) * Math.cos(pitch), Math.sin(pitch), Math.cos(yaw) * Math.cos(pitch));
-    const right = vec3.normalize(vec3.cross(forwardDir, vec3.create(0, 1, 0)));
+    const forwardDir = Vec3.set(flyForward, Math.sin(yaw) * Math.cos(pitch), Math.sin(pitch), Math.cos(yaw) * Math.cos(pitch));
+    const right = Vec3.normalize(flyRight, Vec3.cross(flyRight, forwardDir, WORLD_UP));
     const moveSpeed = 3 * dt;
     if (keys.has(SdlKeycode.W)) {
-        vec3.add(scene.camera.position, vec3.scale(forwardDir, moveSpeed), scene.camera.position);
+        Vec3.add(scene.camera.position, scene.camera.position, Vec3.scale(flyStep, forwardDir, moveSpeed));
     }
     if (keys.has(SdlKeycode.S)) {
-        vec3.add(scene.camera.position, vec3.scale(forwardDir, -moveSpeed), scene.camera.position);
+        Vec3.add(scene.camera.position, scene.camera.position, Vec3.scale(flyStep, forwardDir, -moveSpeed));
     }
     if (keys.has(SdlKeycode.A)) {
-        vec3.add(scene.camera.position, vec3.scale(right, -moveSpeed), scene.camera.position);
+        Vec3.add(scene.camera.position, scene.camera.position, Vec3.scale(flyStep, right, -moveSpeed));
     }
     if (keys.has(SdlKeycode.D)) {
-        vec3.add(scene.camera.position, vec3.scale(right, moveSpeed), scene.camera.position);
+        Vec3.add(scene.camera.position, scene.camera.position, Vec3.scale(flyStep, right, moveSpeed));
     }
     if (keys.has(SdlKeycode.Q)) {
-        scene.camera.position[1]! -= moveSpeed;
+        scene.camera.position.setComponent(1, scene.camera.position.getComponent(1) - moveSpeed);
     }
     if (keys.has(SdlKeycode.E)) {
-        scene.camera.position[1]! += moveSpeed;
+        scene.camera.position.setComponent(1, scene.camera.position.getComponent(1) + moveSpeed);
     }
-    vec3.add(scene.camera.position, forwardDir, scene.camera.target);
+    Vec3.add(scene.camera.target, scene.camera.position, forwardDir);
 
     const frame = ctx.beginFrame();
     const encodeStart = performance.now();

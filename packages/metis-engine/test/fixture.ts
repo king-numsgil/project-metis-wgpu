@@ -32,7 +32,8 @@ import {
     VectorText,
 } from "metis-engine/renderer";
 import { mkdirSync } from "node:fs";
-import { vec3 } from "wgpu-matrix";
+import { Vec3 } from "metis-data";
+import { vec3f } from "metis-engine/renderer";
 import { loadMetalPlateTextures, makeEmissivePanelTexture } from "../examples/demoAssets";
 
 const W = 800;
@@ -93,8 +94,8 @@ async function renderExterior() {
     await renderToFile("exterior", "METIS-ENGINE // EXTERIOR", (device) => {
         const scene = new Scene();
         scene.environment = createExteriorEnvironment();
-        scene.camera.position = vec3.create(0, 1.2, 4.5);
-        scene.camera.target = vec3.create(0, 0.3, 0);
+        scene.camera.position = vec3f(0, 1.2, 4.5);
+        scene.camera.target = vec3f(0, 0.3, 0);
 
         const hullMesh = new Mesh(device, uvSphere(1, 32, 48), "hull");
         const hullMaterial = new Material({baseColor: [0.62, 0.64, 0.67, 1], metallic: 0.85, roughness: 0.35});
@@ -102,11 +103,11 @@ async function renderExterior() {
 
         const padMesh = new Mesh(device, cube(6, 0.1, 6), "deck");
         const padMaterial = new Material({baseColor: [0.15, 0.15, 0.17, 1], metallic: 0.1, roughness: 0.8});
-        scene.add(padMesh, padMaterial, {position: vec3.create(0, -1.05, 0)});
+        scene.add(padMesh, padMaterial, {position: vec3f(0, -1.05, 0)});
 
         scene.lights.push(
-            {kind: "point", position: vec3.create(-1.6, 0.3, 0.8), color: [1, 0.15, 0.1], intensity: 6, range: 4},
-            {kind: "point", position: vec3.create(1.6, 0.3, 0.8), color: [0.1, 1, 0.2], intensity: 6, range: 4},
+            {kind: "point", position: vec3f(-1.6, 0.3, 0.8), color: [1, 0.15, 0.1], intensity: 6, range: 4},
+            {kind: "point", position: vec3f(1.6, 0.3, 0.8), color: [0.1, 1, 0.2], intensity: 6, range: 4},
         );
 
         return scene;
@@ -133,25 +134,25 @@ async function renderSpotlights() {
         scene.environment = createInteriorEnvironment();
         scene.environment.sunIntensity = 0.02;
         scene.environment.ambientIntensity = 0.015;
-        scene.camera.position = vec3.create(0, 5.5, 7.5);
-        scene.camera.target = vec3.create(0, 0, -0.5);
+        scene.camera.position = vec3f(0, 5.5, 7.5);
+        scene.camera.target = vec3f(0, 0, -0.5);
 
         const deck = new Mesh(device, plane(20, 20), "deck");
         const deckMaterial = new Material({baseColor: [0.5, 0.5, 0.54, 1], metallic: 0.0, roughness: 0.7});
-        scene.add(deck, deckMaterial, {position: vec3.create(0, -1, 0)});
+        scene.add(deck, deckMaterial, {position: vec3f(0, -1, 0)});
 
         // A sphere under the middle cone, so the cones fall on curved geometry
         // too rather than only a flat plane.
         const ball = new Mesh(device, uvSphere(0.7, 32, 48), "ball");
         const ballMaterial = new Material({baseColor: [0.8, 0.8, 0.82, 1], metallic: 0.1, roughness: 0.45});
-        scene.add(ball, ballMaterial, {position: vec3.create(0, -0.3, 0)});
+        scene.add(ball, ballMaterial, {position: vec3f(0, -0.3, 0)});
 
-        const down = vec3.create(0, -1, 0);
+        const down = vec3f(0, -1, 0);
         scene.lights.push(
             // Narrow + soft edge (wide inner→outer gradient).
             {
                 kind: "spot",
-                position: vec3.create(-4, 3.5, 0),
+                position: vec3f(-4, 3.5, 0),
                 direction: down,
                 color: [1, 0.3, 0.25],
                 intensity: 60,
@@ -162,7 +163,7 @@ async function renderSpotlights() {
             // Wide + soft.
             {
                 kind: "spot",
-                position: vec3.create(0, 3.5, 0),
+                position: vec3f(0, 3.5, 0),
                 direction: down,
                 color: [0.95, 0.95, 1],
                 intensity: 60,
@@ -173,7 +174,7 @@ async function renderSpotlights() {
             // Hard-edged: inner == outer exercises the degenerate-cone clamp.
             {
                 kind: "spot",
-                position: vec3.create(4, 3.5, 0),
+                position: vec3f(4, 3.5, 0),
                 direction: down,
                 color: [0.25, 0.5, 1],
                 intensity: 60,
@@ -182,7 +183,7 @@ async function renderSpotlights() {
                 outerAngle: (25 * Math.PI) / 180,
             },
             // Control: a plain point light must be unaffected by all of this.
-            {kind: "point", position: vec3.create(0, 0.6, 5), color: [1, 0.9, 0.5], intensity: 12, range: 6},
+            {kind: "point", position: vec3f(0, 0.6, 5), color: [1, 0.9, 0.5], intensity: 12, range: 6},
         );
 
         return scene;
@@ -205,21 +206,21 @@ async function renderSpotShadows() {
         scene.environment = createInteriorEnvironment();
         scene.environment.sunIntensity = 0.02;
         scene.environment.ambientIntensity = 0.02;
-        scene.camera.position = vec3.create(0, 6, 9);
-        scene.camera.target = vec3.create(0, 0, -0.5);
+        scene.camera.position = vec3f(0, 6, 9);
+        scene.camera.target = vec3f(0, 0, -0.5);
 
         const deck = new Mesh(device, plane(24, 24), "deck");
         const deckMaterial = new Material({baseColor: [0.55, 0.55, 0.58, 1], metallic: 0.0, roughness: 0.75});
-        scene.add(deck, deckMaterial, {position: vec3.create(0, -1, 0)});
+        scene.add(deck, deckMaterial, {position: vec3f(0, -1, 0)});
 
         // One pillar per cone, same size, same offset within its own beam.
         const pillar = new Mesh(device, cube(0.6, 2.2, 0.6), "pillar");
         const pillarMaterial = new Material({baseColor: [0.75, 0.7, 0.65, 1], metallic: 0.0, roughness: 0.6});
-        scene.add(pillar, pillarMaterial, {position: vec3.create(-3.5, 0.1, 0)});
-        scene.add(pillar, pillarMaterial, {position: vec3.create(3.5, 0.1, 0)});
+        scene.add(pillar, pillarMaterial, {position: vec3f(-3.5, 0.1, 0)});
+        scene.add(pillar, pillarMaterial, {position: vec3f(3.5, 0.1, 0)});
 
         const cone = {
-            direction: vec3.create(0, -1, 0),
+            direction: vec3f(0, -1, 0),
             color: [1, 0.96, 0.9] as [number, number, number],
             intensity: 90,
             range: 14,
@@ -234,9 +235,9 @@ async function renderSpotShadows() {
         // alike.
         scene.lights.push(
             // Left: casts. The pillar should throw a shadow across the deck.
-            {kind: "spot", position: vec3.create(-4.6, 4.2, -1.2), castsShadow: true, ...cone},
+            {kind: "spot", position: vec3f(-4.6, 4.2, -1.2), castsShadow: true, ...cone},
             // Right: identical but does not cast — the control.
-            {kind: "spot", position: vec3.create(2.4, 4.2, -1.2), ...cone},
+            {kind: "spot", position: vec3f(2.4, 4.2, -1.2), ...cone},
         );
 
         return scene;
@@ -250,10 +251,10 @@ async function renderInterior() {
         // z in [-5, 5] with the window cut into the wall at z = -5, so the
         // sun must travel in +Z (into the room) to pass through it.
         scene.environment = createInteriorEnvironment({
-            sunDirection: vec3.normalize(vec3.create(0.15, -0.5, 0.85)),
+            sunDirection: Vec3.normalize(vec3f(), vec3f(0.15, -0.5, 0.85)),
         });
-        scene.camera.position = vec3.create(0, 1.8, 3.5);
-        scene.camera.target = vec3.create(0, 1.6, -5);
+        scene.camera.position = vec3f(0, 1.8, 3.5);
+        scene.camera.target = vec3f(0, 1.6, -5);
 
         const roomMesh = new Mesh(
             device,
@@ -265,8 +266,8 @@ async function renderInterior() {
 
         // Ceiling fixtures.
         scene.lights.push(
-            {kind: "point", position: vec3.create(-2, 3.6, 1), color: [1, 0.92, 0.75], intensity: 5, range: 6},
-            {kind: "point", position: vec3.create(2, 3.6, 1), color: [1, 0.92, 0.75], intensity: 5, range: 6},
+            {kind: "point", position: vec3f(-2, 3.6, 1), color: [1, 0.92, 0.75], intensity: 5, range: 6},
+            {kind: "point", position: vec3f(2, 3.6, 1), color: [1, 0.92, 0.75], intensity: 5, range: 6},
         );
 
         return scene;
@@ -340,15 +341,15 @@ class NaiveClampPass implements PostProcessPass {
 function buildHdrClipScene(device: GpuDevice): Scene {
     const scene = new Scene();
     scene.environment = createExteriorEnvironment({ambientIntensity: 0.01, sunIntensity: 1.5});
-    scene.camera.position = vec3.create(0, 1.5, 3);
-    scene.camera.target = vec3.create(0, 0, 0);
+    scene.camera.position = vec3f(0, 1.5, 3);
+    scene.camera.target = vec3f(0, 0, 0);
 
     const floorMesh = new Mesh(device, plane(6, 6), "floor");
     const floorMaterial = new Material({baseColor: [0.5, 0.5, 0.52, 1], metallic: 0.0, roughness: 0.9});
     scene.add(floorMesh, floorMaterial);
 
     // Intentionally overbright — a naive clamp will flatten this to a hard white disc.
-    scene.lights.push({kind: "point", position: vec3.create(0, 0.4, 0), color: [1, 0.95, 0.85], intensity: 80, range: 5});
+    scene.lights.push({kind: "point", position: vec3f(0, 0.4, 0), color: [1, 0.95, 0.85], intensity: 80, range: 5});
 
     return scene;
 }
@@ -435,8 +436,8 @@ async function renderGltfDemo() {
 
     const scene = new Scene();
     scene.environment = createExteriorEnvironment({ambientIntensity: 0.05});
-    scene.camera.position = vec3.create(2.5, 2, 3);
-    scene.camera.target = vec3.create(0, 0, 0);
+    scene.camera.position = vec3f(2.5, 2, 3);
+    scene.camera.target = vec3f(0, 0, 0);
     scene.camera.setAspectFromSize(W, H);
 
     const gltfPath = await ensureGltfSampleCached();
@@ -485,8 +486,8 @@ async function renderTexturedDemo() {
 
     const scene = new Scene();
     scene.environment = createExteriorEnvironment({ambientIntensity: 0.03});
-    scene.camera.position = vec3.create(0, 1.0, 4.2);
-    scene.camera.target = vec3.create(0.1, 0.15, 0);
+    scene.camera.position = vec3f(0, 1.0, 4.2);
+    scene.camera.target = vec3f(0.1, 0.15, 0);
     scene.camera.setAspectFromSize(W, H);
 
     const metalPlate = await loadMetalPlateTextures(ctx.device);
@@ -502,7 +503,7 @@ async function renderTexturedDemo() {
         metallicTexture: metalPlate.metallic,
         roughnessTexture: metalPlate.roughness,
     });
-    scene.add(panelMesh, panelMaterial, {position: vec3.create(-1.2, 0, 0), rotationEuler: vec3.create(0.25, 0.5, 0)});
+    scene.add(panelMesh, panelMaterial, {position: vec3f(-1.2, 0, 0), rotationEuler: vec3f(0.25, 0.5, 0)});
 
     const emissiveMesh = new Mesh(ctx.device, plane(1.2, 0.8), "emissive-panel");
     const emissiveMaterial = new Material({
@@ -513,11 +514,11 @@ async function renderTexturedDemo() {
         emissiveTexture: makeEmissivePanelTexture(ctx.device),
     });
     scene.add(emissiveMesh, emissiveMaterial, {
-        position: vec3.create(1.3, 0.2, 0),
-        rotationEuler: vec3.create(Math.PI / 2, 0, 0),
+        position: vec3f(1.3, 0.2, 0),
+        rotationEuler: vec3f(Math.PI / 2, 0, 0),
     });
 
-    scene.lights.push({kind: "point", position: vec3.create(1.5, 2, 3), color: [1, 0.95, 0.85], intensity: 8, range: 8});
+    scene.lights.push({kind: "point", position: vec3f(1.5, 2, 3), color: [1, 0.95, 0.85], intensity: 8, range: 8});
 
     for (let i = 0; i < 30; i++) {
         const frame = ctx.beginFrame();

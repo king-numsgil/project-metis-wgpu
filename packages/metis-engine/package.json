@@ -23,7 +23,6 @@
     },
     "dependencies": {
         "metis-native": "workspace:*",
-        "metis-data": "workspace:*",
-        "wgpu-matrix": "^3.4.2"
+        "metis-data": "workspace:*"
     }
 }

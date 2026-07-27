@@ -528,17 +528,24 @@ export const Mat4 = {
     },
 
     /**
-     * Create a 4x4 look-at view matrix.
+     * Write a 4x4 look-at view matrix into `out` — the out-first,
+     * allocation-free counterpart to {@link lookAt}, which delegates here.
+     *
+     * This is the form a renderer calls per frame (a camera's view matrix, a
+     * shadow cascade's light view, a spot light's frustum), so it reads the
+     * operands through their cached views rather than through `get()` tuples.
+     * `out` may alias nothing else; `eye`/`center`/`up` are only read.
      */
-    lookAt<S extends ScalarDescriptor>(
-        scalar: S = F32 as S,
+    setLookAt<S extends ScalarDescriptor>(
+        out: MatMemoryBuffer<S, 4>,
         eye: VecMemoryBuffer<S, 3>,
         center: VecMemoryBuffer<S, 3>,
         up: VecMemoryBuffer<S, 3>,
     ): MatMemoryBuffer<S, 4> {
-        const [ex, ey, ez] = eye.get();
-        const [cx, cy, cz] = center.get();
-        const [ux, uy, uz] = up.get();
+        const ev = eye.view(), cv = center.view(), uv = up.view();
+        const ex = ev[0] as number, ey = ev[1] as number, ez = ev[2] as number;
+        const cx = cv[0] as number, cy = cv[1] as number, cz = cv[2] as number;
+        const ux = uv[0] as number, uy = uv[1] as number, uz = uv[2] as number;
 
         // Calculate forward vector
         let fx = cx - ex;
@@ -546,7 +553,7 @@ export const Mat4 = {
         let fz = cz - ez;
 
         // Normalize forward vector
-        let fLen = Math.sqrt(fx * fx + fy * fy + fz * fz);
+        const fLen = Math.sqrt(fx * fx + fy * fy + fz * fz);
         if (fLen > 0.000001) {
             fx /= fLen;
             fy /= fLen;
@@ -559,7 +566,7 @@ export const Mat4 = {
         let rz = fx * uy - fy * ux;
 
         // Normalize right vector
-        let rLen = Math.sqrt(rx * rx + ry * ry + rz * rz);
+        const rLen = Math.sqrt(rx * rx + ry * ry + rz * rz);
         if (rLen > 0.000001) {
             rx /= rLen;
             ry /= rLen;
@@ -567,17 +574,33 @@ export const Mat4 = {
         }
 
         // Calculate true up vector (cross product of right and forward)
-        let tx = ry * fz - rz * fy;
-        let ty = rz * fx - rx * fz;
-        let tz = rx * fy - ry * fx;
+        const tx = ry * fz - rz * fy;
+        const ty = rz * fx - rx * fz;
+        const tz = rx * fy - ry * fx;
 
-        const descriptor = Mat(scalar, 4);
-        const buffer = allocate(descriptor);
-        buffer.set(0, [rx, tx, -fx, 0] as TupleOf<4, number>);
-        buffer.set(1, [ry, ty, -fy, 0] as TupleOf<4, number>);
-        buffer.set(2, [rz, tz, -fz, 0] as TupleOf<4, number>);
-        buffer.set(3, [-(rx * ex + ry * ey + rz * ez), -(tx * ex + ty * ey + tz * ez), fx * ex + fy * ey + fz * ez, 1] as TupleOf<4, number>);
-        return buffer;
+        const ov = out.view();
+        const c = out.columnElements;
+        ov[0] = rx; ov[1] = tx; ov[2] = -fx; ov[3] = 0;
+        ov[c] = ry; ov[c + 1] = ty; ov[c + 2] = -fy; ov[c + 3] = 0;
+        ov[2 * c] = rz; ov[2 * c + 1] = tz; ov[2 * c + 2] = -fz; ov[2 * c + 3] = 0;
+        ov[3 * c] = -(rx * ex + ry * ey + rz * ez);
+        ov[3 * c + 1] = -(tx * ex + ty * ey + tz * ez);
+        ov[3 * c + 2] = fx * ex + fy * ey + fz * ez;
+        ov[3 * c + 3] = 1;
+        return out;
+    },
+
+    /**
+     * Create a 4x4 look-at view matrix. Allocates; {@link setLookAt} is the
+     * per-frame form.
+     */
+    lookAt<S extends ScalarDescriptor>(
+        scalar: S = F32 as S,
+        eye: VecMemoryBuffer<S, 3>,
+        center: VecMemoryBuffer<S, 3>,
+        up: VecMemoryBuffer<S, 3>,
+    ): MatMemoryBuffer<S, 4> {
+        return Mat4.setLookAt(allocate(Mat(scalar, 4)), eye, center, up);
     },
 
     /**
@@ -593,21 +616,40 @@ export const Mat4 = {
         near: number,
         far: number,
     ): MatMemoryBuffer<S, 4> {
-        const f = 1.0 / Math.tan(0.5 * fovy);
+        return Mat4.setPerspective(allocate(Mat(scalar, 4)), fovy, aspect, near, far);
+    },
 
-        const descriptor = Mat(scalar, 4);
-        const buffer = allocate(descriptor);
-        buffer.set(0, [f / aspect, 0, 0, 0] as TupleOf<4, number>);
-        buffer.set(1, [0, f, 0, 0] as TupleOf<4, number>);
+    /**
+     * Write a perspective projection into `out` — the out-first,
+     * allocation-free counterpart to {@link perspective}, which delegates here.
+     *
+     * Writes **all sixteen** components, including the zeros, so `out` may be
+     * scratch holding an unrelated matrix.
+     */
+    setPerspective<S extends ScalarDescriptor>(
+        out: MatMemoryBuffer<S, 4>,
+        fovy: number,
+        aspect: number,
+        near: number,
+        far: number,
+    ): MatMemoryBuffer<S, 4> {
+        const f = 1.0 / Math.tan(0.5 * fovy);
+        const ov = out.view();
+        const c = out.columnElements;
+
+        ov[0] = f / aspect; ov[1] = 0; ov[2] = 0; ov[3] = 0;
+        ov[c] = 0; ov[c + 1] = f; ov[c + 2] = 0; ov[c + 3] = 0;
+        ov[2 * c] = 0; ov[2 * c + 1] = 0;
+        ov[3 * c] = 0; ov[3 * c + 1] = 0; ov[3 * c + 3] = 0;
         if (far === Infinity) {
-            buffer.set(2, [0, 0, -1, -1] as TupleOf<4, number>);
-            buffer.set(3, [0, 0, -near, 0] as TupleOf<4, number>);
+            ov[2 * c + 2] = -1; ov[2 * c + 3] = -1;
+            ov[3 * c + 2] = -near;
         } else {
             const nf = 1 / (near - far);
-            buffer.set(2, [0, 0, far * nf, -1] as TupleOf<4, number>);
-            buffer.set(3, [0, 0, far * near * nf, 0] as TupleOf<4, number>);
+            ov[2 * c + 2] = far * nf; ov[2 * c + 3] = -1;
+            ov[3 * c + 2] = far * near * nf;
         }
-        return buffer;
+        return out;
     },
 
     /**
@@ -628,21 +670,41 @@ export const Mat4 = {
         near: number,
         far: number = Infinity,
     ): MatMemoryBuffer<S, 4> {
-        const f = 1.0 / Math.tan(0.5 * fovy);
+        return Mat4.setPerspectiveReverseZ(allocate(Mat(scalar, 4)), fovy, aspect, near, far);
+    },
 
-        const descriptor = Mat(scalar, 4);
-        const buffer = allocate(descriptor);
-        buffer.set(0, [f / aspect, 0, 0, 0] as TupleOf<4, number>);
-        buffer.set(1, [0, f, 0, 0] as TupleOf<4, number>);
+    /**
+     * Write a reverse-Z perspective projection into `out` — the out-first,
+     * allocation-free counterpart to {@link perspectiveReverseZ}, which
+     * delegates here. This is the one a camera rebuilds every frame.
+     *
+     * Writes **all sixteen** components, including the zeros, so `out` may be
+     * scratch holding an unrelated matrix.
+     */
+    setPerspectiveReverseZ<S extends ScalarDescriptor>(
+        out: MatMemoryBuffer<S, 4>,
+        fovy: number,
+        aspect: number,
+        near: number,
+        far: number = Infinity,
+    ): MatMemoryBuffer<S, 4> {
+        const f = 1.0 / Math.tan(0.5 * fovy);
+        const ov = out.view();
+        const c = out.columnElements;
+
+        ov[0] = f / aspect; ov[1] = 0; ov[2] = 0; ov[3] = 0;
+        ov[c] = 0; ov[c + 1] = f; ov[c + 2] = 0; ov[c + 3] = 0;
+        ov[2 * c] = 0; ov[2 * c + 1] = 0; ov[2 * c + 3] = -1;
+        ov[3 * c] = 0; ov[3 * c + 1] = 0; ov[3 * c + 3] = 0;
         if (far === Infinity) {
-            buffer.set(2, [0, 0, 0, -1] as TupleOf<4, number>);
-            buffer.set(3, [0, 0, near, 0] as TupleOf<4, number>);
+            ov[2 * c + 2] = 0;
+            ov[3 * c + 2] = near;
         } else {
             const rangeInv = 1 / (far - near);
-            buffer.set(2, [0, 0, near * rangeInv, -1] as TupleOf<4, number>);
-            buffer.set(3, [0, 0, far * near * rangeInv, 0] as TupleOf<4, number>);
+            ov[2 * c + 2] = near * rangeInv;
+            ov[3 * c + 2] = far * near * rangeInv;
         }
-        return buffer;
+        return out;
     },
 
     /**
@@ -659,17 +721,40 @@ export const Mat4 = {
         near: number,
         far: number,
     ): MatMemoryBuffer<S, 4> {
+        return Mat4.setOrthographic(allocate(Mat(scalar, 4)), left, right, bottom, top, near, far);
+    },
+
+    /**
+     * Write an orthographic projection into `out` — the out-first,
+     * allocation-free counterpart to {@link orthographic}, which delegates
+     * here. A shadow-cascade fit calls this once per cascade per frame.
+     *
+     * Writes **all sixteen** components, including the zeros, so `out` may be
+     * scratch holding an unrelated matrix.
+     */
+    setOrthographic<S extends ScalarDescriptor>(
+        out: MatMemoryBuffer<S, 4>,
+        left: number,
+        right: number,
+        bottom: number,
+        top: number,
+        near: number,
+        far: number,
+    ): MatMemoryBuffer<S, 4> {
         const lr = 1 / (left - right);
         const bt = 1 / (bottom - top);
         const nf = 1 / (near - far);
+        const ov = out.view();
+        const c = out.columnElements;
 
-        const descriptor = Mat(scalar, 4);
-        const buffer = allocate(descriptor);
-        buffer.set(0, [-2 * lr, 0, 0, 0] as TupleOf<4, number>);
-        buffer.set(1, [0, -2 * bt, 0, 0] as TupleOf<4, number>);
-        buffer.set(2, [0, 0, nf, 0] as TupleOf<4, number>);
-        buffer.set(3, [(left + right) * lr, (top + bottom) * bt, near * nf, 1] as TupleOf<4, number>);
-        return buffer;
+        ov[0] = -2 * lr; ov[1] = 0; ov[2] = 0; ov[3] = 0;
+        ov[c] = 0; ov[c + 1] = -2 * bt; ov[c + 2] = 0; ov[c + 3] = 0;
+        ov[2 * c] = 0; ov[2 * c + 1] = 0; ov[2 * c + 2] = nf; ov[2 * c + 3] = 0;
+        ov[3 * c] = (left + right) * lr;
+        ov[3 * c + 1] = (top + bottom) * bt;
+        ov[3 * c + 2] = near * nf;
+        ov[3 * c + 3] = 1;
+        return out;
     },
 
     /**

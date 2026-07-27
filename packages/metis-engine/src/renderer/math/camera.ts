@@ -1,4 +1,5 @@
-import { mat4, type Mat4Arg, vec3, type Vec3Arg } from "wgpu-matrix";
+import { Mat4 } from "metis-data";
+import { type Mat4f, mat4f, type Vec3f, vec3f } from "./types.ts";
 
 /**
  * A look-at perspective camera using a **reverse-Z, infinite-far** projection
@@ -21,11 +22,11 @@ import { mat4, type Mat4Arg, vec3, type Vec3Arg } from "wgpu-matrix";
  */
 export class Camera {
     /** Eye position in world space. */
-    position: Vec3Arg = vec3.create(0, 0, 5);
+    position: Vec3f = vec3f(0, 0, 5);
     /** Point the camera looks at. This is a look-at camera — there is no orientation field; move the target to turn. */
-    target: Vec3Arg = vec3.create(0, 0, 0);
+    target: Vec3f = vec3f(0, 0, 0);
     /** World up hint. Degenerate when parallel to `target - position`. */
-    up: Vec3Arg = vec3.create(0, 1, 0);
+    up: Vec3f = vec3f(0, 1, 0);
     /** Vertical field of view, in **radians**. */
     fovYRadians = Math.PI / 4;
     /** Width / height. Keep it in sync with the render targets via {@link setAspectFromSize}. */
@@ -72,32 +73,38 @@ export class Camera {
         this.aspect = width / Math.max(1, height);
     }
 
-    /** World -> view. Right-handed, looking down -Z. */
-    viewMatrix(dst?: Mat4Arg): Mat4Arg {
-        return mat4.lookAt(this.position, this.target, this.up, dst);
+    /**
+     * World -> view, into `out`. Right-handed, looking down -Z.
+     *
+     * Out-first, and `out` may be a `Mat4f` wrapped **directly over GPU staging
+     * bytes** — that is the whole point of the metis-data types. Omit it and a
+     * fresh matrix is allocated, which is fine for setup and wrong per frame.
+     */
+    viewMatrix(out: Mat4f = mat4f()): Mat4f {
+        return Mat4.setLookAt(out, this.position, this.target, this.up);
     }
 
     /** Reverse-Z with an infinite far plane (`zFar` omitted). Maps near -> 1, infinity -> 0. */
-    projectionMatrix(dst?: Mat4Arg): Mat4Arg {
-        return mat4.perspectiveReverseZ(this.fovYRadians, this.aspect, this.near, undefined, dst);
+    projectionMatrix(out: Mat4f = mat4f()): Mat4f {
+        return Mat4.setPerspectiveReverseZ(out, this.fovYRadians, this.aspect, this.near);
     }
 
     /**
-     * `projection * view`. Pass `dst` and this allocates **nothing** — the two
-     * intermediates go into per-camera scratch. Omit it and only the result is
-     * allocated.
+     * `projection * view`, into `out`. Pass `out` and this allocates
+     * **nothing** — the two intermediates go into per-camera scratch. Omit it
+     * and only the result is allocated.
      *
      * The scratch is reused across calls, so a matrix returned by
      * `viewMatrix()`/`projectionMatrix()` is *not* aliased by it — those still
-     * allocate (or write your `dst`) as before. Only this method touches it.
+     * write your `out` (or allocate) as before. Only this method touches it.
      */
-    viewProjectionMatrix(dst?: Mat4Arg): Mat4Arg {
+    viewProjectionMatrix(out: Mat4f = mat4f()): Mat4f {
         const v = this.viewMatrix(this.viewScratch);
         const p = this.projectionMatrix(this.projScratch);
-        return mat4.multiply(p, v, dst);
+        return Mat4.multiply(out, p, v);
     }
 
     /** Scratch for {@link viewProjectionMatrix}, so the per-frame path doesn't allocate. */
-    private readonly viewScratch: Mat4Arg = mat4.identity();
-    private readonly projScratch: Mat4Arg = mat4.identity();
+    private readonly viewScratch: Mat4f = mat4f();
+    private readonly projScratch: Mat4f = mat4f();
 }

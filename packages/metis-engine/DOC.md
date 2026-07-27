@@ -19,6 +19,55 @@ is separate and covered in §12; it is not yet wired to the renderer.
 
 ---
 
+## 0. Vectors and matrices — they are `metis-data` buffers
+
+Every positional value in this API (`Camera.position/target/up`,
+`Light.position/direction`, `Transform.*`, `Environment.sunDirection`,
+`SceneInstance.modelMatrixOverride`) is a **`metis-data` memory buffer**, not a
+`Float32Array`. The engine re-exports short aliases and their constructors:
+
+```ts
+import { mat3f, mat4f, quatf, vec2f, vec3f, vec4f } from "metis-engine/renderer";
+import type { Mat3f, Mat4f, Quatf, Vec2f, Vec3f, Vec4f } from "metis-engine/renderer";
+
+vec3f(1, 2, 3)   // Vec3f, defaults to the origin
+mat4f()          // identity Mat4f — the scratch you hand to an out-first op
+quatf()          // identity quaternion [0, 0, 0, 1]
+mat3f()          // identity Mat3f, std140-packed (see below)
+```
+
+**The operations come from `metis-data` directly** — this package re-exports the
+types, not the math:
+
+```ts
+import { Mat4, Quat, Vec3 } from "metis-data";
+
+Vec3.add(out, a, b);        Vec3.normalize(out, v);      Vec3.dot(a, b): number
+Mat4.multiply(out, a, b);   Mat4.invert(out, m);         Mat4.setLookAt(out, eye, center, up)
+```
+
+Three things to internalise, each a real trap:
+
+- **Every op is out-first**: `Vec3.add(out, a, b)` writes into `out` and returns
+  it. It does not return a fresh value. `out` may safely alias an input.
+- **A buffer is not an array.** `v[0]` does not work — it is a view over an
+  `ArrayBuffer`. Read a component with `v.getComponent(i)` (allocation-free),
+  write one with `v.setComponent(i, x)`, or take the whole typed view with
+  `v.view()`. Avoid `get()`/`set()` on a per-frame path: they allocate a tuple.
+- **Packing is invisible to the type system, and it matters for `mat3` only.** A
+  mat4 lays out identically Dense or std140; a Dense mat3 packs its columns at 12
+  bytes where std140 pads them to 16. `Mat3f` doesn't encode which, so always use
+  `mat3f()` for anything destined for a uniform buffer.
+
+The payoff for all this is zero-copy upload: a `Mat4f` can be *wrapped over the
+GPU staging bytes themselves*, so `Mat4.multiply(cameraStaging.viewProj, p, v)`
+writes the result straight into what `queue.writeBuffer` sends. The renderer does
+exactly that for the camera, AO, cluster, and per-instance model uniforms.
+
+See `metis-data`'s `DOC.md` §8 for the full math surface.
+
+---
+
 ## 1. Quick start
 
 There are three ways to drive the engine. They differ only in **who owns the
@@ -36,7 +85,7 @@ entirely — see §1.3.
 
 ```ts
 import { SdlEventType, SdlKeycode, sdlPollEvents } from "metis-native";
-import { vec3 } from "wgpu-matrix";
+import { vec3f } from "metis-engine/renderer";
 
 // Default present mode is "mailbox" (tear-free, no fifo stall). The FrameLimiter
 // paces the loop: new FrameLimiter(0) = uncapped, new FrameLimiter(60) = 60 fps.
@@ -47,12 +96,12 @@ const post = createDefaultPostProcessPipeline(ctx.device);
 
 const scene = new Scene();
 scene.environment = createExteriorEnvironment();
-scene.camera.position = vec3.create(0, 2, 6);
-scene.camera.target = vec3.create(0, 0, 0);
+scene.camera.position = vec3f(0, 2, 6);
+scene.camera.target = vec3f(0, 0, 0);
 scene.camera.setAspectFromSize(ctx.width, ctx.height);
 
 scene.add(new Mesh(ctx.device, cube(1, 1, 1), "box"), new Material({ metallic: 0.8, roughness: 0.3 }));
-scene.lights.push({ kind: "point", position: vec3.create(2, 2, 0), color: [1, 0.9, 0.8], intensity: 8, range: 6 });
+scene.lights.push({ kind: "point", position: vec3f(2, 2, 0), color: [1, 0.9, 0.8], intensity: 8, range: 6 });
 
 let running = true;
 while (running) {
@@ -273,7 +322,7 @@ class Scene {
 
 class SceneInstance {
     transform: Transform;
-    modelMatrixOverride: Mat4Arg | null;  // bypasses transform (e.g. glTF nodes)
+    modelMatrixOverride: Mat4f | null;  // bypasses transform (e.g. glTF nodes)
     mesh: Mesh; material: Material;
     destroy(): void;
 }
@@ -325,7 +374,7 @@ type Light = PointLight | SpotLight;
 
 interface PointLight {
     kind: "point";
-    position: Vec3Arg;
+    position: Vec3f;
     color: [r, g, b];
     intensity: number;   // same linear units as Environment.sunIntensity
     range: number;       // cull radius; contributes nothing beyond
@@ -333,8 +382,8 @@ interface PointLight {
 
 interface SpotLight {
     kind: "spot";
-    position: Vec3Arg;
-    direction: Vec3Arg;  // direction light TRAVELS (cone axis); normalized on upload
+    position: Vec3f;
+    direction: Vec3f;  // direction light TRAVELS (cone axis); normalized on upload
     color: [r, g, b];
     intensity: number;
     range: number;       // cull radius — the full SPHERE, not the cone (see below)
@@ -371,7 +420,7 @@ against `MAX_LIGHTS_PER_CLUSTER`. See CLAUDE.md "Spot lights" for why cone
 culling was measured and deferred.
 
 interface Environment {
-    sunDirection: Vec3Arg;   // direction light TRAVELS, normalized
+    sunDirection: Vec3f;   // direction light TRAVELS, normalized
     sunColor: [r, g, b]; sunIntensity: number;
     ambientColor: [r, g, b]; ambientIntensity: number;
 }
@@ -386,13 +435,13 @@ Exterior vs. interior is **only** `ambientIntensity` (+ geometry). There is no
 
 ```ts
 class Camera {
-    position, target, up: Vec3Arg;
+    position, target, up: Vec3f;
     fovYRadians = Math.PI / 4; aspect = 16 / 9;
     near = 0.01;        // cheap to make small: reverse-Z precision is ~z * 2^-24, independent of near
     clusterNear = 2.0;  // light-grid near — deliberately NOT `near`. See below.
     clusterFar = 1000;  // light-culling range only — NOT a clip plane. There is no `far`.
     setAspectFromSize(width, height): void;
-    viewMatrix(dst?), projectionMatrix(dst?), viewProjectionMatrix(dst?): Mat4Arg;
+    viewMatrix(out?), projectionMatrix(out?), viewProjectionMatrix(out?): Mat4f;
 }
 
 **`projectionMatrix()` is reverse-Z with an infinite far plane** (`near → ndc.z 1`,
@@ -428,11 +477,17 @@ the slack is. Raising `clusterFar` *lowers* density (200 -> 1000 measured 1.38 -
 distant lights. See CLAUDE.md, "What the forward pass actually costs".
 
 ```ts
-interface Transform { position: Vec3Arg; rotationEuler: Vec3Arg; scale: Vec3Arg }
+interface Transform { position: Vec3f; rotationEuler: Vec3f; scale: Vec3f }
 createTransform(overrides?: Partial<Transform>): Transform
-transformToMat4(t, dst?): Mat4Arg          // T * Rx * Ry * Rz * S
-normalMatrixFromModel(model, dst?): Mat3Arg // inverse-transpose upper 3x3
+transformToMat4(t, out): Mat4f            // T * Rx * Ry * Rz * S
+normalMatrixFromModel(model, out): Mat3f  // inverse-transpose upper 3x3
 ```
+
+Both of the last two are **out-first with no allocating variant**: they run once
+per instance per frame and their results belong in a GPU staging buffer. `out`
+for `normalMatrixFromModel` must be **std140-packed** — use `mat3f()`, which is;
+a Dense mat3 type-checks the same and lays its columns out 4 bytes apart from
+where the shader reads them.
 
 ---
 

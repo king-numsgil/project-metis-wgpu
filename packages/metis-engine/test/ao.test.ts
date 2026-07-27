@@ -30,7 +30,8 @@ import {
     SSAO_KERNEL_SIZE,
     TonemapPass,
 } from "metis-engine/renderer";
-import { vec3 } from "wgpu-matrix";
+
+import { vec3f } from "metis-engine/renderer";
 
 // ── Pure-math: SSAO kernel ──────────────────────────────────────────────────
 
@@ -123,14 +124,14 @@ async function renderAoScene(technique: AoTechnique): Promise<{ mean: number; er
     const scene = new Scene();
     // Ambient-only: sun off, flat white fill. Then final colour ≈ albedo * AO.
     scene.environment = createInteriorEnvironment({sunIntensity: 0, ambientColor: [1, 1, 1], ambientIntensity: 1.0});
-    scene.camera.position = vec3.create(2.2, 2.2, 2.2);
-    scene.camera.target = vec3.create(0, 0.25, 0);
+    scene.camera.position = vec3f(2.2, 2.2, 2.2);
+    scene.camera.target = vec3f(0, 0.25, 0);
     scene.camera.setAspectFromSize(AO_W, AO_H);
 
     const grey = new Material({baseColor: [0.5, 0.5, 0.5, 1], metallic: 0, roughness: 1});
     scene.add(new Mesh(ctx.device, plane(6, 6), "floor"), grey);
     // Box resting on the floor (bottom face at y=0) → contact crease all around its base.
-    scene.add(new Mesh(ctx.device, cube(1, 1, 1), "box"), grey, {position: vec3.create(0, 0.5, 0)});
+    scene.add(new Mesh(ctx.device, cube(1, 1, 1), "box"), grey, {position: vec3f(0, 0.5, 0)});
 
     ctx.device.pushErrorScope("validation");
     const frame = ctx.beginFrame();

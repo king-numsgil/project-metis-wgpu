@@ -12,12 +12,13 @@ import {
     GPUTextureUsage,
     type GpuTextureView,
 } from "metis-native";
-import { mat4, type Mat4Arg, vec3 } from "wgpu-matrix";
+import { Mat4, Vec3 } from "metis-data";
 import type { GpuProfiler } from "../debug/gpuProfiler.ts";
+import { type Mat4f, mat4f, type Vec3f, vec3f } from "../math/types.ts";
 import { MESH_VERTEX_LAYOUT } from "../scene/mesh.ts";
 import type { Scene } from "../scene/scene.ts";
 import { CASCADE_COUNT, SHADOW_MAP_SIZE } from "./shadowConfig.ts";
-import { CascadeUniforms, SHADOW_RENDER_STRIDE, stage } from "./gpuLayouts.ts";
+import { CascadeUniforms, SHADOW_RENDER_STRIDE, stage, wrapMat4 } from "./gpuLayouts.ts";
 import commonWgsl from "./wgsl/common.wgsl" with { type: "text" };
 import shadowWgsl from "./wgsl/shadow.wgsl" with { type: "text" };
 
@@ -106,13 +107,37 @@ export class ShadowCascades {
     private readonly pcfDepthPipeline: GpuRenderPipeline; // single-sample depth
     /** Persistent staging, allocated once (see gpuLayouts.ts). */
     private readonly renderBytes: Uint8Array;
-    private readonly renderMatrices: Float32Array[];
+    /** `Mat4f` per 256-byte slice, aliasing {@link renderBytes} — cascade fits write straight in. */
+    private readonly renderMatrices: Mat4f[];
+    /** Flat float views of the same slices, for the copy into the forward array. */
+    private readonly renderMatrixViews: Float32Array[];
     private readonly forwardBytes: Uint8Array;
     private readonly forwardStaging: {
         viewProj: Float32Array;
         splitDepths: Float32Array;
         normalOffsets: Float32Array;
         params: Float32Array;
+    };
+    /**
+     * Per-frame scratch for the cascade fit, so `computeCascades` allocates
+     * nothing. It runs once a frame and builds four cascades from these.
+     */
+    private readonly scratch = {
+        invView: mat4f(),
+        view: mat4f(),
+        lightView: mat4f(),
+        proj: mat4f(),
+        sunDir: vec3f(),
+        up: vec3f(),
+        zAxis: vec3f(),
+        xAxis: vec3f(),
+        yAxis: vec3f(),
+        center: vec3f(),
+        eye: vec3f(),
+        offset: vec3f(),
+        corner: vec3f(),
+        // The eight frustum-slice corners, reused every cascade.
+        corners: Array.from({length: 8}, () => vec3f()),
     };
 
     constructor(device: GpuDevice, modelBindGroupLayout: GpuBindGroupLayout) {
@@ -162,12 +187,13 @@ export class ShadowCascades {
         // Per-cascade render matrix staging. One mat4 per 256-byte slice, so
         // this is a raw buffer with a view per slice rather than an ArrayOf —
         // metis-data has no way to declare a stride wider than the element.
-        this.renderBytes = new Uint8Array(CASCADE_COUNT * SHADOW_RENDER_STRIDE);
+        const renderBuffer = new ArrayBuffer(CASCADE_COUNT * SHADOW_RENDER_STRIDE);
+        this.renderBytes = new Uint8Array(renderBuffer);
         this.renderMatrices = [];
+        this.renderMatrixViews = [];
         for (let i = 0; i < CASCADE_COUNT; i++) {
-            this.renderMatrices.push(
-                new Float32Array(this.renderBytes.buffer, i * SHADOW_RENDER_STRIDE, 16),
-            );
+            this.renderMatrices.push(wrapMat4(renderBuffer, i * SHADOW_RENDER_STRIDE));
+            this.renderMatrixViews.push(new Float32Array(renderBuffer, i * SHADOW_RENDER_STRIDE, 16));
         }
 
         const fw = stage(CascadeUniforms);
@@ -249,7 +275,7 @@ export class ShadowCascades {
         const fw = this.forwardStaging;
         for (let c = 0; c < CASCADE_COUNT; c++) {
             const cascade = cascades[c]!;
-            fw.viewProj.set(this.renderMatrices[c]!, c * 16);
+            fw.viewProj.set(this.renderMatrixViews[c]!, c * 16);
             fw.splitDepths[c] = cascade.splitFar;
             fw.normalOffsets[c] = cascade.normalOffset;
         }
@@ -314,15 +340,23 @@ export class ShadowCascades {
             splitFar.push(splitLambda * logSplit + (1 - splitLambda) * uniSplit);
         }
 
-        const invView = mat4.invert(cam.viewMatrix());
+        // Everything below runs out of `this.scratch` — this method is called
+        // once per frame and builds four cascades, so nothing here allocates.
+        const S = this.scratch;
+        Mat4.invert(S.invView, cam.viewMatrix(S.view));
         const tanHalfY = Math.tan(cam.fovYRadians / 2);
         const tanHalfX = tanHalfY * cam.aspect;
-        const sunDir = vec3.normalize(scene.environment.sunDirection);
-        const up = Math.abs(sunDir[1]!) > 0.98 ? vec3.create(1, 0, 0) : vec3.create(0, 1, 0);
+        const sunDir = Vec3.normalize(S.sunDir, scene.environment.sunDirection);
+        const sun = sunDir.view();
+        // +Y up, unless the sun is near-vertical and would make it degenerate.
+        // The choice only spins the map about its own axis, which is invisible.
+        const up = Math.abs(sun[1] as number) > 0.98
+            ? Vec3.set(S.up, 1, 0, 0)
+            : Vec3.set(S.up, 0, 1, 0);
         // Light XY basis (rotation only), for texel-snapping the sphere centre.
-        const zAxis = vec3.negate(sunDir); // view looks down -z; eye is toward the light
-        const xAxis = vec3.normalize(vec3.cross(up, zAxis));
-        const yAxis = vec3.cross(zAxis, xAxis);
+        const zAxis = Vec3.negate(S.zAxis, sunDir); // view looks down -z; eye is toward the light
+        const xAxis = Vec3.normalize(S.xAxis, Vec3.cross(S.xAxis, up, zAxis));
+        const yAxis = Vec3.cross(S.yAxis, zAxis, xAxis);
 
         const cascades: Cascade[] = [];
         let sliceNear = near;
@@ -330,51 +364,55 @@ export class ShadowCascades {
             const sliceFar = splitFar[c]!;
 
             // 8 world-space corners of this frustum slice.
-            const corners: ReturnType<typeof vec3.create>[] = [];
+            const corners = S.corners;
+            let n = 0;
             for (const d of [sliceNear, sliceFar]) {
                 for (const sx of [-1, 1]) {
                     for (const sy of [-1, 1]) {
-                        corners.push(vec3.transformMat4(vec3.create(sx * d * tanHalfX, sy * d * tanHalfY, -d), invView));
+                        Vec3.set(S.corner, sx * d * tanHalfX, sy * d * tanHalfY, -d);
+                        Vec3.transformMat4(corners[n++]!, S.corner, S.invView);
                     }
                 }
             }
 
             // Bounding sphere (average-centre — stable and standard for CSM).
-            const center = vec3.create(0, 0, 0);
+            const center = Vec3.set(S.center, 0, 0, 0);
             for (const p of corners) {
-                vec3.add(center, p, center);
+                Vec3.add(center, center, p);
             }
-            vec3.scale(center, 1 / corners.length, center);
+            Vec3.scale(center, center, 1 / corners.length);
             let radius = 0;
             for (const p of corners) {
-                radius = Math.max(radius, vec3.distance(center, p));
+                radius = Math.max(radius, Vec3.distance(center, p));
             }
             // Quantize the radius so it doesn't wobble by sub-texel amounts.
             radius = Math.ceil(radius * 16) / 16;
 
             const worldPerTexel = (2 * radius) / SHADOW_MAP_SIZE;
             // Snap the centre within the light's XY plane to the texel grid.
-            const cx = vec3.dot(center, xAxis);
-            const cy = vec3.dot(center, yAxis);
+            const cx = Vec3.dot(center, xAxis);
+            const cy = Vec3.dot(center, yAxis);
             const snapX = Math.round(cx / worldPerTexel) * worldPerTexel - cx;
             const snapY = Math.round(cy / worldPerTexel) * worldPerTexel - cy;
-            vec3.add(center, vec3.scale(xAxis, snapX), center);
-            vec3.add(center, vec3.scale(yAxis, snapY), center);
+            Vec3.add(center, center, Vec3.scale(S.offset, xAxis, snapX));
+            Vec3.add(center, center, Vec3.scale(S.offset, yAxis, snapY));
 
             const dist = radius * CASCADE_ORTHO_NEAR_SCALE;
-            const eye = vec3.subtract(center, vec3.scale(sunDir, dist));
-            const lightView = mat4.lookAt(eye, center, up);
+            const eye = Vec3.subtract(S.eye, center, Vec3.scale(S.offset, sunDir, dist));
+            const lightView = Mat4.setLookAt(S.lightView, eye, center, up);
             // Ortho half-extent padded by a texel so the ≤1-texel snap can't clip
             // the sphere. Depth 0..(dist + FAR·r) captures occluders standing
             // well outside the slice, between it and the light.
             const half = radius + worldPerTexel;
-            const proj = mat4.ortho(-half, half, -half, half, 0, dist + radius * CASCADE_ORTHO_FAR_SCALE);
+            const proj = Mat4.setOrthographic(
+                S.proj, -half, half, -half, half, 0, dist + radius * CASCADE_ORTHO_FAR_SCALE,
+            );
 
             const normalOffset = Math.max(SHADOW_NORMAL_OFFSET_MIN, SHADOW_NORMAL_OFFSET_TEXELS * worldPerTexel);
             // Straight into this cascade's 256-stride render slice; `render`
             // then fans it out to the forward uniform. The matrix used to be
             // allocated here and copied into both.
-            mat4.multiply(proj, lightView, this.renderMatrices[c]!);
+            Mat4.multiply(this.renderMatrices[c]!, proj, lightView);
             cascades.push({radius, splitFar: sliceFar, normalOffset});
             sliceNear = sliceFar;
         }

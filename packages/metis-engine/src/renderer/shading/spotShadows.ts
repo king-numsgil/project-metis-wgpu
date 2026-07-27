@@ -11,15 +11,16 @@ import {
     GPUTextureUsage,
     type GpuTextureView,
 } from "metis-native";
-import { mat4, type Mat4Arg, vec3 } from "wgpu-matrix";
+import { Mat4, Vec3 } from "metis-data";
 import type { GpuProfiler } from "../debug/gpuProfiler.ts";
 import { type Frustum, frustumFromViewProj, sphereInFrustum, worldBoundingSphere } from "../math/frustum.ts";
 import { transformToMat4 } from "../math/transform.ts";
+import { type Mat4f, mat4f, vec3f } from "../math/types.ts";
 import type { Light, SpotLight } from "../scene/light.ts";
 import { MESH_VERTEX_LAYOUT } from "../scene/mesh.ts";
 import type { Scene } from "../scene/scene.ts";
 import { MAX_SHADOW_SPOTS, SPOT_SHADOW_MAP_SIZE } from "./shadowConfig.ts";
-import { SHADOW_RENDER_STRIDE, SpotShadowUniforms, stage } from "./gpuLayouts.ts";
+import { SHADOW_RENDER_STRIDE, SpotShadowUniforms, stage, wrapMat4 } from "./gpuLayouts.ts";
 import commonWgsl from "./wgsl/common.wgsl" with { type: "text" };
 import shadowWgsl from "./wgsl/shadow.wgsl" with { type: "text" };
 
@@ -47,10 +48,10 @@ const SPOT_NORMAL_OFFSET_TEXELS = 1.5;
 const MAX_SHADOW_FOV = (150 * Math.PI) / 180;
 
 /** Reused for inactive shadow layers rather than allocating an identity per frame. */
-const IDENTITY = mat4.identity();
+const IDENTITY = mat4f();
 /** Shared up-vector constants — the choice only spins the map about its own axis. */
-const UP_X = vec3.create(1, 0, 0);
-const UP_Y = vec3.create(0, 1, 0);
+const UP_X = vec3f(1, 0, 0);
+const UP_Y = vec3f(0, 1, 0);
 /**
  * Near plane as a fraction of the light's range. Perspective depth precision is
  * dominated by the far/near ratio, so this can't be tiny; 2% of range keeps the
@@ -107,14 +108,19 @@ export class SpotShadows {
     private readonly frustum: Frustum = new Float32Array(24);
     /** Persistent staging, allocated once (see gpuLayouts.ts). */
     private readonly renderBytes: Uint8Array;
-    private readonly renderMatrices: Float32Array[];
+    /** `Mat4f` per 256-byte slice, aliasing {@link renderBytes} — the fit writes straight in. */
+    private readonly renderMatrices: Mat4f[];
+    /** Flat float views of the same slices, for the copy into the forward array. */
+    private readonly renderMatrixViews: Float32Array[];
     private readonly forwardBytes: Uint8Array;
     private readonly forwardStaging: {viewProj: Float32Array; texelScale: Float32Array; params: Float32Array};
     /** Per-frame scratch, so `render` allocates nothing for its matrix setup. */
-    private readonly dirScratch = vec3.create(0, 0, 0);
-    private readonly targetScratch = vec3.create(0, 0, 0);
-    private readonly viewScratch = mat4.identity();
-    private readonly projScratch = mat4.identity();
+    private readonly dirScratch = vec3f();
+    private readonly targetScratch = vec3f();
+    private readonly viewScratch = mat4f();
+    private readonly projScratch = mat4f();
+    /** Scratch for the per-instance model matrix behind the frustum cull. */
+    private readonly modelScratch = mat4f();
     private readonly texelScaleScratch = new Float32Array(MAX_SHADOW_SPOTS);
 
     /**
@@ -162,12 +168,13 @@ export class SpotShadows {
         });
 
         // Same 256-stride slicing as the sun cascades — see SHADOW_RENDER_STRIDE.
-        this.renderBytes = new Uint8Array(MAX_SHADOW_SPOTS * SHADOW_RENDER_STRIDE);
+        const renderBuffer = new ArrayBuffer(MAX_SHADOW_SPOTS * SHADOW_RENDER_STRIDE);
+        this.renderBytes = new Uint8Array(renderBuffer);
         this.renderMatrices = [];
+        this.renderMatrixViews = [];
         for (let i = 0; i < MAX_SHADOW_SPOTS; i++) {
-            this.renderMatrices.push(
-                new Float32Array(this.renderBytes.buffer, i * SHADOW_RENDER_STRIDE, 16),
-            );
+            this.renderMatrices.push(wrapMat4(renderBuffer, i * SHADOW_RENDER_STRIDE));
+            this.renderMatrixViews.push(new Float32Array(renderBuffer, i * SHADOW_RENDER_STRIDE, 16));
         }
 
         const fw = stage(SpotShadowUniforms);
@@ -230,21 +237,21 @@ export class SpotShadows {
 
         for (let i = 0; i < spots.length; i++) {
             const spot = spots[i]!;
-            const dir = vec3.normalize(spot.direction, this.dirScratch);
-            const target = vec3.add(spot.position, dir, this.targetScratch);
+            const dir = Vec3.normalize(this.dirScratch, spot.direction);
+            const target = Vec3.add(this.targetScratch, spot.position, dir);
             // Any up vector not parallel to the cone axis; the choice only spins
             // the map about its own axis, which is invisible.
-            const up = Math.abs(dir[1]!) > 0.99 ? UP_X : UP_Y;
-            const view = mat4.lookAt(spot.position, target, up, this.viewScratch);
+            const up = Math.abs(dir.getComponent(1)) > 0.99 ? UP_X : UP_Y;
+            const view = Mat4.setLookAt(this.viewScratch, spot.position, target, up);
 
             // Full field of view is twice the cone's half-angle, plus a small
             // margin so the cone's own soft edge isn't clipped by the map border.
             const fov = Math.min(Math.max(spot.outerAngle * 2.1, 1e-3), MAX_SHADOW_FOV);
             const near = Math.max(spot.range * NEAR_FRACTION, 1e-3);
-            const proj = mat4.perspective(fov, 1, near, Math.max(spot.range, near * 2), this.projScratch);
+            const proj = Mat4.setPerspective(this.projScratch, fov, 1, near, Math.max(spot.range, near * 2));
             // Straight into the 256-stride render slice — this matrix used to be
             // allocated and then copied into two places.
-            mat4.multiply(proj, view, this.renderMatrices[i]!);
+            Mat4.multiply(this.renderMatrices[i]!, proj, view);
             // World size of one texel per unit distance from the light — the
             // shader multiplies this by the receiver's distance to size its
             // normal offset, since a perspective map's texels grow with depth.
@@ -257,9 +264,9 @@ export class SpotShadows {
             // with an activeCount guard, so the matrix only has to be finite.
             // (Also clears a matrix left over from a previous frame's caster.)
             if (i >= spots.length) {
-                this.renderMatrices[i]!.set(IDENTITY as Float32Array);
+                Mat4.copy(this.renderMatrices[i]!, IDENTITY);
             }
-            fw.viewProj.set(this.renderMatrices[i]!, i * 16);
+            fw.viewProj.set(this.renderMatrixViews[i]!, i * 16);
             fw.texelScale[i] = texelScale[i]!;
         }
         fw.params[0] = spots.length;
@@ -270,7 +277,7 @@ export class SpotShadows {
         // World bounding spheres once per frame, reused across every light's
         // frustum test rather than recomputed per (light, instance).
         const spheres = scene.instances.map((inst) => {
-            const model = inst.modelMatrixOverride ?? transformToMat4(inst.transform);
+            const model = inst.modelMatrixOverride ?? transformToMat4(inst.transform, this.modelScratch);
             return worldBoundingSphere(model, inst.mesh.boundingRadius);
         });
 

@@ -1,4 +1,5 @@
-import { vec3, type Vec3Arg } from "wgpu-matrix";
+import { Vec3 } from "metis-data";
+import { type Vec3f, vec3f } from "../math/types.ts";
 
 /**
  * The scene-wide lighting context: one directional "sun" plus a flat ambient
@@ -9,7 +10,7 @@ import { vec3, type Vec3Arg } from "wgpu-matrix";
  */
 export interface Environment {
     /** Direction the light *travels* (sun -> scene), normalized. */
-    sunDirection: Vec3Arg;
+    sunDirection: Vec3f;
     /** Linear RGB tint of the directional light. */
     sunColor: [number, number, number];
     /** Radiance scale (arbitrary linear units). The auto-exposure pass meters the scene to middle grey (`math/Tonemapping and exposure formulas.md`, Formula 2), so absolute magnitude mostly sets brightness *relative* to the ambient/point-light terms rather than final screen brightness. */
@@ -32,7 +33,7 @@ export interface Environment {
  */
 export function createExteriorEnvironment(overrides?: Partial<Environment>): Environment {
     return {
-        sunDirection: vec3.normalize(vec3.create(-0.4, -0.75, -0.3)),
+        sunDirection: Vec3.normalize(vec3f(), vec3f(-0.4, -0.75, -0.3)),
         sunColor: [1.0, 0.98, 0.92],
         sunIntensity: 4.0,
         ambientColor: [0.55, 0.65, 0.85],
@@ -52,7 +53,7 @@ export function createExteriorEnvironment(overrides?: Partial<Environment>): Env
  */
 export function createInteriorEnvironment(overrides?: Partial<Environment>): Environment {
     return {
-        sunDirection: vec3.normalize(vec3.create(-0.4, -0.75, -0.3)),
+        sunDirection: Vec3.normalize(vec3f(), vec3f(-0.4, -0.75, -0.3)),
         sunColor: [1.0, 0.98, 0.92],
         sunIntensity: 4.0,
         ambientColor: [0.5, 0.55, 0.6],

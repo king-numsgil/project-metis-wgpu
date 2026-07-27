@@ -5,9 +5,10 @@ import {
     GPUBufferUsage,
     type GpuDevice,
 } from "metis-native";
-import type { Mat4Arg } from "wgpu-matrix";
+import { Mat4 } from "metis-data";
 import { Camera } from "../math/camera.ts";
 import { createTransform, normalMatrixFromModel, type Transform, transformToMat4 } from "../math/transform.ts";
+import type { Mat3f, Mat4f } from "../math/types.ts";
 import { ModelUniforms, stage } from "../shading/gpuLayouts.ts";
 import { createExteriorEnvironment, type Environment } from "./environment.ts";
 import type { Light } from "./light.ts";
@@ -23,7 +24,7 @@ export class SceneInstance {
      * arbitrary quaternion rotation + non-uniform scale that can't be losslessly
      * decomposed back into `Transform`'s position/Euler-rotation/scale fields.
      */
-    modelMatrixOverride: Mat4Arg | null = null;
+    modelMatrixOverride: Mat4f | null = null;
 
     private buffer: GpuBuffer | null = null;
     private bindGroup: GpuBindGroup | null = null;
@@ -32,8 +33,12 @@ export class SceneInstance {
      * rewritten in place every frame. This is the allocation that scaled with
      * scene size before — one `Std140Writer` per instance per frame, each with
      * five allocations of its own.
+     *
+     * `model`/`normalMatrix` are `Mat4f`/`Mat3f` **aliasing the upload bytes**,
+     * so the two matrices below are computed directly into what gets uploaded.
+     * There is no intermediate matrix and no copy on this path any more.
      */
-    private staging: {bytes: Uint8Array; model: Float32Array; normalMatrix: Float32Array} | null = null;
+    private staging: {bytes: Uint8Array; model: Mat4f; normalMatrix: Mat3f} | null = null;
 
     /**
      * @param mesh geometry to draw; shared freely between instances.
@@ -54,9 +59,9 @@ export class SceneInstance {
             const s = stage(ModelUniforms);
             this.staging = {
                 bytes: s.bytes,
-                model: s.f32("model", 16),
-                // A std140 mat3 is three *vec4* columns — 12 floats, not 9.
-                normalMatrix: s.f32("normalMatrix", 12),
+                model: s.mat4("model"),
+                // A std140 mat3 is three *vec4* columns — 48 bytes, not 36.
+                normalMatrix: s.mat3("normalMatrix"),
             };
             this.buffer = device.createBuffer({
                 label: "metis-engine/model",
@@ -70,11 +75,15 @@ export class SceneInstance {
             });
         }
 
-        const model = this.modelMatrixOverride ?? transformToMat4(this.transform);
-        this.staging.model.set(model as Float32Array);
-        // wgpu-matrix's Mat3 is already 12 floats with the same column padding
-        // std140 wants, so this copies straight across.
-        this.staging.normalMatrix.set(normalMatrixFromModel(model) as Float32Array);
+        // Composed straight into the upload bytes. An override is the only case
+        // that copies, and only because the caller owns that matrix.
+        const model = this.staging.model;
+        if (this.modelMatrixOverride) {
+            Mat4.copy(model, this.modelMatrixOverride);
+        } else {
+            transformToMat4(this.transform, model);
+        }
+        normalMatrixFromModel(model, this.staging.normalMatrix);
 
         device.queue.writeBuffer(this.buffer!, 0, this.staging.bytes);
         return this.bindGroup!;

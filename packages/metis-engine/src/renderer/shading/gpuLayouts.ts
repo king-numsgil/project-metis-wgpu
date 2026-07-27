@@ -1,11 +1,15 @@
 import {
     ArrayOf,
     F32,
+    type F32Descriptor,
     Mat,
+    type MatMemoryBuffer,
     PackingType,
     StructOf,
     U32,
     Vec,
+    type VecMemoryBuffer,
+    wrap,
 } from "metis-data";
 import { MAX_LIGHTS } from "./clusterConfig.ts";
 import { CASCADE_COUNT, MAX_SHADOW_SPOTS } from "./shadowConfig.ts";
@@ -45,6 +49,8 @@ const STD140 = PackingType.Std140;
 const STD430 = PackingType.Std430;
 
 const Vec3f = Vec(F32, 3, STD140);
+/** std430 `vec3<f32>` — the `GpuLight` members' packing. */
+const Vec3fStorage = Vec(F32, 3, STD430);
 const Vec4f = Vec(F32, 4, STD140);
 const Vec4u = Vec(U32, 4, STD140);
 const Mat4f = Mat(F32, 4, STD140);
@@ -77,9 +83,10 @@ export const EnvironmentUniforms = StructOf({
  * `ModelUniforms` — 112 bytes.
  *
  * `normalMatrix` is a std140 `mat3x3`, i.e. **three vec4 columns, 48 bytes** —
- * not 36. The old hand-packed path happened to get this right only because
- * wgpu-matrix stores a `Mat3` as 12 floats with the same padding, so writing it
- * raw worked by coincidence. Here the padding is the declared layout.
+ * not 36. Two earlier paths got this right only by coincidence rather than by
+ * declaration, so it is worth stating: here the padding *is* the layout, and
+ * `stage().mat3()` hands back a buffer that already knows it. A Dense mat3
+ * (12-byte columns) written into this slot type-checks and is silently wrong.
  */
 export const ModelUniforms = StructOf({
     model: Mat4f,
@@ -231,6 +238,15 @@ export const VectorTextFrame = Mat4f;
  * offset is the fastest correct thing, and `.set()` on it copies a whole matrix
  * in one call.
  *
+ * **{@link StructStaging.mat4} is the exception, and it is the better one where
+ * it applies.** It hands back a `Mat4f` *wrapped over these very bytes*, so an
+ * out-first op (`Mat4.multiply`, `Mat4.setLookAt`, `Mat4.composeTRS`) writes
+ * its result **straight into the upload buffer** — no intermediate matrix and
+ * no `.set()` copy at all. That is what moving the renderer's math onto
+ * metis-data bought; reach for `mat4` over `f32` whenever the member is a
+ * matrix a math op produces. `f32` remains right for a matrix that arrives as
+ * loose floats, and for everything that isn't a matrix.
+ *
  * Allocate one of these per owner at construction and rewrite it in place. The
  * old `Std140Writer` did the opposite — a fresh `number[]`, a parallel
  * `string[]` of type tags, an `ArrayBuffer`, a `DataView` and a `Uint8Array` on
@@ -243,6 +259,10 @@ export interface StructStaging {
     f32(member: string, count: number): Float32Array;
     /** A `Uint32Array` over `member`, `count` elements long. */
     u32(member: string, count: number): Uint32Array;
+    /** A `Mat4f` **aliasing** `member` — write into it and the upload bytes are already correct. */
+    mat4(member: string): MatMemoryBuffer<F32Descriptor, 4>;
+    /** A std140 `Mat3f` aliasing `member` — three *vec4* columns, 48 bytes, not 36. */
+    mat3(member: string): MatMemoryBuffer<F32Descriptor, 3>;
 }
 
 /** Allocates a {@link StructStaging} for `desc`. Call once, at construction. */
@@ -252,7 +272,19 @@ export function stage(desc: { byteSize: number; offsetOf(name: string): number }
         bytes: new Uint8Array(buffer),
         f32: (member, count) => new Float32Array(buffer, desc.offsetOf(member), count),
         u32: (member, count) => new Uint32Array(buffer, desc.offsetOf(member), count),
+        mat4: (member) => wrap(Mat4f, buffer, desc.offsetOf(member)),
+        mat3: (member) => wrap(Mat3f, buffer, desc.offsetOf(member)),
     };
+}
+
+/**
+ * A `Mat4f` over an arbitrary `ArrayBuffer` at `byteOffset` — for the one
+ * layout that isn't a descriptor: the 256-byte-strided shadow render slices
+ * (see {@link SHADOW_RENDER_STRIDE}). Same zero-copy property as
+ * {@link StructStaging.mat4}.
+ */
+export function wrapMat4(buffer: ArrayBuffer, byteOffset: number): MatMemoryBuffer<F32Descriptor, 4> {
+    return wrap(Mat4f, buffer, byteOffset);
 }
 
 /**
@@ -269,11 +301,17 @@ export function stageArray(
 ): {
     bytes: Uint8Array;
     elementF32(index: number, member: string, count: number): Float32Array;
+    elementVec3(index: number, member: string): VecMemoryBuffer<F32Descriptor, 3>;
 } {
     const buffer = new ArrayBuffer(desc.byteSize);
     return {
         bytes: new Uint8Array(buffer),
         elementF32: (index, member, count) =>
             new Float32Array(buffer, desc.offsetAt(index) + element.offsetOf(member), count),
+        // Aliases the same bytes as `elementF32`, so a vec3 op can write xyz
+        // while the paired scalar in the 16-byte slot is written through the
+        // 4-element f32 view — no intermediate vector on the light loop.
+        elementVec3: (index, member) =>
+            wrap(Vec3fStorage, buffer, desc.offsetAt(index) + element.offsetOf(member)),
     };
 }

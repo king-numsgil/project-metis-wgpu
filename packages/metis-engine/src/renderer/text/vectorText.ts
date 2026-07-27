@@ -10,9 +10,10 @@ import {
     type GpuTextureView,
     VectorContext,
 } from "metis-native";
-import { mat4 } from "wgpu-matrix";
+import { Mat4 } from "metis-data";
 import type { GpuProfiler } from "../debug/gpuProfiler.ts";
-import { VectorTextFrame } from "../shading/gpuLayouts.ts";
+import type { Mat4f } from "../math/types.ts";
+import { VectorTextFrame, wrapMat4 } from "../shading/gpuLayouts.ts";
 import vectorWgsl from "./wgsl/vector.wgsl" with { type: "text" };
 
 /** Linear (not sRGB) RGBA in 0..1 — the HDR targets and the swapchain both want linear. */
@@ -57,7 +58,8 @@ export class VectorText {
     private readonly paletteStaging: Uint8Array;
     /** Persistent staging for the ortho projection (a bare mat4). */
     private readonly projectionBytes: Uint8Array;
-    private readonly projectionStaging: Float32Array;
+    /** A `Mat4f` aliasing {@link projectionBytes} — the ortho is built in place. */
+    private readonly projectionStaging: Mat4f;
     /**
      * Optional GPU profiler. Set it and this class's render pass shows up in the
      * profiler tree alongside the renderer's own passes.
@@ -150,7 +152,7 @@ export class VectorText {
         });
         const projBuffer = new ArrayBuffer(VectorTextFrame.byteSize);
         this.projectionBytes = new Uint8Array(projBuffer);
-        this.projectionStaging = new Float32Array(projBuffer, 0, 16);
+        this.projectionStaging = wrapMat4(projBuffer, 0);
         this.paletteBuffer = device.createBuffer({
             label: "metis-engine/vector-text-palette",
             size: this.paletteStride * MAX_PALETTE_COLORS,
@@ -309,7 +311,7 @@ export class VectorText {
      * persistent staging matrix rather than packing a fresh buffer per call.
      */
     private writeProjection(width: number, height: number) {
-        this.projectionStaging.set(mat4.ortho(0, width, height, 0, -1, 1) as Float32Array);
+        Mat4.setOrthographic(this.projectionStaging, 0, width, height, 0, -1, 1);
         this.device.queue.writeBuffer(this.frameBuffer, 0, this.projectionBytes);
     }
 
