@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { defineComponent } from "../component.ts";
+import { MAX_COMPONENT_TYPES } from "../archetype.ts";
+import { type ComponentDef, defineComponent } from "../component.ts";
 import { f32, u32, vec3 } from "../field.ts";
 import { World } from "../world.ts";
 
@@ -169,6 +170,91 @@ describe("archetypes and queries", () => {
         const a = w.spawnEntity("Position", "Velocity");
         w.spawnEntity("Position"); // missing Velocity
         expect([...w.queryEntities(["Position", "Velocity"])]).toEqual([a]);
+    });
+});
+
+describe("bitmask signatures", () => {
+    /**
+     * A registry holding exactly `MAX_COMPONENT_TYPES` components, with `First`
+     * at bit 0 and `Last` at bit 31 — the sign bit. Those two are declared
+     * properties so they stay precisely typed; the filler spread only
+     * contributes an index signature, which is what keeps the tests below free
+     * of casts.
+     */
+    function cappedRegistry() {
+        const filler: Record<string, ComponentDef> = {};
+        for (let i = 0; i < MAX_COMPONENT_TYPES - 2; i++) {
+            filler[`F${i}`] = defineComponent(`F${i}`, { v: f32 });
+        }
+        return {
+            First: defineComponent("First", { v: f32 }),
+            ...filler,
+            Last: defineComponent("Last", { v: f32 }),
+        };
+    }
+
+    test("the fixture really does put Last on the sign bit", () => {
+        const keys = Object.keys(cappedRegistry());
+        expect(keys).toHaveLength(MAX_COMPONENT_TYPES);
+        expect(keys.indexOf("Last")).toBe(31);
+    });
+
+    test("a registry at the cap is accepted", () => {
+        expect(() => new World(cappedRegistry())).not.toThrow();
+    });
+
+    test("a registry over the cap throws, pointing at the constant", () => {
+        const tooMany: Record<string, ComponentDef> = cappedRegistry();
+        tooMany.OneTooMany = defineComponent("OneTooMany", { v: f32 });
+        expect(() => new World(tooMany)).toThrow(/MAX_COMPONENT_TYPES/);
+    });
+
+    // The highest bit makes a mask NEGATIVE (1 << 31 === -2147483648). Mask
+    // building, archetype keying, and the (a & q) === q test all have to agree
+    // on signed int32; normalising any one of them with `>>> 0` breaks matching
+    // silently. Mutation-checked — adding `>>> 0` to makeSignatureMask fails
+    // this test and the next.
+    test("the sign-bit component (bit 31) spawns, matches, and reads back", () => {
+        const w = new World(cappedRegistry());
+        const e = w.spawnEntity("First", "Last");
+        w.getComponent(e, "Last").v = 7;
+
+        expect([...w.queryEntities(["Last"])]).toEqual([e]);
+        expect([...w.queryEntities(["First", "Last"])]).toEqual([e]);
+        expect(w.getComponent(e, "Last").v).toBe(7);
+
+        let seen = 0;
+        w.query(["Last"], (cols, count) => {
+            seen += count;
+            expect(cols.Last.v[0]).toBe(7);
+        });
+        expect(seen).toBe(1);
+    });
+
+    test("a query for the sign-bit component does not match archetypes lacking it", () => {
+        const w = new World(cappedRegistry());
+        w.spawnEntity("First"); // no bit 31
+        const withLast = w.spawnEntity("First", "Last");
+        expect([...w.queryEntities(["Last"])]).toEqual([withLast]);
+    });
+
+    // OR is idempotent, so a duplicated name collapses. The old sorted-string
+    // key produced "Position,Position" — a second, distinct archetype.
+    test("duplicate component names resolve to the same archetype", () => {
+        const w = makeWorld();
+        w.spawnEntity("Position", "Position");
+        w.spawnEntity("Position");
+        expect(w.archetypeCount).toBe(1);
+        expect(w.entityCount).toBe(2);
+    });
+
+    test("querying an unregistered component throws instead of matching nothing", () => {
+        const w = makeWorld();
+        w.spawnEntity("Position");
+        // @ts-expect-error — "Nope" is not a registered component
+        expect(() => w.query(["Nope"], () => {})).toThrow(/not registered/);
+        // @ts-expect-error — generators throw on first next()
+        expect(() => [...w.queryEntities(["Nope"])]).toThrow(/not registered/);
     });
 });
 

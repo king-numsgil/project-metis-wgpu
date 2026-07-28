@@ -959,7 +959,7 @@ Scalars `f32 f64 i32 u32 i16 u16 i8 u8` (each → its TypedArray) and vectors
 defineComponent<S>(name: string, schema: S): ComponentDef<S>   // schema = Record<field, f32 | vec3(f32) | …>
 
 class World<R extends Registry> {                              // R = Record<name, ComponentDef>
-    constructor(registry: R)
+    constructor(registry: R)                                    // throws if registry has > MAX_COMPONENT_TYPES (32)
     get entityCount(): number;  get archetypeCount(): number;
     spawnEntity(...componentNames: (keyof R & string)[]): EntityId;   // fields zero-initialised
     despawnEntity(id: EntityId): void;
@@ -976,6 +976,34 @@ a vec field is `{ x, y, z }` typed arrays (`cols.Position.pos.x[i]`). **Do not
 spawn/despawn while a `query` is running** — structural changes reallocate/reorder
 the current archetype's columns and rows.
 
+Passing a name that isn't in the registry **throws** (`spawnEntity`, `query`, and
+`queryEntities` alike) rather than quietly matching nothing. TypeScript already
+rejects it at compile time; the throw catches the `as never` escape hatches.
+
+### Component signatures are bitmasks — `MAX_COMPONENT_TYPES = 32`
+
+An archetype's component set is a **32-bit mask**, one bit per component in the
+registry, assigned once in the `World` constructor. Matching is
+`(archetypeMask & wantedMask) === wantedMask`.
+
+**A `World` therefore cannot register more than 32 component types**, and its
+constructor throws with a message pointing at `MAX_COMPONENT_TYPES` in
+`ecs/archetype.ts` if you try. This is a real ceiling, not a tunable constant —
+raising it means multi-word masks. See CLAUDE.md "The 32-component ceiling" for
+what that change involves and why 32 was accepted for now.
+
+```ts
+import { MAX_COMPONENT_TYPES } from "metis-engine/ecs";   // 32
+```
+
+Two consequences worth knowing:
+
+- **`spawnEntity("A", "A")` is the same archetype as `spawnEntity("A")`** — OR is
+  idempotent. The previous string key made those two *different* archetypes.
+- `Archetype.mask` is the identity; `Archetype.signatureKey` still exists as the
+  human-readable `"Position,Velocity"` form, and is **display only** — for error
+  messages and `inspectWorld` (which also reports `mask`). Never match or key on it.
+
 ### Debug helpers (`debug.ts`)
 
 `inspectWorld(world)` / `printWorldInfo(world)` — per-archetype entity counts,
@@ -983,12 +1011,50 @@ capacity, and the per-component column layout (field, kind, axis count,
 bytes/entity). `src/ecs/test.ts` is a manual smoke script (`bun run src/ecs/test.ts`);
 `src/ecs/test/ecs.test.ts` is the automated `bun test` suite.
 
+### Benchmark (`bun run bench:ecs`)
+
+`bench/ecs.ts` — pure-CPU stress benchmark, no GPU or window. Sections: **A**
+iteration vs. a hand-written typed-array loop, **B** access shape, **C** spawn /
+despawn / churn (with an in-bench decomposition of one `spawnEntity`), **D**
+per-query dispatch as archetype count grows, **E** memory footprint and whether
+churn leaks, **F** a realistic multi-system tick against a 60 Hz budget.
+
+```
+bun run bench:ecs                  # full sweep
+bun run bench:ecs --quick          # fewer trials, smaller sizes
+bun run bench:ecs --only A,C       # selected sections
+bun run bench:ecs --trials 9 --min-ms 250
+```
+
+Every number is a median over `--trials` trials, each auto-calibrated to run at
+least `--min-ms`. **Don't lower `--min-ms` much** — a trial shorter than a few
+tens of milliseconds measures JIT warmup rather than the code, precisely and
+wrongly. See CLAUDE.md "What the ECS actually costs" for what the results mean.
+
+`bun run bench:ecs-dispatch` (`bench/ecsDispatch.ts`) is a companion that
+decomposes `query`'s per-archetype dispatch into matching vs. per-call object
+construction, and measures **candidate implementations that do not exist yet**
+(inline bitmask matching, cached query plans). It's a design-decision aid, not a
+regression test for shipped code — see CLAUDE.md for the two ways it has already
+produced a wrong answer.
+
+### Performance rules that follow from it
+
+| Do | Don't |
+|---|---|
+| `query` for anything per-frame — it reaches the raw typed-array ceiling | `queryEntities` + `getComponent` in a loop: ~2 orders of magnitude slower, and it *looks* like a query |
+| `getComponent` for one-off random access on a handle you hold | `getComponent` inside a per-frame sweep |
+| Despawn in bulk **back to front** (a pop) | Bulk despawn front to back (~3x — swap-with-last copies every column each time) |
+| Treat spawn/despawn as expensive relative to touching data (~2 orders of magnitude), and batch it | Spawn per-entity in an inner loop and assume it's near-free because the data is small |
+| Keep the archetype count modest — dispatch is per-archetype and is paid even by archetypes that don't match | Give every entity a unique tag component; a fragmented world costs per query, per system, per frame |
+
 ### Sharp edges (current, deliberate)
 
 | Thing | State |
 |---|---|
 | `EntityId` | a bare incrementing `number` — **no generation tag**; not reused today (no free list), but that's not a safety guarantee. |
 | `query` / `queryEntities` | match archetypes that are a **superset** of the requested names. **No `Without`/exclusion** filter yet. |
+| Component count | hard cap of `MAX_COMPONENT_TYPES` (**32**) per `World` — the signature is one int32 mask. Constructor throws past it. |
 | `despawnEntity` | swap-with-last, so an entity's dense row index is **not stable** across despawns (columns get reordered). |
 | Buffers | each column doubles on overflow (`INITIAL_CAPACITY = 32`); no shrink. |
 | Hierarchy / systems | none — no `ChildOf`/`Children`, no transform propagation, no scheduler. |

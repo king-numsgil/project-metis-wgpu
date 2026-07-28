@@ -1,4 +1,11 @@
-import { Archetype, type EntityId, makeSignatureKey, type SignatureKey } from "./archetype.ts";
+import {
+    Archetype,
+    type ComponentBits,
+    type EntityId,
+    makeSignatureMask,
+    MAX_COMPONENT_TYPES,
+    type SignatureMask,
+} from "./archetype.ts";
 import type { ComponentDef, Registry, SchemaOf } from "./component.ts";
 import type { ComponentAccessor, ComponentColumns } from "./field.ts";
 
@@ -31,13 +38,37 @@ export type QueryColumns<R extends Registry, Names extends readonly (keyof R)[]>
  */
 export class World<R extends Registry> {
     private readonly registry: R;
-    private readonly archetypes = new Map<SignatureKey, Archetype>();
-    private readonly entityArchetype = new Map<EntityId, SignatureKey>();
+    private readonly archetypes = new Map<SignatureMask, Archetype>();
+    private readonly entityArchetype = new Map<EntityId, SignatureMask>();
+    /** Registry key -> bit index. Fixed at construction; the registry can't grow. */
+    private readonly bits: ComponentBits;
+    /** Bit index -> registry key, for rebuilding a component set from a mask. */
+    private readonly namesByBit: readonly string[];
     private nextEntityId: EntityId = 0;
 
-    /** @param registry every component this world can spawn, keyed by component name. */
+    /**
+     * @param registry every component this world can spawn, keyed by component name.
+     * @throws if the registry holds more than {@link MAX_COMPONENT_TYPES} components.
+     */
     constructor(registry: R) {
         this.registry = registry;
+        // Bit indices are assigned once, here, because the registry is fixed at
+        // construction — that's what makes a bitmask signature possible at all.
+        const names = Object.keys(registry);
+        if (names.length > MAX_COMPONENT_TYPES) {
+            throw new Error(
+                `World registry has ${names.length} components, but an archetype signature is a ` +
+                    `single int32 bitmask, so at most ${MAX_COMPONENT_TYPES} are supported. Widening ` +
+                    `this is a real change, not a constant bump — see MAX_COMPONENT_TYPES in ` +
+                    `ecs/archetype.ts and CLAUDE.md "The 32-component ceiling".`,
+            );
+        }
+        const bits = new Map<string, number>();
+        for (let i = 0; i < names.length; i++) {
+            bits.set(names[i]!, i);
+        }
+        this.bits = bits;
+        this.namesByBit = names;
     }
 
     /** Live entities across every archetype. */
@@ -57,10 +88,11 @@ export class World<R extends Registry> {
      * @throws if any name isn't in the registry.
      */
     spawnEntity(...componentNames: Array<keyof R & string>): EntityId {
-        const archetype = this.getOrCreateArchetype(componentNames);
+        const mask = makeSignatureMask(this.bits, componentNames);
+        const archetype = this.getOrCreateArchetype(mask);
         const entityId = this.nextEntityId++;
         archetype.addEntity(entityId);
-        this.entityArchetype.set(entityId, archetype.signatureKey);
+        this.entityArchetype.set(entityId, mask);
         return entityId;
     }
 
@@ -112,8 +144,9 @@ export class World<R extends Registry> {
         componentNames: Names,
         run: (columns: QueryColumns<R, Names>, count: number, entityIds: readonly EntityId[]) => void,
     ): void {
+        const wanted = makeSignatureMask(this.bits, componentNames);
         for (const archetype of this.archetypes.values()) {
-            if (!this.archetypeHasAll(archetype, componentNames)) {
+            if ((archetype.mask & wanted) !== wanted) {
                 continue;
             }
             const all = archetype.columns;
@@ -135,8 +168,9 @@ export class World<R extends Registry> {
      * access. Use `query` for that.
      */
     *queryEntities(componentNames: Array<keyof R & string>): IterableIterator<EntityId> {
+        const wanted = makeSignatureMask(this.bits, componentNames);
         for (const archetype of this.archetypes.values()) {
-            if (this.archetypeHasAll(archetype, componentNames)) {
+            if ((archetype.mask & wanted) === wanted) {
                 yield* archetype.entityIds;
             }
         }
@@ -148,45 +182,37 @@ export class World<R extends Registry> {
     }
 
     private archetypeOf(entityId: EntityId): Archetype {
-        const key = this.entityArchetype.get(entityId);
-        if (key === undefined) {
+        const mask = this.entityArchetype.get(entityId);
+        if (mask === undefined) {
             throw new Error(`Entity ${entityId} does not exist`);
         }
-        const archetype = this.archetypes.get(key);
+        const archetype = this.archetypes.get(mask);
         if (archetype === undefined) {
-            throw new Error(`Archetype "${key}" not found`);
+            throw new Error(`Archetype for mask ${mask} not found`);
         }
         return archetype;
     }
 
-    private archetypeHasAll(archetype: Archetype, names: readonly string[]): boolean {
-        const present = archetype.componentNames;
-        for (const name of names) {
-            if (!present.includes(name)) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    private getOrCreateArchetype(componentNames: Array<keyof R & string>): Archetype {
-        const key = makeSignatureKey(componentNames);
-        const existing = this.archetypes.get(key);
+    private getOrCreateArchetype(mask: SignatureMask): Archetype {
+        const existing = this.archetypes.get(mask);
         if (existing !== undefined) {
             return existing;
         }
 
+        // Rebuild the component set from the mask rather than from the caller's
+        // argument list, so an archetype's defs always agree with the mask that
+        // keys it — and so duplicate names (`spawn("Position", "Position")`)
+        // resolve to the same archetype as the deduplicated set, which the old
+        // string key silently did not.
         const defs: ComponentDef[] = [];
-        for (const name of componentNames) {
-            const def = this.registry[name];
-            if (def === undefined) {
-                throw new Error(`Component "${name}" is not registered in this World`);
+        for (let bit = 0; bit < this.namesByBit.length; bit++) {
+            if ((mask & (1 << bit)) !== 0) {
+                defs.push(this.registry[this.namesByBit[bit]!]!);
             }
-            defs.push(def);
         }
 
-        const archetype = new Archetype(key, defs);
-        this.archetypes.set(key, archetype);
+        const archetype = new Archetype(mask, defs);
+        this.archetypes.set(mask, archetype);
         return archetype;
     }
 }

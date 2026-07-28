@@ -13,7 +13,9 @@
         "demo:exterior": "bun run examples/exterior-demo.ts",
         "demo:interior": "bun run examples/interior-demo.ts",
         "demo:spots": "bun run examples/spots-demo.ts",
-        "bench:lights": "bun run bench/lights.ts"
+        "bench:lights": "bun run bench/lights.ts",
+        "bench:ecs": "bun run bench/ecs.ts",
+        "bench:ecs-dispatch": "bun run bench/ecsDispatch.ts"
     },
     "devDependencies": {
         "@types/bun": "latest"

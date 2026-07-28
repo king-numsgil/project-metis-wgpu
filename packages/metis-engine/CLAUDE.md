@@ -64,6 +64,11 @@ bun run demo:spots      # spot-shadow visual test (L toggles shadows, Space paus
 # Standalone VectorContext (text rendering) smoke test
 bun run test/vectorText.smoke.ts
 
+# ECS stress benchmark (pure CPU — no GPU, no window). See "What the ECS
+# actually costs" below before reading its output.
+bun run bench:ecs
+bun run bench:ecs --quick --only A,C
+
 # Type-check this package (or `cd ../.. && bunx tsc --noEmit` for the whole monorepo)
 bunx tsc --noEmit
 ```
@@ -170,7 +175,8 @@ so the sim can be modelled as entities/components; the renderer still consumes a
 hand-built `Scene`, and nothing extracts one from the other yet.
 
 **Storage model: archetype + Structure-of-Arrays (SoA).** Entities with the *same
-set of component names* share an `Archetype`. Within one, each component field is
+set of component names* share an `Archetype`, identified by a **32-bit signature
+mask** (see "The 32-component ceiling" below). Within one, each component field is
 stored as its **own typed-array column** indexed by a dense row — a scalar field
 is one column, a vec field is one column *per axis* (`x`/`y`/`z`/`w`). So a system
 touches data as a bare `column[row]` index: cache-friendly, fully typed, no
@@ -210,6 +216,169 @@ matches archetypes that are a *superset* of the requested names — there is no
 `Without`); a **hierarchy** (`ChildOf`/`Children` components) or transform
 propagation; and any **system/scheduler** layer. Don't document these as if they
 exist.
+
+### The 32-component ceiling — the known limit, and where to look when it bites
+
+An archetype's component set is a **signed int32 bitmask** (`SignatureMask` in
+`ecs/archetype.ts`), one bit per component in the `World`'s registry, assigned
+once in the constructor because the registry is fixed there. Matching is
+`(archetypeMask & wantedMask) === wantedMask`; set equality is a number
+comparison. This replaced a sorted-and-joined string key that was re-derived on
+every `spawnEntity` call — bitwise OR is inherently order-independent, so the
+sort that key existed to fake comes free.
+
+**`MAX_COMPONENT_TYPES` is 32, and `new World(...)` throws past it.** This is a
+real ceiling, not a tunable constant, and it is written down here because *we do
+not yet know whether a real game fits under it*. There is no game, so there is no
+evidence either way; 32 was accepted because it is the simple, fast case and
+because the failure mode is a loud throw at construction rather than anything
+subtle. A mature ECS with a full sim (flecs-scale) routinely carries 100+
+component types, so **assume this will need widening eventually.**
+
+**When it blows up, this is the change.** The throw names the constant and points
+here. Widening means multi-word masks:
+
+- `SignatureMask` becomes a small `Uint32Array` (or a `[lo, hi]` pair for 64),
+  and `makeSignatureMask` plus the two `(a & q) === q` tests in `World` loop over
+  words.
+- `World.archetypes` can no longer be a `Map` keyed by a bare number. Options, in
+  the order worth trying: a hashed numeric key with a short collision list; or a
+  plain linear scan over the (few) archetypes comparing word-wise, which is
+  likely fine since archetype counts are small and the comparison is a couple of
+  ANDs. **Do not reach for `BigInt` keys** — they're heap-allocated and this is
+  the spawn hot path, which is the whole reason the string key was removed.
+- Keep the one-word fast path. Most worlds will stay under 32, and the two-word
+  case shouldn't tax the common one.
+
+**Masks are signed int32 and must stay that way.** `|` and `&` both yield signed
+int32, so bit 31 makes a mask negative. That is fine as long as *nothing*
+normalises with `>>> 0`: an unsigned wanted-mask compared against a signed
+`a & b` result is never equal, and the failure is silent — queries just quietly
+stop matching the 32nd component. `src/ecs/test/ecs.test.ts` pins this with a
+registry whose last component sits on bit 31, and it is **mutation-checked**:
+adding `>>> 0` to `makeSignatureMask` fails both sign-bit tests. Per this
+package's history with `clusterNear.test.ts`, that check is the point — a passing
+test here proves nothing until it has been seen failing for the right reason.
+
+One free behavioural change worth knowing: `spawnEntity("A", "A")` now resolves
+to the same archetype as `spawnEntity("A")`, because OR is idempotent. The string
+key made those two *different* archetypes, which was a latent bug nobody had hit.
+
+### What the ECS actually costs — iteration is free, structure is not
+
+Re-measure with **`bun run bench:ecs`** (`bench/ecs.ts`; pure CPU, no GPU or
+window). It is sectioned — `--only A,C` to narrow, `--quick` for a fast pass,
+`--trials N` for a tighter median. Per this file's no-numbers rule the findings
+below are stated structurally; the bench prints the numbers.
+
+**The SoA design claim holds, and section A is the proof.** `World.query` runs at
+the speed of the equivalent hand-written typed-array loop — the bench measures
+that ceiling in the same process, on the same data, rather than against a
+remembered figure. There is nothing left to win in the iteration path, so don't
+go looking there.
+
+**`getComponent` is ~two orders of magnitude slower per field access, and that is
+by construction.** Every read resolves through a property getter → `Map.get(entityId)`
+→ array index, per axis, so it survives column growth and despawn swaps. That
+robustness is exactly what makes it unfit for a per-frame loop. **The trap is
+`queryEntities` + `getComponent`**: it reads like a query, and it is the accessor
+path at full price. If a system walks entities, it uses `query`.
+
+**Structural change still costs far more than touching an entity's data, and
+most of it isn't the data.** Section C decomposes one `spawnEntity` in-bench (the
+`isolate:` rows), so the attribution doesn't rest on a profiler that was run once
+and thrown away. As it stands:
+
+- Two `Map.set`s (`World.entityArchetype`, `Archetype.rowOfEntity`) are now the
+  **largest** slice by a wide margin.
+- `addEntity`'s row zeroing (a nested-Map walk per spawn) is second.
+- `makeSignatureMask` — the mask OR — is nearly free, roughly a twentieth of what
+  the string key it replaced cost.
+- The component data itself — the actual float stores — is noise.
+
+**What already landed: the signature bitmask.** `makeSignatureKey` used to
+re-derive `[...names].sort().join(",")` on **every** `spawnEntity` call, and it
+was the single largest slice of a spawn — larger than everything the archetype
+itself did, for a value that is a pure function of the component-name set.
+Replacing it with an int32 mask (see "The 32-component ceiling") roughly halved
+spawn across every component count and cut churn measurably. The `isolate:` rows
+keep the old string key as a standing A/B so the win doesn't have to be taken on
+faith.
+
+**What's left, and deliberately not done.** The two `Map`s want to be a sparse
+set, which also fixes the memory finding below and wants entity-id recycling and
+generation tags alongside it. That's a change to what an `EntityId` *means*, not
+a micro-optimization — see the note at the end of this section. Nothing consumes
+the ECS yet, so the pure-performance half can wait; optimizing against a guessed
+workload is what the renderer's own history warns about.
+
+**Despawn order matters ~3x.** Swap-with-last makes back-to-front removal a pop
+and front-to-back removal a full column copy every time. Bulk despawns should
+walk backwards.
+
+**Query dispatch is per-archetype, not per-entity, and is paid whether the
+archetype matches or not.** So the pathological case is a *fragmented* world —
+many archetypes holding few entities each — not a large one.
+
+`bun run bench:ecs-dispatch` (`bench/ecsDispatch.ts`) decomposes it against
+*candidate* implementations that don't exist yet, so a design choice here starts
+from measurement. Roughly, per archetype visited: the bare iteration floor is
+small, `archetypeHasAll`'s linear `includes` scan is about a quarter, and
+**building the per-call `picked` object is the largest single item — over half**.
+Two consequences:
+
+- **The bitmask signature (landed) was a real but partial fix for `query`.** It
+  removed the matching quarter and nothing else; the `picked` half is untouched
+  by faster matching. The bench confirms it end-to-end: `World.query` as shipped
+  now measures the same per-archetype cost as the bench's inline-mask variant,
+  where it used to match the `includes` variant. Its much bigger payoff was on
+  the *spawn* path — that was the reason to do it, not this.
+- **The `picked` half needs a cached query plan** (matching archetypes + their
+  prebuilt column objects, invalidated by an archetype-creation counter). Still
+  **not done**. It does *not* require a new public API: the mask now gives a
+  cheap numeric key the plan can be looked up by inside the existing
+  `query(names, fn)`, which was always the real synergy between the two changes.
+
+**Two traps the bench exists to document, both of which produced wrong answers
+first:**
+
+- **A mask kept in a side `Map<Archetype, …>` measured ~8x SLOWER than the string
+  `includes` it replaced** — object-keyed hash plus a heap indirection per
+  archetype, per query. The mask has to be a plain number field *on* the
+  archetype record or it is worse than useless.
+- **"Just pass `archetype.columns` instead of building `picked`" is not the free
+  win it looks like.** The archetype's cached view has a *different shape per
+  archetype* (its own component set), so the callback's `cols.Position` access
+  goes megamorphic and gives back over half of what skipping the allocation
+  saved. A cached `picked` wins because every archetype's copy has the *same*
+  shape. Shape consistency is the load-bearing property, not the allocation
+  count. (An earlier note here said reading through `cols` costs nothing; that
+  was measured against the shipped code, where the shape *is* consistent, and it
+  does not generalise to handing the callback the wider view.)
+
+**Memory: the bookkeeping dwarfs the columns.** Per entity, the `Map`s and the
+dense id array cost several times what the component columns do — the SoA storage
+is genuinely compact and the handle machinery around it is not. Same fix list as
+the spawn cost, same reason for not doing it yet.
+
+**Churn does not leak, and getting that answer right needed the right
+measurement.** A single force-GC / churn / force-GC delta reports a large
+retained step and reads as a leak. It isn't: the `Map`s take **one** step up when
+deletions start leaving tombstones and then plateau, and a rehash *transiently*
+allocates a second table, so a one-shot delta can land on the step, the
+transient, or both. Section E therefore measures across repeated rounds and looks
+for a plateau. If that number ever moves, re-measure it the same way before
+calling it a regression — and note the transient peak is real, so churn-heavy
+frames carry a GC spike even though nothing leaks.
+
+**The methodology mistake worth not repeating.** The first pass at the
+archetype-scaling probe ran a fixed 200 repetitions per trial, which came to a
+fraction of a millisecond — below the point where the JIT settles — and produced
+per-archetype costs several times too high *plus* a large fixed per-query cost
+that does not exist. The bench calibrates every trial to a minimum wall time for
+exactly this reason. **A microbenchmark whose trial is under a few tens of
+milliseconds is measuring the tier-up, not the code**, and it will look precise
+while doing it.
 
 ### The engine does not own the window — `RenderContext` is a convenience
 

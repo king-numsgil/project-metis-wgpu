@@ -9,12 +9,58 @@ import { AXES, type EcsTypedArray, type FieldType } from "./field.ts";
  */
 export type EntityId = number;
 
-/** Identifies an archetype by its component set — see {@link makeSignatureKey}. */
-export type SignatureKey = string;
+/**
+ * An archetype's component set as a **bitmask**, one bit per component
+ * registered with the {@link World} — so "does this archetype have all of
+ * these?" is `(archetypeMask & wantedMask) === wantedMask`, and set equality is
+ * a plain number comparison.
+ *
+ * This replaced a sorted-and-joined string key, which was re-derived on **every**
+ * `spawnEntity` call and measured as the single largest slice of a spawn
+ * (`bun run bench:ecs`, section C). Bitwise OR is inherently order-independent,
+ * so the sort that key needed exists here for free.
+ *
+ * **Masks are signed int32 and must stay that way.** `|` and `&` both produce
+ * signed int32, so bit 31 makes a mask negative — which is fine as long as
+ * nothing normalises with `>>> 0`. Mixing the two silently breaks matching: an
+ * unsigned wanted-mask compared against a signed `a & b` result is never equal.
+ * Don't "clean up" the sign.
+ */
+export type SignatureMask = number;
 
-/** Canonical key for a set of component names (order-independent). */
-export function makeSignatureKey(names: string[]): SignatureKey {
-    return [...names].sort().join(",");
+/**
+ * The most component types one {@link World} may register, because
+ * {@link SignatureMask} is a single int32.
+ *
+ * **If a real game hits this, this is the place to look.** Widening it means
+ * multi-word masks: `SignatureMask` becomes a small `Uint32Array` (or a
+ * `[lo, hi]` pair), {@link makeSignatureMask} and the `(a & q) === q` test in
+ * `World` loop over words, and `World.archetypes` can no longer be keyed by a
+ * bare number — it needs a hashed key with a collision list, or a linear scan
+ * over the (few) archetypes comparing word-wise. See CLAUDE.md, "The
+ * 32-component ceiling", for the full note and why 32 was chosen anyway.
+ */
+export const MAX_COMPONENT_TYPES = 32;
+
+/** Component name -> bit index, assigned once per {@link World} from its registry. */
+export type ComponentBits = ReadonlyMap<string, number>;
+
+/**
+ * OR the named components into a signature mask. Order-independent and
+ * duplicate-tolerant by construction.
+ *
+ * @throws if any name has no bit — i.e. isn't registered in this World.
+ */
+export function makeSignatureMask(bits: ComponentBits, names: readonly string[]): SignatureMask {
+    let mask = 0;
+    for (let i = 0; i < names.length; i++) {
+        const bit = bits.get(names[i]!);
+        if (bit === undefined) {
+            throw new Error(`Component "${names[i]}" is not registered in this World`);
+        }
+        mask |= 1 << bit;
+    }
+    return mask;
 }
 
 const INITIAL_CAPACITY = 32;
@@ -40,9 +86,18 @@ export type ColumnsView = Record<string, ComponentView>;
  * handle across despawns; the `EntityId -> row` map is the stable lookup.
  */
 export class Archetype {
-    /** This archetype's component set, canonicalised — see {@link makeSignatureKey}. */
-    readonly signatureKey: SignatureKey;
-    /** The components every entity here has, in the order they were registered. */
+    /**
+     * This archetype's component set as a bitmask — the identity `World` keys
+     * it by and matches queries against. See {@link SignatureMask}.
+     */
+    readonly mask: SignatureMask;
+    /**
+     * Human-readable form of {@link mask} (`"Position,Velocity"`), built once at
+     * construction for error messages and the debug inspector. **Display only** —
+     * never match or key on it; that's what `mask` is for.
+     */
+    readonly signatureKey: string;
+    /** The components every entity here has, in registry (bit-index) order. */
     readonly componentNames: readonly string[];
 
     private _capacity = INITIAL_CAPACITY;
@@ -53,9 +108,10 @@ export class Archetype {
     private readonly store = new Map<string, Map<string, FieldColumn>>();
     private columnsView: ColumnsView = {};
 
-    constructor(signatureKey: SignatureKey, defs: readonly ComponentDef[]) {
-        this.signatureKey = signatureKey;
+    constructor(mask: SignatureMask, defs: readonly ComponentDef[]) {
+        this.mask = mask;
         this.componentNames = defs.map((d) => d.name);
+        this.signatureKey = [...this.componentNames].sort().join(",");
 
         for (const def of defs) {
             const fields = new Map<string, FieldColumn>();

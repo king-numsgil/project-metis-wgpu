@@ -13,8 +13,10 @@ import type { World } from "./world.ts";
 
 /** One archetype's storage layout and occupancy — see {@link inspectArchetype}. */
 export interface ArchetypeInfo {
-    /** The archetype's canonical component set, e.g. `"Position,Velocity"`. */
+    /** The archetype's component set, human-readable, e.g. `"Position,Velocity"`. */
     readonly signatureKey: string;
+    /** The signature bitmask `World` actually matches on — check this when a query matches the wrong set. */
+    readonly mask: number;
     /** Live entities (dense rows in use). */
     readonly entityCount: number;
     /** Rows the columns can currently hold before the next doubling. */
@@ -33,6 +35,7 @@ export function inspectArchetype(archetype: Archetype): ArchetypeInfo {
     const perEntity = archetype.count > 0 ? archetype.allocatedBytes / archetype.capacity : 0;
     return {
         signatureKey: archetype.signatureKey,
+        mask: archetype.mask,
         entityCount: archetype.count,
         capacity: archetype.capacity,
         allocatedBytes: archetype.allocatedBytes,
@@ -73,7 +76,7 @@ export function printWorldInfo<R extends Registry>(world: World<R>): void {
         const pct = arch.allocatedBytes > 0
             ? ((arch.usedBytes / arch.allocatedBytes) * 100).toFixed(1)
             : "0.0";
-        console.log(`\n  Archetype [${arch.signatureKey}]`);
+        console.log(`\n  Archetype [${arch.signatureKey}]  mask 0b${(arch.mask >>> 0).toString(2)}`);
         console.log(`    Entities : ${arch.entityCount} / ${arch.capacity} (${pct}% of buffers used)`);
         console.log(`    Columns  : ${arch.usedBytes} / ${arch.allocatedBytes} bytes`);
         for (const [comp, fields] of Object.entries(arch.components)) {
