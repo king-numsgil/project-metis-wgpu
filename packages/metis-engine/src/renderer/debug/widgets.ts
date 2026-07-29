@@ -506,11 +506,57 @@ export class DebugOverlay {
  * A span that *is* the whole frame (the `"GPU frame"` root) is drawn neutral:
  * it's 100% by definition, and grading it red would flag the total as a problem
  * on every frame.
+ *
+ * ## Sibling spans sharing a label are merged
+ *
+ * Per-draw zones are labelled by `mesh.label`, so a scene that draws one mesh
+ * many times produces that many identical sibling rows — 100 rows reading
+ * `light-bulb` in `demo:helmet`, which pushes every pass that matters off the
+ * panel. Those rows are merged into one showing the **summed** time and a
+ * `xN` count.
+ *
+ * Merging is unconditional and by label, which is exactly the right key: two
+ * instances share a label only if they share a `Mesh`, and when they do there is
+ * nothing to tell their rows apart anyway. Instances with no `mesh.label` fall
+ * back to `instance N` in the renderer, which is unique per draw, so those stay
+ * separate — as they should, being unidentifiable otherwise.
+ *
+ * **What this costs:** one pathologically slow draw among many hides inside the
+ * sum. If you are hunting that, read `GpuProfiler.spans` directly — it is left
+ * untouched, and this merge is display-only.
  */
 export function profileSpansToRows(spans: readonly ProfileSpan[], totalMs: number): TreeRow[] {
     const total = totalMs > 0 ? totalMs : 1;
-    const convert = (s: ProfileSpan): TreeRow => {
-        const fraction = s.gpuMs / total;
+
+    /** Sum siblings by label, keeping first-appearance order. */
+    const merge = (list: readonly ProfileSpan[]): {span: ProfileSpan; count: number}[] => {
+        const out: {span: ProfileSpan; count: number}[] = [];
+        const byLabel = new Map<string, number>();
+        for (const s of list) {
+            const at = byLabel.get(s.label);
+            if (at === undefined) {
+                byLabel.set(s.label, out.length);
+                // Copied, not aliased: accumulating into the caller's span would
+                // corrupt `GpuProfiler.spans` for anyone reading it after this.
+                out.push({span: {...s, children: [...s.children]}, count: 1});
+                continue;
+            }
+            const entry = out[at]!;
+            entry.span = {
+                ...entry.span,
+                gpuMs: entry.span.gpuMs + s.gpuMs,
+                // Children of merged siblings pool together and are merged in
+                // turn by the recursion below, so a repeated sub-zone collapses
+                // the same way its parent did.
+                children: [...entry.span.children, ...s.children],
+            };
+            entry.count++;
+        }
+        return out;
+    };
+
+    const convert = ({span, count}: {span: ProfileSpan; count: number}): TreeRow => {
+        const fraction = span.gpuMs / total;
         const color =
             fraction >= 0.999
                 ? DEBUG_THEME.text
@@ -520,12 +566,12 @@ export function profileSpansToRows(spans: readonly ProfileSpan[], totalMs: numbe
                     ? DEBUG_THEME.warn
                     : DEBUG_THEME.good;
         return {
-            label: s.label,
-            value: `${s.gpuMs.toFixed(3)} ms`,
+            label: count > 1 ? `${span.label} x${count}` : span.label,
+            value: `${span.gpuMs.toFixed(3)} ms`,
             fraction,
             color,
-            children: s.children.map(convert),
+            children: merge(span.children).map(convert),
         };
     };
-    return spans.map(convert);
+    return merge(spans).map(convert);
 }

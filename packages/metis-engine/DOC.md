@@ -916,6 +916,14 @@ validation error, which this binding only prints to stderr.
 grading each span green -> amber -> red by its share of the frame (a span that
 *is* the whole frame stays neutral).
 
+**Sibling spans sharing a label are merged into one row** showing the summed time
+and an `xN` count — a scene drawing one mesh 100 times produces 100 identical
+`light-bulb` rows otherwise, which pushes every pass that matters off the panel.
+The key is the label, so rows merge exactly when the draws share a `Mesh` and are
+therefore indistinguishable anyway; instances with no `mesh.label` get a unique
+`instance N` and stay separate. It is **display-only** — `GpuProfiler.spans` is
+untouched, so read that directly if you are hunting one slow draw among many.
+
 ---
 
 ## 11. Commands
@@ -923,6 +931,7 @@ grading each span green -> amber -> red by its share of the frame (a span that
 ```powershell
 bun run fixture          # headless render + screenshot validation -> test/output/*.png
 bun run demo:exterior    # interactive; WASD+QE fly, arrows look, P profiler, Esc quit
+bun run demo:helmet      # glTF + 100 lights + full shadow stack; arrows orbit, W/S dolly
 bun run demo:interior    # + O cycles AO technique
 bun run demo:spots       # spot-shadow visual test: 4 coloured orbiting casters
                          #   L toggles shadows (the A/B), Space pauses the orbit

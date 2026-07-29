@@ -1299,6 +1299,13 @@ engine, which is why they are here rather than only in the file's comments.
   ones shading the helmet; the other ninety are scattered across the deck. That
   split also makes the `-` key well-behaved — thinning the field never unlights
   the subject, because the inner lights are first in the array.
+
+  Note the asymmetry in how `-` deactivates: **lights are parked, bulbs are
+  removed.** `scene.lights`'s order is load-bearing (it decides which spot owns
+  which shadow layer), so a deactivated light is moved 10 km down — outside every
+  cluster, one sphere test. `scene.instances` has no ordering rule, so a
+  deactivated bulb is spliced out of it. Parking the bulb too was the original
+  code and was a bug; see the profiler-tree section below for how it surfaced.
 - **Auto-exposure was the actual problem, not the lights.** Half the frame is
   black sky, which drags the metered average down, which makes the exposure
   *rise* until the lit half is white and every bulb clips. Dimming the lights
@@ -1344,6 +1351,50 @@ performs.
 This closes a gap this file previously listed as a known limitation. It does
 **not** address the other half of that entry: there is still no per-cascade
 frustum culling, so every caster is redrawn for every cascade.
+
+### The profiler tree merges repeated draw rows, and that is a display choice
+
+`profileSpansToRows` sums sibling spans that share a label into one `xN` row.
+It exists because `demo:helmet` draws 100 identical bulb meshes and produced 100
+rows reading `light-bulb`, which pushed every pass worth looking at off the
+panel — the widget was unusable on exactly the scene it was most needed for.
+
+Two properties make the merge safe rather than lossy-by-default:
+
+- **The key is the label, and the label is `mesh.label`.** Two draws share one
+  only if they share a `Mesh`, and when they do their rows are indistinguishable
+  anyway. Instances without a label fall back to `instance N` in
+  `clusteredForwardRenderer.ts`, which is unique per draw, so those correctly
+  stay separate.
+- **It is display-only.** `GpuProfiler.spans` is the measurement and is left
+  exactly as recorded; the merge copies rather than accumulating into it. One
+  pathologically slow draw among many *does* hide inside the sum — read the raw
+  spans when hunting that.
+
+**The `xN` count immediately earned its keep by exposing a bug**, and the shape
+of that is worth keeping. `demo:helmet`'s `-` key reported 25 lights while the
+tree kept reading `light-bulb x100` — which looked like the merge miscounting and
+was the merge being *honest*: deactivated bulbs were parked far below the deck
+rather than removed from `scene.instances`, so all 100 were still being drawn.
+**Off-screen is not undrawn** — there is no frustum culling in the forward pass —
+and the waste was invisible both on screen and in the frame time, because a bulb
+behind the camera rasterises nothing. A count of draws is a claim nothing else in
+the HUD makes, which is exactly why it caught something nothing else could.
+
+**This did not fix, and was not meant to fix, the query budget.** `MAX_QUERIES`
+is 256 and each span costs two, so `demo:helmet` sits around 240 with its ~102
+instances — it fits, with about 7% headroom. Adding geometry to that scene will
+trip the "exhausted its query budget" warning, and the fix then is raising
+`MAX_QUERIES` (8 bytes per query per ring entry — the cost is negligible), not
+suppressing zones.
+
+**`test/output/debug-widgets.png` is not a byte-exact golden and cannot be.**
+It renders live GPU timings *as text*, so two consecutive runs of identical code
+differ (measured: max delta 187 across ~8000 pixels). It is written by
+`test/debugWidgets.smoke.ts`, not by `bun run fixture`, so it is outside the
+byte-exact fixture set described above despite living in the same folder — do
+not read a diff on it as a regression, and do not commit a regenerated one as if
+it were a baseline.
 
 ### Known limitations (not yet done)
 

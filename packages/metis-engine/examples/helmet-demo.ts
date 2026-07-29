@@ -337,14 +337,16 @@ for (let i = 0; i < LIGHT_COUNT; i++) {
 let activeLights = LIGHT_COUNT;
 
 /**
- * Move every light onto its orbit, and park the deactivated ones far below the
- * deck.
+ * Move every active light onto its orbit, and park the deactivated ones far
+ * below the deck.
  *
- * Deactivation moves lights out of the way rather than splicing `scene.lights`,
- * because the array's *order* is load-bearing (see `Scene.lights`) and
- * re-splicing it every keypress would reshuffle which light owns which index.
- * The cull cost of an off-screen light is a sphere test, which is the cheap part
- * — what `-`/`=` is really measuring is the per-fragment loop.
+ * **Lights are parked, bulbs are removed, and the asymmetry is deliberate.**
+ * `scene.lights`'s *order* is load-bearing (see `Scene.lights` — it decides
+ * which spot owns which shadow layer), so splicing it on every keypress would
+ * reshuffle indices; parking a light 10 km down puts it outside every cluster
+ * instead, which costs one sphere test. `scene.instances` has no such ordering
+ * rule, so a deactivated bulb is taken out of it entirely by `syncBulbs()` —
+ * see there for why parking it too was wrong.
  */
 function animateLights(t: number) {
     for (let i = 0; i < lights.length; i++) {
@@ -352,7 +354,6 @@ function animateLights(t: number) {
         const active = i < activeLights;
         if (!active) {
             Vec3.set(l.light.position, 0, -1e4, 0);
-            l.bulb.transform.position.setComponent(1, -1e4);
             continue;
         }
         const a = l.phase + l.speed * t;
@@ -401,13 +402,29 @@ const keys = new Set<number>();
 let running = true;
 let lastTime = performance.now();
 
-/** Bulbs are removed from `instances` rather than hidden — there is no per-instance visibility flag. */
-function setBulbsVisible(visible: boolean) {
-    if (visible) {
-        scene.instances.push(...lights.map((l) => l.bulb));
-    } else {
-        const bulbSet = new Set(lights.map((l) => l.bulb));
-        scene.instances = scene.instances.filter((i) => !bulbSet.has(i));
+/**
+ * Rebuild which bulbs are in `scene.instances`: the ones belonging to an active
+ * light, and only while `B` has them switched on.
+ *
+ * **This used to park deactivated bulbs 10 km below the deck instead of removing
+ * them, and that was a real bug** — off-screen is not undrawn. There is no
+ * frustum culling in the forward pass, so all 100 bulbs kept issuing draw calls
+ * (and per-draw profiler zones) no matter what `-` was set to. It was invisible
+ * on screen and invisible in the frame time, because a bulb behind the camera
+ * rasterises nothing; the profiler is what exposed it, by honestly reporting
+ * `light-bulb x100` while the HUD said 25 lights.
+ *
+ * There is no per-instance visibility flag to reach for — membership of
+ * `scene.instances` *is* the flag.
+ */
+function syncBulbs() {
+    const bulbSet = new Set(lights.map((l) => l.bulb));
+    scene.instances = scene.instances.filter((i) => !bulbSet.has(i));
+    if (!bulbsVisible) {
+        return;
+    }
+    for (let i = 0; i < activeLights; i++) {
+        scene.instances.push(lights[i]!.bulb);
     }
 }
 
@@ -431,7 +448,7 @@ while (running) {
                 orbitPaused = !orbitPaused;
             } else if (e.keycode === SdlKeycode.B && fresh) {
                 bulbsVisible = !bulbsVisible;
-                setBulbsVisible(bulbsVisible);
+                syncBulbs();
             } else if (e.keycode === SdlKeycode.L && fresh) {
                 sunOn = !sunOn;
                 scene.environment.sunIntensity = sunOn ? SUN_INTENSITY : 0;
@@ -443,8 +460,10 @@ while (running) {
                 }
             } else if (e.keycode === SdlKeycode.Minus && fresh) {
                 activeLights = Math.max(0, activeLights - 25);
+                syncBulbs();
             } else if (e.keycode === SdlKeycode.Equals && fresh) {
                 activeLights = Math.min(Math.min(LIGHT_COUNT, MAX_LIGHTS), activeLights + 25);
+                syncBulbs();
             }
         }
         if (e.type === SdlEventType.KeyUp && e.keycode !== undefined) {
