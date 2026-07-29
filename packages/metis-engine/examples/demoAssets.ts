@@ -50,6 +50,35 @@ export async function loadMetalPlateTextures(device: GpuDevice): Promise<MetalPl
     return {albedo: albedo.view, normal: normal.view, metallic: metal.view, roughness: roughness.view};
 }
 
+const GLTF_CACHE_DIR = new URL(".asset-cache/gltf/", import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1");
+const KHRONOS_BASE = "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models";
+
+/**
+ * Downloads (once, cached under `examples/.asset-cache/gltf/`, gitignored) the
+ * Khronos "DamagedHelmet" sample and returns the local `.glb` path.
+ *
+ * The **binary** variant is deliberate: it is one 3.6 MB file with all five 2K
+ * textures in its binary chunk, so there is nothing to keep in sync on disk —
+ * and it exercises the paths a separate `.gltf` + sidecars does not (GLB chunk
+ * parsing, images from a `bufferView`). It is also the asset with **no
+ * `TANGENT` accessor**, which is what makes it the right demo for the
+ * importer's tangent synthesis: this model is normal-mapped, so a wrong tangent
+ * basis is immediately visible.
+ */
+export async function cacheDamagedHelmet(): Promise<string> {
+    mkdirSync(GLTF_CACHE_DIR, {recursive: true});
+    const dest = `${GLTF_CACHE_DIR}DamagedHelmet.glb`;
+    if (!(await Bun.file(dest).exists())) {
+        console.log("downloading DamagedHelmet.glb (~3.6 MB)...");
+        const response = await fetch(`${KHRONOS_BASE}/DamagedHelmet/glTF-Binary/DamagedHelmet.glb`);
+        if (!response.ok) {
+            throw new Error(`failed to download DamagedHelmet.glb: ${response.status}`);
+        }
+        await Bun.write(dest, await response.arrayBuffer());
+    }
+    return dest;
+}
+
 /**
  * A synthetic "instrument panel" emissive texture — not a downloaded asset
  * (no suitable small CC0 emissive-only PNG was sourced), but real GPU

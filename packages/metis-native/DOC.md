@@ -757,6 +757,185 @@ longer need to render into a separate `rgba8unorm` target just to capture.
 
 ---
 
+## 8b. glTF 2.0 import
+
+Two calls. `inspectGltf` parses the container and nothing else — no device, no
+binary reads, no decoding. `loadGltf` does the whole import: geometry into
+interleaved vertex/index buffers, images into textures, samplers, and the entire
+scene graph as typed data. Both are async, on a worker thread.
+
+```ts
+import { loadGltf, inspectGltf, GltfIndexFormat, GltfVertexLayoutMode } from "metis-native";
+
+const asset = await loadGltf(device, "assets/helmet.glb");
+
+for (const mesh of asset.meshes) {
+  for (const prim of mesh.primitives) {
+    pass.setPipeline(pipelineFor(prim.layout, prim.gpuTopology!));
+    pass.setVertexBuffer(0, prim.vertexBuffer);
+    if (prim.indexBuffer) {
+      pass.setIndexBuffer(prim.indexBuffer, prim.indexFormat === GltfIndexFormat.Uint16 ? "uint16" : "uint32");
+      pass.drawIndexed(prim.indexCount);
+    } else {
+      pass.draw(prim.vertexCount);
+    }
+  }
+}
+```
+
+`prim.layout` is already the shape `GPUVertexBufferLayout` wants
+(`arrayStride` + `attributes[]` with `format`/`offset`/`shaderLocation`), and
+`prim.gpuTopology` is a `GPUPrimitiveTopology` string — both go straight into
+`createRenderPipeline`.
+
+### What comes back
+
+| field | what it is |
+|---|---|
+| `meshes[].primitives[]` | one draw each: `vertexBuffer`, `layout`, `indexBuffer`/`indexCount`/`indexFormat`, `mode`, `gpuTopology`, `material`, `min`/`max`, `morphTargets` |
+| `materials[]` | metallic-roughness factors + texture refs, **every spec default already applied**, every supported `KHR_*` extension folded in |
+| `defaultMaterial` | index of the appended glTF default material — `primitive.material` is never null |
+| `textures[]` | `texture` (a `GpuTexture`, or `null` if skipped), `sampler` index, `colorSpace`, `encoding` |
+| `samplers[]` | a `GpuSampler` plus the glTF filter/wrap enums it came from |
+| `nodes[]` / `scenes[]` / `defaultScene` | the hierarchy: `children`, `mesh`, `skin`, `camera`, `light`, and the transform **in both forms** (see below) |
+| `animations[]` | per sampler: `input`/`output` as `Float32Array`, `interpolation`, `components`, `valuesPerKeyframe` |
+| `skins[]` | `joints` (node indices, in joint order), `skeleton`, `inverseBindMatrices` as a `Float32Array` |
+| `cameras[]` / `lights[]` | perspective/orthographic parameters; `KHR_lights_punctual` lights |
+| `variants[]` | `KHR_materials_variants` names |
+| `extensions` / `extras` | raw JSON of anything not modelled — **kept, not dropped** |
+
+### Vertex layout: two modes
+
+```ts
+// Source (default) — exactly the attributes the file has.
+await loadGltf(device, path);
+
+// Standard — always POSITION/NORMAL/TANGENT/TEXCOORD_0 at locations 0-3,
+// arrayStride 48. Synthesises what's missing, drops everything else.
+await loadGltf(device, path, { vertexLayout: GltfVertexLayoutMode.Standard });
+```
+
+`Source` reports the file faithfully; `arrayStride` and the attribute set vary
+per primitive, so a pipeline is built per layout. `Standard` gives every mesh the
+same layout so one pipeline serves them all — at the cost of dropping
+`COLOR_n`/joints/weights/custom attributes and **synthesising** absent normals
+(smooth, not the spec's flat — see `gltf/mesh.rs`) and tangents (UV-derived).
+That is the mode `metis-engine` uses.
+
+Under `Source`, known semantics get **fixed** `shaderLocation`s so one shader can
+serve every mesh with the same attribute set:
+
+| semantic | location | format |
+|---|---|---|
+| `POSITION` | 0 | `float32x3` |
+| `NORMAL` | 1 | `float32x3` |
+| `TANGENT` | 2 | `float32x4` |
+| `TEXCOORD_0..3` | 3-6 | `float32x2` |
+| `COLOR_0..1` | 7, 8 | `float32x4` |
+| `JOINTS_0/1` | 9, 11 | `uint16x4` |
+| `WEIGHTS_0/1` | 10, 12 | `float32x4` |
+| custom `_FOO` | 13+ | byte-exact where WebGPU can express it, else `float32xN` |
+
+Quantised sources (`KHR_mesh_quantization`) are un-normalised into these
+canonical formats; `sourceComponentType` / `sourceType` / `sourceNormalized` on
+each attribute report what the file actually held.
+
+### Node transforms come back in both forms
+
+glTF writes *either* a `matrix` *or* translation/rotation/scale. Both are always
+filled in — `matrix` (column-major, upload-ready) and `translation`/`rotation`
+(`[x,y,z,w]`)/`scale` — and `hasMatrix` says which the file used.
+
+### Hooks: `inspectGltf` → overrides → `loadGltf`
+
+Overrides are matched by resource index or by the URI **exactly as written in the
+file**, so you need the resource list first:
+
+```ts
+const manifest = await inspectGltf("scene.gltf");
+// manifest.resources: { kind, index, uri, resolvedPath, mimeType, byteLength, source }
+
+const asset = await loadGltf(device, "scene.gltf", {
+  resourceOverrides: manifest.resources
+    .filter((r) => r.kind === GltfResourceKind.Image && r.uri?.endsWith(".png"))
+    .map((r) => ({ kind: r.kind, index: r.index, path: r.resolvedPath!.replace(/\.png$/, ".ktx2") })),
+});
+```
+
+Each override sets **exactly one** of `path` (read this file instead), `bytes`
+(a `Uint8Array` you supply) or `skip: true`. A skipped image yields a
+`GltfTexture` with a `null` `texture`; a skipped buffer is an error if any
+accessor reads it. Malformed options **throw synchronously** — they are argument
+errors, checked before any work is scheduled.
+
+`inspectGltf` is also the cheap way to answer "can I load this at all"
+(`unsupportedRequiredExtensions`) and "how big is it" (`counts`).
+
+### Texture colour space is inferred from the material slot
+
+`baseColorTexture` and `emissiveTexture` (and the KHR specular/sheen *colour*
+textures) become `rgba8unorm-srgb`; normal, occlusion and metallic-roughness
+maps become `rgba8unorm`. A texture used both ways resolves to sRGB; a texture
+no material references defaults to linear. Override per texture:
+
+```ts
+await loadGltf(device, path, {
+  textureColorSpaces: [{ texture: 3, colorSpace: ImageColorSpace.Linear }],
+});
+```
+
+Read `texture.format` off the handle rather than assuming — `KHR_texture_basisu`
+sources go through the KTX2 path and come back block-compressed with a full mip
+chain.
+
+### Other options
+
+| option | default | effect |
+|---|---|---|
+| `label` | the file's name | prefix for every created buffer/texture/sampler label |
+| `baseDirectory` | the glTF file's directory | where relative URIs resolve |
+| `loadImages` | `true` | `false` skips all image decoding; every `texture` is `null` |
+| `textureUsage` | `TEXTURE_BINDING \| COPY_DST` | usage for created textures |
+| `extraVertexBufferUsage` / `extraIndexBufferUsage` | `0` | OR'd on top of `VERTEX\|COPY_DST` / `INDEX\|COPY_DST` (pass `COPY_SRC` to read geometry back) |
+| `maxAnisotropy` | `1` | clamped back to 1 for samplers that are not fully linear-filtered |
+| `convertUnsupportedTopologies` | `true` | rewrites `TRIANGLE_FAN`/`LINE_LOOP` into indices WebGPU can draw |
+| `strictRequiredExtensions` | `true` | `false` loads a file needing an unimplemented required extension anyway |
+
+### Supported, and not
+
+Handled natively: `KHR_materials_unlit`, `_emissive_strength`, `_ior`,
+`_specular`, `_transmission`, `_volume`, `_clearcoat`, `_sheen`, `_anisotropy`,
+`_iridescence`, `_dispersion`, `_variants`; `KHR_texture_transform`;
+`KHR_lights_punctual`; `KHR_texture_basisu`; `EXT_texture_webp`;
+`KHR_mesh_quantization`. Anything else survives as raw JSON on
+`material.extensions` / `texture.extensions` / `asset.extensions`.
+
+Rejected with an actionable message: `KHR_draco_mesh_compression`,
+`EXT_meshopt_compression` (both need a C/C++ decoder this package does not link
+— strip them with `gltf-transform`), and
+`KHR_materials_pbrSpecularGlossiness` (archived; convert with
+`gltf-transform metalrough`).
+
+Not done: mipmap generation. Decoded images have one mip level; ship
+`KHR_texture_basisu` `.ktx2` textures if you want a chain.
+
+### Gotchas
+
+- **`TRIANGLE_FAN`/`LINE_LOOP` have no WebGPU equivalent.** `mode` reports what
+  the file said, `gpuTopology` what the buffers now hold. With
+  `convertUnsupportedTopologies: false`, `gpuTopology` is `null` and there is
+  nothing you can draw.
+- **`UNSIGNED_BYTE` indices are widened to `Uint16`**, because WebGPU has no
+  8-bit index format. The width follows the *vertex* range, not the index count.
+- **Two `GltfTexture`s over one image share one `wgpu::Texture`.** They are
+  distinct handles; `destroy()` on either frees it for both.
+- **Network URIs are rejected**, not fetched. Download first and point a
+  `resourceOverride` at the local copy.
+- **There is no `asset.destroy()`.** The handles are ordinary `GpuBuffer` /
+  `GpuTexture` / `GpuSampler` objects; destroy the ones you kept.
+
+---
+
 ## 9. `VectorContext` — vector/text rendering
 
 Tessellates TTF glyphs and 2D paths into vertex/index buffers you draw yourself.

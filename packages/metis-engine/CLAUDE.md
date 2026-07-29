@@ -60,6 +60,8 @@ bun run fixture && git status --short test/output
 bun run demo:exterior
 bun run demo:interior
 bun run demo:spots      # spot-shadow visual test (L toggles shadows, Space pauses orbit)
+bun run demo:helmet     # glTF import + 100-light clustered forward, orbiting cam
+                        # (downloads DamagedHelmet.glb once into examples/.asset-cache/)
 
 # Standalone VectorContext (text rendering) smoke test
 bun run test/vectorText.smoke.ts
@@ -146,8 +148,10 @@ src/renderer/   — the entire renderer; import via "metis-engine/renderer"
                                  History and profileSpansToRows
   assets/       primitives.ts — procedural cube/sphere/plane/room-box generation (the guaranteed,
                                  network-independent path every demo/fixture scene defaults to)
-                gltf.ts       — a deliberately narrow glTF 2.0 reader (see its doc comment for the
-                                 exact supported subset), not a general-purpose importer
+                gltf.ts       — a thin adapter over metis-native's glTF importer: the node walk
+                                 and the GltfMaterial -> Material mapping, nothing else. The
+                                 hand-rolled reader that used to live here is gone (see "The glTF
+                                 loader moved into Rust" below)
                 texture.ts    — loadTexture() (image file -> GpuTexture via metis-native's
                                  `loadImageTexture` — decode + upload happen in Rust, pure-Rust
                                  `image` crate; PNG/TGA/JPEG/Radiance HDR. Replaced the former
@@ -159,7 +163,8 @@ src/renderer/   — the entire renderer; import via "metis-engine/renderer"
                   present(). Separate from present mode by design (see "Present mode" below)
   index.ts      — renderer barrel (re-exports RenderContext, Scene, ClusteredForwardRenderer, …);
                   reached from outside as "metis-engine/renderer"
-examples/       exterior-demo.ts, interior-demo.ts — windowed, interactive, SDL-loop-driven
+examples/       exterior-demo.ts, interior-demo.ts, spots-demo.ts, helmet-demo.ts — windowed,
+                interactive, SDL-loop-driven; demoAssets.ts caches the downloaded ones
 test/           fixture.ts — headless validation harness (also downloads+caches a Khronos sample
                               glTF into test/assets-cache/, gitignored); vectorText.smoke.ts —
                               standalone text test
@@ -1133,6 +1138,60 @@ The forward pipeline renders 4x multisampled (`RenderTargets.hdrColorMultisample
 
 The forward pipeline culls back faces with the default CCW front-face convention, and `assets/primitives.ts`'s `addQuad` builds CCW-from-the-normal-side quads to match. `uvSphere`, however, shipped with clockwise-from-outside triangles — so the rasterizer culled the sphere's *outside* and rendered its interior, with outward vertex normals attached to the far hemisphere. Result: every light lit the side of the sphere *opposite* itself, patches slid around with camera motion ("the specular highlights follow me"), and specular was killed entirely (N·V < 0 on the visible surface) — while all quad-based geometry shaded correctly, which made the report easy to misattribute to the BRDF or light culling. Root-caused by A/B rendering with cluster culling bypassed (pixel-identical → culling exonerated) and a light placed behind the sphere (it lit the camera-facing side → geometry, not shading), then confirmed by hand-winding the equator triangle. If a new mesh source ever shows "lights on the wrong side + no specular," check winding against `cullMode` before touching the shading code.
 
+### The glTF loader moved into Rust, and what stayed behind
+
+`assets/gltf.ts` used to *be* the importer: ~150 hand-rolled lines that parsed a
+`.gltf`'s JSON, walked its accessors, and supported a deliberately narrow subset
+(one external `.bin`, `f32` POSITION/NORMAL/optional-TEXCOORD_0, `u16`/`u32`
+indices, no textures, no tangents, a throw for everything else). That reader is
+gone. Parsing, accessor decoding, image decoding and GPU upload now happen in
+`metis-native/src/gltf/`, off the JS thread, with the actual spec behind it.
+
+**What is left here is the part that is genuinely this engine's**: the node walk
+that flattens a hierarchy into `SceneInstance`s, and the `GltfMaterial` →
+`Material` mapping. A glTF feature gets added in the native importer, not here.
+
+Three things about the seam are worth knowing:
+
+- **The engine asks for `GltfVertexLayoutMode.Standard`, and that is not a
+  convenience.** There is one `MESH_VERTEX_LAYOUT` and one forward pipeline built
+  against it, so a per-primitive layout would mean a pipeline variant per mesh.
+  Standard mode pins position/normal/tangent/uv at locations 0-3 with stride 48 —
+  *exactly* `MESH_VERTEX_LAYOUT` — so `Mesh` adopts the importer's buffers rather
+  than round-tripping them through the CPU. It also synthesises absent normals
+  and UV-derived tangents, which is what retired the old loader's "fabricates an
+  arbitrary perpendicular tangent" limitation.
+- **`Mesh` grew an `indexFormat` field because of this.** It used to hardcode
+  `"uint32"` in `bind()`, which was true for everything `assets/primitives.ts`
+  builds and is false for most glTF meshes. Binding the wrong width reads pairs
+  of `u16` indices as one `u32` and draws confetti — no validation error, no
+  throw.
+- **`boundingRadius` comes from the file, not from the vertices.** Once the
+  geometry is on the GPU there is nothing to scan, so it is derived from the glTF
+  POSITION accessor's declared `min`/`max` — the furthest AABB corner from the
+  local origin, **not** half the diagonal, because `Mesh.boundingRadius` is
+  measured from the mesh's own origin and a primitive need not be centred on it.
+
+**`forward.wgsl` now reads metallic from `.b` and roughness from `.g`.** glTF
+packs both into one `metallicRoughnessTexture` (blue = metallic, green =
+roughness) while this engine has two separate slots that both read `.r`. Binding
+the packed texture to both slots and leaving the reads on red would have been
+silently wrong — the exact failure class this file keeps documenting. The two
+slots stay separate so a single-channel map can still be bound to one alone, and
+the change is a **no-op for grayscale maps** (R=G=B), which is what every texture
+that existed before this — including `test/fixture.ts`'s Poly Haven set — is.
+
+**Golden status when this landed (2026-07-28, Manjaro laptop):** the fixture run
+was clean (no `wgpu` errors) and `gltf-box.png` came back within **1 LSB** of the
+committed golden through a completely rewritten import path, which is the strong
+signal that the rewrite is faithful. Every other fixture also moved by ≤1 LSB
+except `textured` (max Δ7 on 10 of 360 000 pixels) and `exterior` (max Δ21 on
+**one** pixel) — the numeric-drift shape described above, and consistent with the
+goldens having been committed from different hardware. They were therefore
+**left as committed** rather than rebased here; see "The fixture goldens are a
+genuine byte-exact baseline" for why regenerating a cross-machine diff is the one
+case not worth doing silently.
+
 ### Textures: always-bound placeholders, no shader branching
 
 Every material's bind group has exactly 6 texture-related bindings (1 sampler + 5 textures) whether or not it was given real textures — unset slots bind a shared 1x1 neutral placeholder (`assets/texture.ts`'s `getMaterialDefaults`) chosen so sampling it is a no-op against the material's own factors (white for anything multiplied, a flat tangent-space normal that reproduces the vertex normal unchanged). This keeps the bind group layout — and therefore the pipeline — identical for every material, avoiding per-material pipeline variants or a `hasTexture` uniform flag with shader branching. `test/fixture.ts`'s `textured` scene downloads a real CC0 texture set (Poly Haven's `metal_plate_02`, via its public file API) to validate all four map types at once; its small "emissive panel" object uses a synthetically-generated (not downloaded) checkerboard pattern purely to exercise the emissive-texture path, since no suitable small standalone CC0 emissive asset was sourced.
@@ -1215,9 +1274,81 @@ cache tessellating in font units at a fixed tolerance — ~118 triangles per gly
 at 11 px, roughly 10x more than needed. Fixing that means keying the cache by
 (glyph, size bucket); not done, and the reason `due()` carries the load instead.
 
+### `demo:helmet` — and what tuning a 100-light scene actually taught
+
+`examples/helmet-demo.ts` is the glTF importer and the clustered-forward path in
+one scene: the Khronos DamagedHelmet (a real `.glb`, five 2K textures, **no
+`TANGENT` accessor** so its basis is synthesised) under 100 orbiting point
+lights, on an orbit camera. It is the demo to reach for when either half needs
+eyeballing, and the reason it is one demo rather than two is that an orbit camera
+over a static light field is the cheapest way to see a wrong tangent basis:
+normal-mapped detail that lights from the wrong side as you go round.
+
+**Three things about the scene are load-bearing and were each arrived at by
+getting them wrong first.** They generalise to any many-light scene in this
+engine, which is why they are here rather than only in the file's comments.
+
+- **A shell of lights around one object does not look like many lights.** Packed
+  into the volume around the helmet, 100 pools merge into a single white wash on
+  any nearby surface and the whole thing reads as one badly-exposed spotlight.
+  Distinct pools need the field spread over an area *much* larger than the
+  subject — and spread over `sqrt(rand())` radius, not `rand()`, or half the
+  lights land in the inner quarter of the disc. But spread them all out and
+  nothing is close enough to light the hero object, which then sits there dark.
+  The scene splits the field: the first ten orbit close and high and are the only
+  ones shading the helmet; the other ninety are scattered across the deck. That
+  split also makes the `-` key well-behaved — thinning the field never unlights
+  the subject, because the inner lights are first in the array.
+- **Auto-exposure was the actual problem, not the lights.** Half the frame is
+  black sky, which drags the metered average down, which makes the exposure
+  *rise* until the lit half is white and every bulb clips. Dimming the lights
+  does not fix it — the metering compensates straight back. `post.autoExposure.
+  exposureCompensation` (0.45 here) is the knob, and it made a bigger difference
+  than every light-parameter change combined. Worth remembering before spending
+  an hour retuning intensities in a high-contrast scene.
+- **The sun is dim, not off — and turning it off was the wrong call.** The first
+  cut disabled it entirely, because 100 emissive bulbs going through all four
+  cascades speckled every lit surface with their own little shadows and buried
+  the real ones. That fixed the noise by deleting the shadows, which made the
+  scene read as weightless: nothing grounded the helmet on the deck. The right
+  fix was `SceneInstance.castsShadow` (below); with the bulbs excluded, a *dim*
+  sun (0.16) gives an unmistakable contact shadow while the coloured pools still
+  dominate, and three shadow-casting spots throw coloured spokes off the helmet.
+  **Dimming a light is almost always the better move than removing it** — the
+  thing that was actually broken was what was in the shadow pass, not that there
+  was one.
+
+### `SceneInstance.castsShadow` — content, not culling
+
+Every instance was drawn into all four sun cascades and every spot-shadow layer,
+unconditionally. `castsShadow` (default `true`) opts one out.
+
+It exists because of a concrete failure, not as a general knob:
+`demo:helmet` stands 100 point lights in for their positions with small emissive
+spheres, and a hundred marker spheres in the shadow passes speckle every lit
+surface with tiny shadows that swamp the shadows that matter. There is no way to
+tune that away — the geometry is genuinely there and genuinely occludes.
+
+**It is a property of the content, not of the frame, and must not be used as a
+culling optimisation.** A real occluder that is off-screen still has to cast;
+that is what `SpotShadows`' frustum test is for, and conflating the two would
+make objects lose their shadows as the camera moves. The flag means "this object
+does not have a shadow" — light gizmos, sky shells, emissive markers, and
+ground planes with nothing beneath them.
+
+One detail in `spotShadows.ts`: the check runs *before* `lastCandidateInstances++`,
+so a non-caster is not counted as a culling candidate. Counting it would make the
+drawn/candidate ratio the demos display look worse than the frustum test actually
+performs.
+
+This closes a gap this file previously listed as a known limitation. It does
+**not** address the other half of that entry: there is still no per-cascade
+frustum culling, so every caster is redrawn for every cascade.
+
 ### Known limitations (not yet done)
 
 - No image-based lighting / environment reflections — a pure metal with no texture is lit only by direct lights, nothing else (see `math/PBR shading formulas.md`'s "Where the real handwave lives").
 - **Point** lights don't cast shadows — only the sun and up to `MAX_SHADOW_SPOTS` flagged spot lights do. Point-light shadows need a cube map (6x the passes and draws) and are not planned; point lights are for detail and fake emissive glow. See "Spot light shadows" above.
 - **Zero-thickness occluder geometry is the one case the shadow system genuinely cannot resolve** — occluder and receiver depths coincide at a shared edge, and no shadow-map representation can separate them. `roomBox` therefore builds solid-slab walls (0.2 units thick), so a corner's occluder record is the wall's sunlit exterior face and the depth gap is ~wall-thickness; a long-running concave-corner light leak in the interior demo was ultimately closed by exactly this, and it also paid for `SHADOW_MAP_SIZE` 4096 → 2048. Prefer closed/thick meshes for anything that must cast interior shadows. `normalOffset` is a texel-count quantity, computed per frame per cascade from that cascade's texel size (`SHADOW_NORMAL_OFFSET_TEXELS`/`_MIN`, uploaded in `CascadeUniforms.normalOffsets`), so it self-rescales with `SHADOW_MAP_SIZE`, `shadowDistance`, and the split scheme; see "Cascaded shadow maps" above.
-- The glTF loader (`assets/gltf.ts`) doesn't read a `TANGENT` accessor (fabricates an arbitrary perpendicular vector instead) and ignores any texture a glTF material references (factors only) — fine for the plain untextured "Box" sample it's validated against, wrong for a real normal-mapped/textured glTF asset. It also only handles a narrow subset generally: separate `.gltf` + `.bin` (no `.glb`, no embedded base64), `f32` POSITION/NORMAL/optional-TEXCOORD_0, `u16`/`u32` indices. Anything with skinning, morph targets, sparse accessors, or multiple buffers will throw.
+- The glTF loader **imports** skins, morph targets and animations but the renderer **draws** none of them — there is no skinning or morph pipeline, and nothing extracts a camera or a `KHR_lights_punctual` light into the `Scene`. `loadGltfAsset` hands back the full `GltfAsset` so a future system can; `loadGltf` drops them.
+- No alpha blending or alpha testing, so a glTF material with `alphaMode: "BLEND"`/`"MASK"` renders opaque (with a warning).

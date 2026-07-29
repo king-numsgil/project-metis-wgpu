@@ -286,6 +286,9 @@ export class ShadowCascades {
         const drawScene = (pass: ReturnType<GpuCommandEncoder["beginRenderPass"]>, cascade: number) => {
             pass.setBindGroup(0, this.cascadeRenderBindGroups[cascade]!);
             for (const instance of scene.instances) {
+                if (!instance.castsShadow) {
+                    continue;
+                }
                 pass.setBindGroup(1, instance.getModelBindGroup(this.device, this.modelBindGroupLayout));
                 instance.mesh.bind(pass);
                 instance.mesh.draw(pass);

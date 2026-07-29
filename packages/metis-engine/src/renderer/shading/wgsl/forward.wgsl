@@ -180,8 +180,15 @@ fn fs(input: VertexOutput) -> @location(0) vec4<f32> {
     let N = normalize(tbn * normalSample);
 
     let albedo = material.baseColor.rgb * textureSample(albedoTex, matSampler, input.uv).rgb;
-    let metallic = clamp(material.metallicRoughness.x * textureSample(metallicTex, matSampler, input.uv).r, 0.0, 1.0);
-    let roughness = clamp(material.metallicRoughness.y * textureSample(roughnessTex, matSampler, input.uv).r, 0.045, 1.0);
+    // Blue for metallic, green for roughness — glTF's `metallicRoughnessTexture`
+    // channel assignment. The two slots stay separate so a single-channel map
+    // can still be bound to one of them alone; a glTF import binds the same
+    // packed texture to both and each picks its own channel out of it.
+    // Grayscale maps (R=G=B, which is what the Poly Haven sets in test/ are)
+    // read identically either way, which is why this is not a visual change for
+    // anything that existed before glTF textures were wired up.
+    let metallic = clamp(material.metallicRoughness.x * textureSample(metallicTex, matSampler, input.uv).b, 0.0, 1.0);
+    let roughness = clamp(material.metallicRoughness.y * textureSample(roughnessTex, matSampler, input.uv).g, 0.045, 1.0);
     let emissive = material.emissive * textureSample(emissiveTex, matSampler, input.uv).rgb;
 
     var color = vec3<f32>(0.0);

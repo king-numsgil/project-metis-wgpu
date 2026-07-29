@@ -52,6 +52,13 @@ pub use compressed::{Ktx2LoadOptions, load_ktx2_texture};
 pub use save::{read_texture_pixels, save_pixels_to_file, save_texture_to_file};
 pub use uncompressed::{ImageColorSpace, ImageLoadOptions, load_image_texture};
 
+// The in-memory halves of both loaders, for the glTF importer. glTF images are
+// routinely embedded (GLB binary chunk, `data:` URI), so they have no file to
+// open — but nothing here is `#[napi]`, so the *public* API remains "file
+// readers only" and no byte slice crosses the napi boundary either way.
+pub(crate) use compressed::upload_ktx2_bytes;
+pub(crate) use uncompressed::{decode_image_bytes, upload_texture};
+
 use crate::gpu::GpuTexture;
 use std::sync::{Arc, Mutex};
 

@@ -1,6 +1,7 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+mod gltf;
 mod gpu;
 mod image;
 #[allow(unused_imports)]
@@ -85,4 +86,25 @@ pub use vector::{VectorContext, FontMetrics, DrawCall};
 pub use image::{
     ImageColorSpace, ImageLoadOptions, Ktx2LoadOptions, load_image_texture, load_ktx2_texture,
     read_texture_pixels, save_pixels_to_file, save_texture_to_file,
+};
+
+// ── glTF 2.0 import (file -> GPU buffers/textures + scene graph) ───────────────
+//
+// `inspect_gltf` parses the container only (no binary reads, no device) and
+// reports the resource list a `GltfResourceOverride` matches on; `load_gltf`
+// does the whole import. See `gltf/mod.rs` for the extension support matrix and
+// why the hooks are declarative rather than callbacks.
+
+pub use gltf::{
+    GltfAccessorType, GltfAlphaMode, GltfAnimation, GltfAnimationChannel, GltfAnimationPath,
+    GltfAnimationSampler, GltfAnisotropy, GltfAsset, GltfAttributeSemantic, GltfCamera,
+    GltfCameraKind, GltfClearcoat, GltfComponentType, GltfCounts, GltfImageEncoding,
+    GltfIndexFormat, GltfInterpolation, GltfIridescence, GltfLight, GltfLightKind, GltfLoadOptions,
+    GltfMagFilter, GltfManifest, GltfMaterial, GltfMesh, GltfMinFilter, GltfMorphTarget, GltfNode,
+    GltfNormalTextureRef, GltfOcclusionTextureRef, GltfOrthographic, GltfPerspective,
+    GltfPrimitive, GltfPrimitiveMode, GltfResource, GltfResourceKind, GltfResourceOverride,
+    GltfResourceSource, GltfSampler, GltfScene, GltfSheen, GltfSkin, GltfSpecular, GltfTexture,
+    GltfTextureColorSpace, GltfTextureRef, GltfTextureTransform, GltfTransmission,
+    GltfVertexAttribute, GltfVertexLayout, GltfVertexLayoutMode, GltfVolume, GltfWrapMode,
+    inspect_gltf, load_gltf,
 };

@@ -20,10 +20,33 @@ lyon_tessellation = "1"
 lyon_path = "1"
 lyon_geom = "1"
 ttf-parser = "0.21"
-image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "tga", "hdr"] }
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "tga", "hdr", "webp"] }
 half = "2.7.1"
 ktx2 = "0.5"
 ruzstd = "0.8.3"
+# glTF 2.0. `default-features = false` drops the crate's own `import` feature,
+# which would pull in its own `image` copy and its own URI/base64 handling — this
+# crate resolves URIs itself (see `gltf/uri.rs`) so that the resource-override
+# hook can intercept before any byte is read. `extensions` keeps unrecognised
+# extension objects as raw JSON instead of discarding them; `extras` does the
+# same for `extras`. The KHR_* features are the ones gltf-json models natively;
+# the rest (clearcoat, sheen, anisotropy, iridescence, dispersion) are parsed
+# from that raw JSON in `gltf/material.rs`.
+gltf = { version = "1.4.1", default-features = false, features = [
+  "utils", "names", "extras", "extensions",
+  "KHR_lights_punctual",
+  "KHR_materials_emissive_strength",
+  "KHR_materials_ior",
+  "KHR_materials_specular",
+  "KHR_materials_transmission",
+  "KHR_materials_unlit",
+  "KHR_materials_variants",
+  "KHR_materials_volume",
+  "KHR_texture_transform",
+] }
+serde_json = "1"
+base64 = "0.22"
+percent-encoding = "2"
 
 [build-dependencies]
 napi-build = "2"

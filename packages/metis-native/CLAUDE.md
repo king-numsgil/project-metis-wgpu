@@ -158,6 +158,7 @@ once it does, rather than assuming either answer.
 - **SDL3**: built from source via `sdl3-sys = { version = "0.6.7", features = ["build-from-source-static"] }` (bundles SDL 3.4.12)
 - **Image decoding**: `image = { version = "0.25", default-features = false, features = ["png", "jpeg", "tga", "hdr"] }` — pure Rust, no C decoder. Plus `half` for the f32→f16 conversion HDR needs. (SDL3_image was removed; see "Why SDL3_image is gone" below.)
 - **Compressed textures**: `ktx2` (container parsing, zero transitive deps) and `ruzstd` (zstd supercompression). Both pure Rust — deliberately *not* the `zstd` crate, which is C bindings, nor any Basis transcoder. Same rule as the decoder above.
+- **glTF**: `gltf = "1.4"` with `default-features = false` — the crate's own `import` feature is deliberately off, so this crate resolves URIs itself and the resource-override hook has somewhere to live (see the glTF section below). Plus `serde_json` (raw extension passthrough), `base64` (`data:` URIs) and `percent-encoding` (URI unescaping). All pure Rust.
 - **wgpu**: 30.0.0 with WGSL feature
 
 Cargo cache / sdl3-sys source:
@@ -199,6 +200,29 @@ src/
                     blocks + their mip chain, no decode step, zstd supercompression
                     via `ruzstd`. Row strides in BLOCKS. Every block-alignment rule
                     in the package lives here and nowhere else
+    gltf/
+      mod.rs        — the two entry points (inspectGltf/loadGltf), options, the
+                    resource resolution, the extension support matrix, and the
+                    assembly of the returned GltfAsset
+      enums.rs      — every closed glTF set as a #[napi] enum; the "no magic
+                    integers cross the boundary" rule lives here
+      uri.rs        — data:/file URI resolution + the resourceOverride table.
+                    Replaces the `gltf` crate's `import` feature, which has no
+                    seam for substitution
+      accessor.rs   — byteStride, matrix column padding, sparse accessors,
+                    `normalized` un-quantisation. Every awkward thing about
+                    glTF's binary layout is confined here
+      mesh.rs       — pure packing math (no wgpu): interleaving, the fixed
+                    shaderLocation table, index widening, fan/loop rewriting,
+                    and Standard mode's normal/tangent synthesis
+      primitive.rs  — the wgpu half of mesh import: GpuBuffer creation and the
+                    #[napi(object)] shapes a caller sees
+      material.rs   — materials with every spec default applied and every
+                    supported KHR_* extension folded in
+      texture.rs    — images -> GpuTexture/GpuSampler, and the sRGB-vs-linear
+                    inference
+      scene.rs      — nodes/scenes/cameras/lights/skins (plain data, no GPU)
+      animation.rs  — keyframe tracks, as Float32Arrays
     save.rs       — the write half: saveTextureToFile, readTexturePixels,
                     savePixelsToFile. GPU readback (row-unpadding, BGRA swizzle)
                     + encoding. Replaced tests/helpers/screenshot.ts
@@ -1045,6 +1069,129 @@ fixture is opaque, so its BC5 green channel reads 255 everywhere and only red
 carries position. That is why the four-way positional assertion lives on the BC7
 case.
 
+### glTF: what the importer decides, and why each decision was forced
+
+`src/gltf/` is a full glTF 2.0 importer: `inspectGltf` (container only, no
+device) and `loadGltf` (geometry, textures, samplers, scene graph). Its own
+module docs cover the mechanics; what follows is the reasoning that is not
+visible from the code.
+
+**The `gltf` crate is used, but not its `import` feature.** `gltf::import` reads
+URIs, decodes `data:` payloads and decodes images in one call — and gives no seam
+between "the file says `hull.png`" and "these bytes get decoded". That seam is
+the whole point of `resourceOverrides`, so URI resolution is this crate's
+(`gltf/uri.rs`). Dropping `import` also kept image decoding on this package's
+single pure-Rust path instead of a second `image` copy bundled inside a
+dependency — the same rule that removed SDL3_image.
+
+**Validation is run by hand, minus one error class, and both halves are
+load-bearing.** `Gltf::from_slice` validates and rejects; this code calls
+`from_slice_without_validation` and then runs `Root::validate` itself, filtering
+out `Error::Unsupported`.
+
+- Validation cannot be skipped: the `gltf` crate's typed accessors `unwrap()` a
+  `Checked<T>`, so an unrecognised `componentType` or `mode` **panics**, and a
+  panic across the napi boundary aborts the process rather than rejecting a
+  promise. Same class as the lyon panics in `VectorContext`.
+- But `Error::Unsupported` means "*gltf-json* has no feature for this
+  `extensionsRequired` entry", which is a different question from whether *this
+  importer* supports it. Half the extensions here (`KHR_materials_clearcoat`,
+  `_sheen`, `_anisotropy`, `_iridescence`, `_dispersion`) are parsed from raw
+  JSON precisely because the crate models none of them, so deferring to its list
+  would reject files this code handles correctly — and would make
+  `strictRequiredExtensions: false` meaningless.
+
+**The hooks are declarative, not callbacks, and that was a deliberate rejection.**
+The obvious design is a `resolveUri(uri) => bytes` callback. It cannot work well
+here: the load runs on a libuv worker, so every callback is a marshalled hop back
+to the JS thread and a wait — turning a resource loop into a thread-ping-pong
+whose behaviour depends on whether the event loop is blocked. `inspectGltf` →
+build overrides → `loadGltf` buys the same expressiveness with none of that, and
+has the extra property that the caller sees the *real* resource list before
+deciding anything. The cost is one extra parse when overrides are needed, which
+is JSON, not binary.
+
+**`GltfResourceOverride.bytes` is the one inbound byte array in this package,
+and it is copied on the JS thread.** `Uint8Array` borrows JS-owned memory, so it
+cannot travel to a worker; `Overrides::from_js` runs synchronously in the
+`#[napi]` entry point and copies. That is also why malformed *options* throw
+synchronously rather than rejecting — they are argument errors, caught before the
+`AsyncTask` exists.
+
+**Primitives are repacked rather than handed back verbatim, and the faithful
+alternative is not implementable.** Uploading each glTF `buffer` as-is and
+reporting accessors as `(buffer, offset, stride)` looks more spec-compliant and
+cannot represent a conforming file: a sparse accessor has *no* `bufferView` to
+point at, `UNSIGNED_BYTE` indices do not exist in WebGPU, and quantised VEC3
+attributes have no matching `GPUVertexFormat`. See `gltf/mesh.rs`'s header.
+
+**`shaderLocation`s are fixed, not densely packed.** One WGSL entry point then
+serves every mesh with the same attribute set, and pipelines can be cached by
+layout. Dense packing would make two meshes differing by one attribute disagree
+about what location 3 means. The trade is that a primitive with many custom
+attributes plus morph targets can exceed WebGPU's default
+`maxVertexAttributes` of 16 — which surfaces at `createRenderPipeline`, not here.
+
+**`GltfVertexLayoutMode::Standard` exists for `metis-engine` and is documented as
+lossy.** The engine has one vertex layout and one forward pipeline, so a
+per-primitive layout would mean a pipeline variant per mesh. Standard mode pins
+position/normal/tangent/uv at locations 0-3 with `arrayStride` 48, synthesising
+what is missing and **dropping** everything else. Two deviations are recorded in
+`gltf/mesh.rs` rather than hidden: absent normals are computed **smooth**, not
+the spec's flat (flat normals need de-indexing, which changes `vertexCount` and
+invalidates every other accessor's indexing), and absent tangents are the
+ordinary UV-derived construction rather than a real MikkTSpace bake.
+
+**Texture colour space is inferred from the material slot, because nothing else
+knows.** A PNG does not say whether it holds colour or data and glTF puts no
+colour-space field on `images`. Getting it wrong produces no error of any kind —
+just a subtly too-bright albedo or subtly wrong normals. A texture used as both
+colour and data resolves to sRGB (a colour map read as linear is visibly wrong;
+a mask read as sRGB is usually only slightly off), and `textureColorSpaces`
+overrides it.
+
+**Mipmap generation was declined.** It needs either a CPU downsample (wrong for
+sRGB unless done in linear space) or a render/compute pass per level — a
+pipeline, a shader and a sampler this module would have to own. `KHR_texture_basisu`
+is the answer instead: a `.ktx2` carries its whole pyramid pre-built and lands on
+`image/compressed.rs` unchanged.
+
+**Draco and meshopt are rejected, not stubbed.** Draco's decoder is C++ and
+meshopt's reference decoder is C — exactly the dependency class the SDL3_image
+removal bought out. The error names the extension and points at `gltf-transform`,
+which strips either offline.
+
+### glTF tests: inline fixtures, then somebody else's files
+
+`tests/gltf.test.ts` builds its fixtures byte by byte (`tests/helpers/gltf-build.ts`),
+and **its assertions read the GPU buffers back** (`tests/helpers/read-buffer.ts`,
+via `extraVertexBufferUsage: COPY_SRC`). That second part is the load-bearing
+one, for the same reason `image-ktx2.test.ts` needs its pixel tier: nearly every
+way this importer can be wrong produces a *correctly shaped* result. A
+`byteStride` ignored gives the right vertex count in the wrong places. A sparse
+block ignored gives zeros. An index accessor read at the wrong width gives
+plausible triangles. None of those throws, and none is a wgpu validation error
+either — a suite that checked only `vertexCount` and `arrayStride` would stay
+green through all of them.
+
+`tests/gltf-samples.test.ts` is the second tier: real Khronos sample assets,
+downloaded once into the gitignored `tests/assets-cache/`. It exists because the
+inline fixtures agree with this importer *by construction* — same author, same
+afternoon, same reading of the spec, so a misreading would be baked into both
+sides. The sample files were not written to make these tests pass. Each was
+picked for one thing the inline tier cannot produce: `DamagedHelmet.glb` (GLB
+with five 2K JPEGs in the binary chunk and no `TANGENT`), `BoxTextured`
+(separate `.gltf` + `.bin` + `.png` sidecars), `AnimatedMorphCube`
+(morph targets with a real weights track), `RiggedSimple` (a skin with real
+inverse bind matrices), `SimpleSparseAccessor` (a sparse accessor and a `data:`
+URI). **The file skips rather than fails when the download is unreachable** — a
+suite that goes red because GitHub is slow teaches people to ignore red.
+
+One expectation there is worth not "fixing": DamagedHelmet has ~46 000 indices
+and ~14 500 vertices, so its index buffer is correctly `Uint16`. The widening
+rule follows the *vertex range*, not the index count, and that test is where
+getting it backwards shows up.
+
 ### The format tables in `convert.rs` are two one-way maps, and they drifted
 
 `texture_format_from_str` accepted every BC/ETC2/ASTC name, but
@@ -1063,10 +1210,11 @@ variant per name.
 
 ### Formats deliberately not supported (yet)
 
-- **Animated images** (GIF/WebP/APNG). `sdlImageLoadAnimation` and
+- **Animated images** (GIF/APNG). `sdlImageLoadAnimation` and
   `SdlImageAnimation` were removed with SDL3_image rather than ported — nothing
   in the monorepo called them. `image` can decode GIF/WebP animation if this
-  comes back.
+  comes back. (Still-image **WebP** *is* decoded now — the `image` crate's
+  `webp` feature was enabled for `EXT_texture_webp`.)
 - **Basis Universal transcoding** (and the `.basis` container). KTX2 with
   *pre-compressed* BC blocks **is** supported now — that was the recommendation
   this bullet used to make, and `compressed.rs` is it. What stays deferred is

@@ -303,6 +303,13 @@ export class SpotShadows {
                 pass.setPipeline(this.pipeline);
                 pass.setBindGroup(0, this.renderBindGroups[i]!);
                 for (let k = 0; k < scene.instances.length; k++) {
+                    // Checked before the counter: a non-caster is not a culling
+                    // candidate at all, so counting it would make the
+                    // drawn/candidate ratio the HUD reports look worse than the
+                    // frustum test actually is.
+                    if (!scene.instances[k]!.castsShadow) {
+                        continue;
+                    }
                     this.lastCandidateInstances++;
                     const s = spheres[k]!;
                     if (!sphereInFrustum(this.frustum, s.x, s.y, s.z, s.r)) {

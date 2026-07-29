@@ -1405,6 +1405,939 @@ export interface FontMetrics {
   unitsPerEm: number
 }
 
+/** glTF `accessor.type` — how many components make one element. */
+export declare enum GltfAccessorType {
+  Scalar = 0,
+  Vec2 = 1,
+  Vec3 = 2,
+  Vec4 = 3,
+  Mat2 = 4,
+  Mat3 = 5,
+  Mat4 = 6
+}
+
+/** glTF `material.alphaMode`. */
+export declare enum GltfAlphaMode {
+  Opaque = 0,
+  Mask = 1,
+  Blend = 2
+}
+
+export interface GltfAnimation {
+  name?: string
+  samplers: Array<GltfAnimationSampler>
+  channels: Array<GltfAnimationChannel>
+  /**
+   * Largest keyframe time across every sampler, in seconds — the length of
+   * one loop. 0 when the animation has no keyframes.
+   */
+  duration: number
+  extras?: string
+}
+
+export interface GltfAnimationChannel {
+  /** Index into this animation's `samplers`. */
+  sampler: number
+  /**
+   * Index into `GltfAsset.nodes`. `null` is legal — the spec allows a
+   * channel with no target, which must be ignored rather than treated as
+   * node 0.
+   */
+  targetNode?: number
+  path: GltfAnimationPath
+}
+
+/** What an animation channel drives on its target node. */
+export declare enum GltfAnimationPath {
+  Translation = 0,
+  Rotation = 1,
+  Scale = 2,
+  /** Morph target weights. */
+  MorphTargetWeights = 3
+}
+
+export interface GltfAnimationSampler {
+  interpolation: GltfInterpolation
+  /** Keyframe times in seconds, strictly increasing. */
+  input: Float32Array
+  /**
+   * Keyframe values, flattened. Length is
+   * `input.length * valuesPerKeyframe`.
+   */
+  output: Float32Array
+  /**
+   * Components in one *value*: 3 for translation/scale, 4 for a rotation
+   * quaternion, and the mesh's morph target count for weights.
+   */
+  components: number
+  /**
+   * Components consumed per keyframe — `components`, or `components * 3`
+   * under `CubicSpline`.
+   */
+  valuesPerKeyframe: number
+}
+
+/** `KHR_materials_anisotropy`. */
+export interface GltfAnisotropy {
+  strength: number
+  /** Radians, counter-clockwise from the tangent. */
+  rotation: number
+  texture?: GltfTextureRef
+}
+
+/**
+ * A fully imported glTF asset: GPU handles plus the whole scene graph.
+ *
+ * This is a plain JS object, not a class — every field is materialised once
+ * when the promise resolves. There is no lazy getter to re-pay for, and no
+ * `destroy()`: the GPU handles are ordinary `GpuBuffer` / `GpuTexture` /
+ * `GpuSampler` objects with their own `destroy()`, and freeing the asset means
+ * destroying the ones you took.
+ */
+export interface GltfAsset {
+  path: string
+  version: string
+  minVersion?: string
+  generator?: string
+  copyright?: string
+  extensionsUsed: Array<string>
+  extensionsRequired: Array<string>
+  /**
+   * Required extensions this importer does not implement. Always empty
+   * unless `strictRequiredExtensions: false` was passed — in which case the
+   * asset loaded anyway and this is the list of reasons to distrust it.
+   */
+  unsupportedRequiredExtensions: Array<string>
+  /** Index into `scenes` of the file's default scene, when it names one. */
+  defaultScene?: number
+  scenes: Array<GltfScene>
+  nodes: Array<GltfNode>
+  meshes: Array<GltfMesh>
+  /**
+   * The file's materials, plus one appended default material at
+   * `defaultMaterial`.
+   */
+  materials: Array<GltfMaterial>
+  /**
+   * Index of the appended glTF default material — what primitives with no
+   * material of their own point at. It is always the last entry.
+   */
+  defaultMaterial: number
+  textures: Array<GltfTexture>
+  /**
+   * The file's samplers, plus (when any texture needs it) one appended
+   * default sampler; see `GltfSampler.isDefault`.
+   */
+  samplers: Array<GltfSampler>
+  animations: Array<GltfAnimation>
+  skins: Array<GltfSkin>
+  cameras: Array<GltfCamera>
+  /** `KHR_lights_punctual` lights, referenced by `GltfNode.light`. */
+  lights: Array<GltfLight>
+  /** `KHR_materials_variants` variant names, in index order. */
+  variants: Array<string>
+  /** Raw JSON of any document-level extension this importer does not model. */
+  extensions?: string
+  /** Raw JSON of the document's `asset.extras`. */
+  extras?: string
+}
+
+/**
+ * A glTF vertex attribute's meaning. The `_n` suffixed sets are the ones glTF
+ * allows more than one of; `Custom` covers application-specific `_UNDERSCORE`
+ * attributes, whose exact spelling is on `GltfVertexAttribute.name`.
+ *
+ * Sets above the ones named here (`TEXCOORD_4`, say) are reported as `Custom`
+ * with the real name and `set` filled in, so nothing is silently dropped.
+ */
+export declare enum GltfAttributeSemantic {
+  Position = 0,
+  Normal = 1,
+  Tangent = 2,
+  TexCoord = 3,
+  Color = 4,
+  Joints = 5,
+  Weights = 6,
+  /**
+   * An application-specific `_FOO` attribute, or a set index beyond the ones
+   * this importer canonicalises.
+   */
+  Custom = 7
+}
+
+export interface GltfCamera {
+  name?: string
+  kind: GltfCameraKind
+  /** Set when `kind` is `Perspective`. */
+  perspective?: GltfPerspective
+  /** Set when `kind` is `Orthographic`. */
+  orthographic?: GltfOrthographic
+  extras?: string
+}
+
+/** glTF `camera.type`. */
+export declare enum GltfCameraKind {
+  Perspective = 0,
+  Orthographic = 1
+}
+
+/** `KHR_materials_clearcoat`. */
+export interface GltfClearcoat {
+  factor: number
+  texture?: GltfTextureRef
+  roughnessFactor: number
+  roughnessTexture?: GltfTextureRef
+  normalTexture?: GltfNormalTextureRef
+}
+
+/**
+ * glTF `accessor.componentType`, reported so a caller can tell what the source
+ * asset actually stored before this importer canonicalised it.
+ */
+export declare enum GltfComponentType {
+  I8 = 0,
+  U8 = 1,
+  I16 = 2,
+  U16 = 3,
+  U32 = 4,
+  F32 = 5
+}
+
+/** Object counts, so a caller can size its own arrays before loading. */
+export interface GltfCounts {
+  scenes: number
+  nodes: number
+  meshes: number
+  primitives: number
+  materials: number
+  textures: number
+  images: number
+  samplers: number
+  animations: number
+  skins: number
+  cameras: number
+  lights: number
+}
+
+/**
+ * The container an image's bytes are in. Decides which loader handles it:
+ * `Ktx2` goes to the block-compressed path (`KHR_texture_basisu`), everything
+ * else to the pixel decoder.
+ */
+export declare enum GltfImageEncoding {
+  Png = 0,
+  Jpeg = 1,
+  /** `EXT_texture_webp`, or a plain `image/webp` source. */
+  WebP = 2,
+  /**
+   * `KHR_texture_basisu`. Must carry pre-compressed BC blocks — see
+   * `image/compressed.rs` for why there is no Basis transcoder.
+   */
+  Ktx2 = 3,
+  /**
+   * Radiance HDR. Not a core glTF image type, but this loader decodes it, so
+   * it is reported rather than refused.
+   */
+  Hdr = 4,
+  /**
+   * No `mimeType` and no recognised signature. Still attempted — the decoder
+   * sniffs magic bytes of its own.
+   */
+  Unknown = 5
+}
+
+/**
+ * Index buffer element width. glTF also permits `UNSIGNED_BYTE`; WebGPU does
+ * not, so byte indices are widened to `Uint16` during import.
+ */
+export declare enum GltfIndexFormat {
+  Uint16 = 0,
+  Uint32 = 1
+}
+
+/**
+ * glTF `animation.sampler.interpolation`.
+ *
+ * `CubicSpline` is the one that changes the *shape* of the output data: each
+ * keyframe carries three values (in-tangent, value, out-tangent) rather than
+ * one, so `GltfAnimationSampler.output` is three times as long. That is
+ * reported explicitly on the sampler rather than left to be inferred.
+ */
+export declare enum GltfInterpolation {
+  Linear = 0,
+  Step = 1,
+  CubicSpline = 2
+}
+
+/** `KHR_materials_iridescence`. */
+export interface GltfIridescence {
+  factor: number
+  texture?: GltfTextureRef
+  ior: number
+  /** Nanometres. */
+  thicknessMinimum: number
+  /** Nanometres. */
+  thicknessMaximum: number
+  /** Green channel selects between minimum and maximum thickness. */
+  thicknessTexture?: GltfTextureRef
+}
+
+/**
+ * A `KHR_lights_punctual` light. Note glTF's photometric units: point and spot
+ * intensity is in candela (lm/sr), directional is in lux (lm/m²) — they are
+ * **not** the same scale, which is why `kind` has to be consulted before the
+ * value is used.
+ */
+export interface GltfLight {
+  name?: string
+  kind: GltfLightKind
+  /** Linear RGB, nominally in `[0, 1]`. */
+  color: Array<number>
+  intensity: number
+  /** `null` means unlimited. Ignored for directional lights. */
+  range?: number
+  /** Spot only, radians. Defaults to 0. */
+  innerConeAngle: number
+  /** Spot only, radians. Defaults to π/4. */
+  outerConeAngle: number
+  extras?: string
+}
+
+/** `KHR_lights_punctual` light type. */
+export declare enum GltfLightKind {
+  Directional = 0,
+  Point = 1,
+  Spot = 2
+}
+
+export interface GltfLoadOptions {
+  /**
+   * Prefix for the debug labels put on every created buffer, texture and
+   * sampler. Defaults to the file's name.
+   */
+  label?: string
+  /**
+   * Directory that relative URIs resolve against. Defaults to the directory
+   * the glTF file is in, which is what the spec means by "relative to the
+   * glTF asset".
+   */
+  baseDirectory?: string
+  /**
+   * Redirect or replace individual buffers and images. See
+   * [`GltfResourceOverride`]; use `inspectGltf` to learn the URIs first.
+   */
+  resourceOverrides?: Array<GltfResourceOverride>
+  /** Override the sRGB/linear decision per texture. */
+  textureColorSpaces?: Array<GltfTextureColorSpace>
+  /**
+   * Extra `GPUBufferUsage` bits OR'd into every vertex buffer, on top of
+   * `VERTEX | COPY_DST`. Pass `STORAGE` to run compute over the geometry.
+   */
+  extraVertexBufferUsage?: number
+  /**
+   * Extra `GPUBufferUsage` bits for index buffers, on top of
+   * `INDEX | COPY_DST`.
+   */
+  extraIndexBufferUsage?: number
+  /**
+   * `GPUTextureUsage` bitmask for created textures. Defaults to
+   * `TEXTURE_BINDING | COPY_DST`.
+   */
+  textureUsage?: number
+  /**
+   * Skip image decoding and texture creation entirely — every
+   * `GltfTexture.texture` comes back `null`. Useful for loading a scene
+   * graph without paying for its textures.
+   */
+  loadImages?: boolean
+  /**
+   * `maxAnisotropy` for created samplers. Defaults to 1. Silently clamped
+   * back to 1 for samplers that are not fully linear-filtered, because wgpu
+   * rejects that combination.
+   */
+  maxAnisotropy?: number
+  /**
+   * Rewrite `TRIANGLE_FAN` and `LINE_LOOP` primitives into index buffers
+   * WebGPU can draw. Defaults to true; see [`primitive::GltfPrimitive`].
+   */
+  convertUnsupportedTopologies?: boolean
+  /**
+   * Whether every primitive gets the file's own attribute set (`Source`,
+   * the default) or the fixed 48-byte position/normal/tangent/uv layout
+   * (`Standard`). See [`GltfVertexLayoutMode`].
+   */
+  vertexLayout?: GltfVertexLayoutMode
+  /**
+   * Reject a file whose `extensionsRequired` names something unimplemented.
+   * Defaults to true.
+   */
+  strictRequiredExtensions?: boolean
+}
+
+/** glTF sampler `magFilter`. */
+export declare enum GltfMagFilter {
+  Nearest = 0,
+  Linear = 1
+}
+
+/**
+ * What `inspectGltf` returns: everything about a glTF file that can be known
+ * without reading a single byte of its binary payload.
+ */
+export interface GltfManifest {
+  path: string
+  /** Where relative URIs will resolve against. */
+  baseDirectory: string
+  /** True for `.glb` (a binary container), false for `.gltf` (plain JSON). */
+  isBinary: boolean
+  /** Byte length of the GLB binary chunk, or `null` for a `.gltf`. */
+  binaryChunkLength?: number
+  version: string
+  minVersion?: string
+  generator?: string
+  copyright?: string
+  extensionsUsed: Array<string>
+  extensionsRequired: Array<string>
+  /**
+   * The subset of `extensionsRequired` this importer does not implement.
+   * Non-empty means `loadGltf` will reject unless
+   * `strictRequiredExtensions` is false.
+   */
+  unsupportedRequiredExtensions: Array<string>
+  resources: Array<GltfResource>
+  counts: GltfCounts
+}
+
+/**
+ * One glTF material with every supported extension folded in and every spec
+ * default applied.
+ */
+export interface GltfMaterial {
+  name?: string
+  alphaMode: GltfAlphaMode
+  /** Only meaningful when `alphaMode` is `Mask`. Defaults to 0.5. */
+  alphaCutoff: number
+  doubleSided: boolean
+  /** Linear RGBA. Multiplies `baseColorTexture` and any `COLOR_0` attribute. */
+  baseColorFactor: Array<number>
+  baseColorTexture?: GltfTextureRef
+  metallicFactor: number
+  roughnessFactor: number
+  /**
+   * Blue channel is metallic, green is roughness. (Red is unused by the core
+   * spec and is where `KHR_materials_*` extensions sometimes stash data.)
+   */
+  metallicRoughnessTexture?: GltfTextureRef
+  normalTexture?: GltfNormalTextureRef
+  occlusionTexture?: GltfOcclusionTextureRef
+  /** Linear RGB, before `emissiveStrength`. */
+  emissiveFactor: Array<number>
+  emissiveTexture?: GltfTextureRef
+  /**
+   * `KHR_materials_emissive_strength`. Defaults to 1; values above 1 are the
+   * whole point of the extension and require an HDR pipeline to show.
+   */
+  emissiveStrength: number
+  /** `KHR_materials_unlit`: shade as unlit base colour, ignoring lights. */
+  unlit: boolean
+  /**
+   * `KHR_materials_ior`. Defaults to 1.5 (the value the core spec's
+   * dielectric `f0` of 0.04 corresponds to).
+   */
+  ior: number
+  /** `KHR_materials_dispersion`. Defaults to 0. */
+  dispersion: number
+  specular?: GltfSpecular
+  transmission?: GltfTransmission
+  volume?: GltfVolume
+  clearcoat?: GltfClearcoat
+  sheen?: GltfSheen
+  anisotropy?: GltfAnisotropy
+  iridescence?: GltfIridescence
+  /**
+   * Raw JSON of every extension on this material that the fields above do
+   * **not** model — verbatim, so a caller can implement one without a Rust
+   * change. `null` when there are none.
+   */
+  extensions?: string
+  /** Raw JSON of the material's `extras`. `null` when absent. */
+  extras?: string
+}
+
+export interface GltfMesh {
+  name?: string
+  /** Default morph target weights, overridden per node by `GltfNode.weights`. */
+  weights: Array<number>
+  primitives: Array<GltfPrimitive>
+  extras?: string
+}
+
+/**
+ * glTF sampler `minFilter`. The four mipmap modes collapse to a
+ * (`minFilter`, `mipmapFilter`) pair on the created `GpuSampler`.
+ */
+export declare enum GltfMinFilter {
+  Nearest = 0,
+  Linear = 1,
+  NearestMipmapNearest = 2,
+  LinearMipmapNearest = 3,
+  NearestMipmapLinear = 4,
+  LinearMipmapLinear = 5
+}
+
+/**
+ * One morph target's deltas, as its own vertex buffer.
+ *
+ * Locations continue on from the primitive's base layout rather than restarting
+ * at 0, so a pipeline can bind the base buffer and its targets together without
+ * them colliding.
+ */
+export interface GltfMorphTarget {
+  name?: string
+  buffer: GpuBuffer
+  layout: GltfVertexLayout
+}
+
+export interface GltfNode {
+  name?: string
+  /** Indices into `GltfAsset.nodes`. */
+  children: Array<number>
+  /** Index into `GltfAsset.meshes`. */
+  mesh?: number
+  /** Index into `GltfAsset.skins`. Only valid together with `mesh`. */
+  skin?: number
+  /** Index into `GltfAsset.cameras`. */
+  camera?: number
+  /** Index into `GltfAsset.lights` (`KHR_lights_punctual`). */
+  light?: number
+  /** Column-major 4x4, ready for a uniform buffer. */
+  matrix: Array<number>
+  translation: Array<number>
+  /** Quaternion as `[x, y, z, w]` — glTF's order, not `[w, x, y, z]`. */
+  rotation: Array<number>
+  scale: Array<number>
+  /**
+   * True when the file wrote a `matrix`; false when it wrote TRS (or
+   * nothing, in which case both forms are the identity).
+   */
+  hasMatrix: boolean
+  /** Morph target weights overriding the mesh's own, when present. */
+  weights: Array<number>
+  extras?: string
+}
+
+/** The normal-map slot: a texture reference plus its `scale`. */
+export interface GltfNormalTextureRef {
+  index: number
+  texCoord: number
+  /** Multiplies the sampled X and Y before the normal is reconstructed. */
+  scale: number
+  transform?: GltfTextureTransform
+}
+
+/** The occlusion slot: a texture reference plus its `strength`. */
+export interface GltfOcclusionTextureRef {
+  index: number
+  texCoord: number
+  strength: number
+  transform?: GltfTextureTransform
+}
+
+export interface GltfOrthographic {
+  xmag: number
+  ymag: number
+  znear: number
+  zfar: number
+}
+
+export interface GltfPerspective {
+  /**
+   * `null` means "use the viewport's aspect ratio" — the spec's wording, and
+   * not something this importer can resolve for the caller.
+   */
+  aspectRatio?: number
+  /** Vertical field of view, radians. */
+  yfov: number
+  znear: number
+  /** `null` means an infinite projection. */
+  zfar?: number
+}
+
+/**
+ * One drawable primitive: an interleaved vertex buffer, an optional index
+ * buffer, and everything needed to build a pipeline for them.
+ */
+export interface GltfPrimitive {
+  /**
+   * What the file said. `LineLoop` and `TriangleFan` have no WebGPU
+   * equivalent — see `gpuTopology`.
+   */
+  mode: GltfPrimitiveMode
+  /**
+   * The topology to build the pipeline with. Differs from `mode` when the
+   * indices were rewritten (fan → `triangle-list`, loop → `line-strip`), and
+   * is `null` only if that rewrite was disabled via
+   * `convertUnsupportedTopologies: false`.
+   */
+  gpuTopology?: GPUPrimitiveTopology | null
+  /**
+   * Index into `GltfAsset.materials`. Always valid: a primitive with no
+   * material in the file points at `GltfAsset.defaultMaterial`.
+   */
+  material: number
+  vertexCount: number
+  vertexBuffer: GpuBuffer
+  layout: GltfVertexLayout
+  /** `null` for a non-indexed primitive; draw with `draw(vertexCount)`. */
+  indexBuffer?: GpuBuffer
+  /** 0 when `indexBuffer` is null. */
+  indexCount: number
+  indexFormat: GltfIndexFormat
+  /**
+   * The POSITION accessor's `min`, when the file declares one — a
+   * ready-made object-space AABB corner. `null` if absent.
+   */
+  min?: Array<number>
+  /** The POSITION accessor's `max`. */
+  max?: Array<number>
+  morphTargets: Array<GltfMorphTarget>
+  extras?: string
+}
+
+/**
+ * glTF `mesh.primitive.mode`, faithfully. Note two of these have **no WebGPU
+ * equivalent** (`LineLoop`, `TriangleFan`); see `GltfPrimitive.gpuTopology`.
+ */
+export declare enum GltfPrimitiveMode {
+  Points = 0,
+  Lines = 1,
+  LineLoop = 2,
+  LineStrip = 3,
+  Triangles = 4,
+  TriangleStrip = 5,
+  TriangleFan = 6
+}
+
+/** One external or embedded resource, as listed by `inspectGltf`. */
+export interface GltfResource {
+  kind: GltfResourceKind
+  /**
+   * Index within `buffers` or `images` — the value a `resourceOverride`
+   * matches on.
+   */
+  index: number
+  name?: string
+  source: GltfResourceSource
+  /**
+   * The URI exactly as written in the file: not percent-decoded, not
+   * resolved. This is the string a `resourceOverride` matches on. A `data:`
+   * URI is truncated here — it can be megabytes — so match those by index.
+   */
+  uri?: string
+  /** The absolute path the loader will read, for `External` resources only. */
+  resolvedPath?: string
+  /** The file's declared `mimeType`, when it declares one. */
+  mimeType?: string
+  /**
+   * Declared `byteLength` for buffers, or the length of the `bufferView` for
+   * an embedded image. `null` when the file does not say.
+   */
+  byteLength?: number
+}
+
+/**
+ * What a resource listed in a `GltfManifest` actually is. The two kinds live in
+ * separate index spaces — a `Buffer` index indexes `buffers`, an `Image` index
+ * indexes `images` — which is why an override has to name both.
+ */
+export declare enum GltfResourceKind {
+  /** A `buffers[i]` entry: raw binary backing accessors and buffer views. */
+  Buffer = 0,
+  /** An `images[i]` entry: the encoded bytes of a texture. */
+  Image = 1
+}
+
+/**
+ * A caller-supplied substitution for one resource.
+ *
+ * Matched by `index` (within its `kind`) or by the exact `uri` as it appears in
+ * the file. Exactly one of `path`, `bytes` or `skip` says what to do.
+ *
+ * `bytes` is the one place in this package where a byte array crosses the napi
+ * boundary inbound, and it is a considered exception: the whole point of the
+ * hook is to let JS supply data the filesystem does not have (an archive
+ * member, a decrypted blob, a procedurally generated buffer). It is opt-in and
+ * per-resource, so the default path still reads files only.
+ */
+export interface GltfResourceOverride {
+  /**
+   * Which index space `index` refers to. Required even when matching by URI,
+   * because buffers and images can name the same URI.
+   */
+  kind: GltfResourceKind
+  /** Match `buffers[index]` / `images[index]`. Mutually exclusive with `uri`. */
+  index?: number
+  /**
+   * Match the resource whose `uri` is exactly this string, as written in the
+   * file (not percent-decoded, not resolved). Mutually exclusive with `index`.
+   */
+  uri?: string
+  /**
+   * Read this filesystem path instead. Relative paths resolve against the
+   * process working directory, not the glTF base directory — an override is
+   * the caller's own path, not the asset's.
+   */
+  path?: string
+  /** Use these bytes instead. Copied on the JS thread before the load starts. */
+  bytes?: Uint8Array
+  /**
+   * Drop the resource. For an image this yields a `GltfTexture` with a `null`
+   * `texture`; for a buffer it is an error, since accessors would dangle.
+   */
+  skip?: boolean
+}
+
+/**
+ * Where a resource's bytes come from, which is what decides whether an
+ * override can usefully redirect it.
+ */
+export declare enum GltfResourceSource {
+  /**
+   * A relative or absolute URI resolved against the base directory — the
+   * sidecar case, and the only one with a `resolvedPath`.
+   */
+  External = 0,
+  /** An RFC 2397 `data:` URI embedded in the JSON. */
+  DataUri = 1,
+  /**
+   * The GLB binary chunk (a `buffers[0]` with no `uri`, or an image whose
+   * `bufferView` points into it).
+   */
+  BinaryChunk = 2,
+  /** An image stored in a `bufferView` of some other buffer. */
+  BufferView = 3
+}
+
+/** A glTF sampler and the `GpuSampler` created from it. */
+export interface GltfSampler {
+  name?: string
+  sampler: GpuSampler
+  magFilter: GltfMagFilter
+  minFilter: GltfMinFilter
+  wrapS: GltfWrapMode
+  wrapT: GltfWrapMode
+  /**
+   * True for the sampler this importer appends for textures that declare
+   * none. glTF leaves that case to the implementation; the defaults chosen
+   * are `repeat`/`repeat` with trilinear filtering, which is what every other
+   * viewer does.
+   */
+  isDefault: boolean
+}
+
+export interface GltfScene {
+  name?: string
+  /** Indices into `GltfAsset.nodes` — the roots of this scene. */
+  nodes: Array<number>
+  extras?: string
+}
+
+/** `KHR_materials_sheen`. */
+export interface GltfSheen {
+  colorFactor: Array<number>
+  colorTexture?: GltfTextureRef
+  roughnessFactor: number
+  roughnessTexture?: GltfTextureRef
+}
+
+export interface GltfSkin {
+  name?: string
+  /**
+   * Indices into `GltfAsset.nodes`, in joint order — the order the shader's
+   * joint matrix array must be built in.
+   */
+  joints: Array<number>
+  /** The common root of the joints, when the file names one. */
+  skeleton?: number
+  /**
+   * 16 floats per joint, column-major, in `joints` order. `null` when the
+   * file omits them, which the spec says means identity for every joint.
+   */
+  inverseBindMatrices?: Float32Array
+  extras?: string
+}
+
+/** `KHR_materials_specular`. */
+export interface GltfSpecular {
+  factor: number
+  /** Linear RGB. */
+  colorFactor: Array<number>
+  /** Alpha channel scales `factor`. */
+  texture?: GltfTextureRef
+  /** RGB scales `colorFactor`. */
+  colorTexture?: GltfTextureRef
+}
+
+/** A glTF texture: the sampler/image pair, plus the GPU texture it produced. */
+export interface GltfTexture {
+  name?: string
+  /**
+   * The uploaded texture. `null` when the image was skipped by a
+   * `resourceOverride` or when `loadImages` was false.
+   */
+  texture?: GpuTexture
+  /**
+   * Index into `GltfAsset.samplers`. Always set — a texture with no sampler
+   * in the file points at the appended default one.
+   */
+  sampler: number
+  /**
+   * Index into the file's `images` array, for correlating with
+   * `GltfManifest.resources`.
+   */
+  source?: number
+  /**
+   * How the pixels were interpreted. See the module docs for how this is
+   * decided.
+   */
+  colorSpace: ImageColorSpace
+  encoding: GltfImageEncoding
+  /**
+   * Raw JSON of any extension on the `textures[i]` entry (for example
+   * `KHR_texture_basisu`), verbatim.
+   */
+  extensions?: string
+}
+
+/**
+ * Force a specific colour space on one texture, overriding the inference
+ * described in [`texture`].
+ */
+export interface GltfTextureColorSpace {
+  /** Index into the file's `textures` array. */
+  texture: number
+  colorSpace: ImageColorSpace
+}
+
+/**
+ * A reference from a material slot to `textures[index]`, plus the UV set it
+ * samples and any `KHR_texture_transform` applied to it.
+ */
+export interface GltfTextureRef {
+  /** Index into `GltfAsset.textures`. */
+  index: number
+  /** Which `TEXCOORD_n` attribute this slot samples. */
+  texCoord: number
+  /**
+   * `KHR_texture_transform`, when present. Note its own `texCoord` (if set)
+   * **overrides** the one above — that is the extension's rule, and it is
+   * left as written rather than pre-applied so a caller can tell them apart.
+   */
+  transform?: GltfTextureTransform
+}
+
+/** `KHR_texture_transform`: a 2D affine transform applied to UVs before sampling. */
+export interface GltfTextureTransform {
+  /** `[u, v]`. */
+  offset: Array<number>
+  /** Counter-clockwise radians. */
+  rotation: number
+  /** `[u, v]`. */
+  scale: Array<number>
+  /** Overrides the slot's `texCoord` when present. */
+  texCoord?: number
+}
+
+/** `KHR_materials_transmission`. */
+export interface GltfTransmission {
+  factor: number
+  /** Red channel scales `factor`. */
+  texture?: GltfTextureRef
+}
+
+/**
+ * One attribute of an interleaved vertex buffer, in the exact shape
+ * `GPUVertexBufferLayout.attributes` wants — plus what the source accessor
+ * held before canonicalisation, so a caller can tell a quantised asset from a
+ * float one.
+ */
+export interface GltfVertexAttribute {
+  semantic: GltfAttributeSemantic
+  /**
+   * The glTF attribute name exactly as written: `POSITION`, `TEXCOORD_1`,
+   * `_BATCHID`.
+   */
+  name: string
+  /** Set index for `TEXCOORD_n` / `COLOR_n` / `JOINTS_n` / `WEIGHTS_n`. */
+  set: number
+  format: GPUVertexFormat
+  offset: number
+  shaderLocation: number
+  /** The accessor's `componentType` before this importer converted it. */
+  sourceComponentType: GltfComponentType
+  /** The accessor's `type` before conversion. */
+  sourceType: GltfAccessorType
+  /**
+   * The accessor's `normalized` flag. Already applied — the values in the
+   * buffer are un-normalised floats when this is true and the destination
+   * format is a float one.
+   */
+  sourceNormalized: boolean
+}
+
+/**
+ * Feeds straight into `GPUVertexBufferLayout` (`stepMode` is always
+ * `"vertex"`).
+ */
+export interface GltfVertexLayout {
+  arrayStride: number
+  attributes: Array<GltfVertexAttribute>
+}
+
+/** Which vertex layout an import produces. */
+export declare enum GltfVertexLayoutMode {
+  /**
+   * Exactly the attributes the file has, at their canonical locations —
+   * faithful, and a different `arrayStride` per primitive.
+   */
+  Source = 0,
+  /**
+   * **Always** `POSITION` (float32x3), `NORMAL` (float32x3), `TANGENT`
+   * (float32x4), `TEXCOORD_0` (float32x2) at locations 0-3, `arrayStride`
+   * 48 — for a renderer that wants one pipeline for every mesh.
+   *
+   * This is lossy in both directions and deliberately so: missing
+   * attributes are **synthesised**, and every other attribute (`COLOR_0`,
+   * joints, weights, custom `_FOO`) is **dropped**. Use `Source` if any of
+   * that matters.
+   */
+  Standard = 1
+}
+
+/** `KHR_materials_volume`. Only meaningful together with transmission. */
+export interface GltfVolume {
+  thicknessFactor: number
+  /** Green channel scales `thicknessFactor`. */
+  thicknessTexture?: GltfTextureRef
+  /**
+   * Distance at which the transmitted colour equals `attenuationColor`.
+   * The spec's default is `+Infinity`; it is reported as `Infinity`, not as
+   * a sentinel, so arithmetic on it behaves.
+   */
+  attenuationDistance: number
+  attenuationColor: Array<number>
+}
+
+/**
+ * glTF sampler `wrapS`/`wrapT`. Maps 1:1 onto `GPUAddressMode`, which is what
+ * the created `GpuSampler` is configured with.
+ */
+export declare enum GltfWrapMode {
+  ClampToEdge = 0,
+  MirroredRepeat = 1,
+  Repeat = 2
+}
+
 export interface GpuAdapterInfo {
   vendor: string
   architecture: string
@@ -1960,12 +2893,52 @@ export interface ImageLoadOptions {
   usage?: number
 }
 
+/**
+ * Parse a `.gltf` or `.glb` and report what it contains and what it depends on
+ * — **without reading any external file, decoding any image, or touching the
+ * GPU.** No device is needed.
+ *
+ * This is the first half of the override workflow: the `resources` it lists
+ * carry the exact `index` and `uri` values a `GltfResourceOverride` matches on,
+ * so a caller can decide what to substitute before `loadGltf` reads anything.
+ * It is also the cheap way to answer "does this asset need an extension I do
+ * not support" (`unsupportedRequiredExtensions`) or "how big is this scene"
+ * (`counts`).
+ */
+export declare function inspectGltf(path: string, baseDirectory?: string | undefined | null): Promise<GltfManifest>
+
 export interface Ktx2LoadOptions {
   /** Debug label applied to the created GPU texture. */
   label?: string
   /** `GpuTextureUsage` bitmask. Defaults to `TEXTURE_BINDING | COPY_DST`. */
   usage?: number
 }
+
+/**
+ * Import a glTF 2.0 asset (`.gltf` or `.glb`) into GPU buffers, textures and
+ * samplers, plus its whole scene graph as typed data — off the JS thread.
+ *
+ * Each primitive comes back as an **interleaved vertex buffer** with a
+ * `layout` in the exact shape `GPUVertexBufferLayout` wants, an index buffer
+ * (`Uint16`/`Uint32` — glTF's byte indices are widened, since WebGPU has no
+ * 8-bit index format), and a `gpuTopology` string ready for
+ * `createRenderPipeline`. Materials arrive with every spec default applied and
+ * every supported `KHR_*` extension folded in; anything unrecognised is kept as
+ * raw JSON rather than dropped.
+ *
+ * Texture colour space is inferred from which material slot each texture is
+ * bound to (base colour and emissive are sRGB, normal/occlusion/metallic-
+ * roughness are linear) and can be overridden per texture.
+ *
+ * Use `inspectGltf` first if you need to redirect the file's external
+ * resources — it lists every buffer and image URI, which is what
+ * `resourceOverrides` matches on.
+ *
+ * The promise rejects on a malformed file, a missing resource, a required
+ * extension this importer does not implement, or a wgpu validation error
+ * during upload.
+ */
+export declare function loadGltf(device: GpuDevice, path: string, options?: GltfLoadOptions | undefined | null): Promise<GltfAsset>
 
 /**
  * Decode an image file (PNG, TGA, JPEG, Radiance HDR) straight into a

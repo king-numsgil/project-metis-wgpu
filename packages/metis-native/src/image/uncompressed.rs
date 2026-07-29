@@ -29,6 +29,7 @@ use std::sync::Arc;
 /// `loadKtx2Texture` reads the colour space out of the file rather than taking
 /// it from the caller.
 #[napi]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ImageColorSpace {
     /// sRGB-encoded colour (albedo, emissive) — creates an `rgba8unorm-srgb`
     /// texture, so the hardware linearises on sample.
@@ -63,13 +64,13 @@ fn resolve_options(options: Option<ImageLoadOptions>) -> ResolvedOptions {
 }
 
 /// Decoded pixels plus the wgpu format they must be uploaded as.
-struct DecodedImage {
-    data: Vec<u8>,
-    width: u32,
-    height: u32,
-    format: wgpu::TextureFormat,
+pub(crate) struct DecodedImage {
+    pub(crate) data: Vec<u8>,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) format: wgpu::TextureFormat,
     /// Bytes per pixel in `data` — 4 for RGBA8, 8 for RGBA16F.
-    bytes_per_pixel: u32,
+    pub(crate) bytes_per_pixel: u32,
 }
 
 /// Decodes an image file into a GPU-uploadable buffer.
@@ -104,9 +105,72 @@ fn decode_image(path: &str, srgb: bool) -> napi::Result<DecodedImage> {
         .decode()
         .map_err(|e| generic_err(format!("failed to decode '{}': {}", path, e)))?;
 
+    to_gpu_pixels(decoded, source_format, path, srgb)
+}
+
+/// Decode an image that is already **in memory** rather than on disk.
+///
+/// This is the entry point the glTF importer uses, because glTF images are
+/// routinely embedded — in the GLB binary chunk or in a `data:` URI — and so
+/// never exist as a file to open. It is `pub(crate)` on purpose: the *public*
+/// API stays "file readers only" (see the module docs), and nothing here
+/// changes that, since no byte slice crosses the napi boundary in either
+/// direction.
+///
+/// `name` is only used in error messages. `mime_type` is the glTF `mimeType`
+/// when the file declares one; it is used **only as a fallback** if the magic
+/// bytes are inconclusive, so a wrongly-declared `mimeType` still loads —
+/// matching the file path's "magic bytes first, extension second" rule.
+pub(crate) fn decode_image_bytes(
+    bytes: &[u8],
+    name: &str,
+    srgb: bool,
+    mime_type: Option<&str>,
+) -> napi::Result<DecodedImage> {
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|e| generic_err(format!("failed to read '{}': {}", name, e)))?;
+    if reader.format().is_none() {
+        // No signature matched. A declared mimeType is the only hint left; TGA
+        // is the case that actually needs it (it has no magic bytes at all).
+        let hint = match mime_type {
+            Some("image/png") => Some(image::ImageFormat::Png),
+            Some("image/jpeg") => Some(image::ImageFormat::Jpeg),
+            Some("image/webp") => Some(image::ImageFormat::WebP),
+            Some("image/x-targa") | Some("image/x-tga") | Some("image/targa") => Some(image::ImageFormat::Tga),
+            Some("image/vnd.radiance") => Some(image::ImageFormat::Hdr),
+            _ => None,
+        };
+        match hint {
+            Some(f) => reader.set_format(f),
+            None => {
+                return Err(generic_err(format!(
+                    "'{}' matches no known image signature{}. Supported: PNG, JPEG, WebP, Radiance HDR, and TGA \
+                     (TGA has no signature, so it needs an accurate `mimeType`).",
+                    name,
+                    mime_type.map(|m| format!(" and its declared mimeType '{m}' is not one this loader decodes")).unwrap_or_default()
+                )));
+            }
+        }
+    }
+    let source_format = reader.format();
+    let decoded = reader
+        .decode()
+        .map_err(|e| generic_err(format!("failed to decode '{}': {}", name, e)))?;
+    to_gpu_pixels(decoded, source_format, name, srgb)
+}
+
+/// The half both decode paths share: pick the destination wgpu format from the
+/// *source* format and flatten the pixels into an upload buffer.
+fn to_gpu_pixels(
+    decoded: image::DynamicImage,
+    source_format: Option<image::ImageFormat>,
+    name: &str,
+    srgb: bool,
+) -> napi::Result<DecodedImage> {
     let (width, height) = (decoded.width(), decoded.height());
     if width == 0 || height == 0 {
-        return Err(generic_err(format!("'{}' decoded to a zero-sized image", path)));
+        return Err(generic_err(format!("'{}' decoded to a zero-sized image", name)));
     }
 
     // Radiance HDR is the only float source enabled; everything else is 8-bit.
@@ -124,7 +188,7 @@ fn decode_image(path: &str, srgb: bool) -> napi::Result<DecodedImage> {
 }
 
 /// Uploads decoded pixels into a fresh single-mip texture.
-fn upload_texture(
+pub(crate) fn upload_texture(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     img: &DecodedImage,

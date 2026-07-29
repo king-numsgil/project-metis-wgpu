@@ -25,6 +25,22 @@ export class SceneInstance {
      * decomposed back into `Transform`'s position/Euler-rotation/scale fields.
      */
     modelMatrixOverride: Mat4f | null = null;
+    /**
+     * Whether this instance is drawn into the shadow passes (all four sun
+     * cascades and every spot-shadow layer). Default `true`.
+     *
+     * Set it `false` for geometry that is *visual only* — light gizmos, sky
+     * shells, emissive markers, anything whose silhouette is not meant to
+     * occlude. A hundred small emissive spheres standing in for point lights
+     * (see `examples/helmet-demo.ts`) otherwise speckle every lit surface with
+     * their own little shadows, which reads as noise rather than as lighting.
+     *
+     * It is not a culling optimisation and should not be used as one — a real
+     * occluder that is off-screen must still cast, and that is what the spot
+     * pass's frustum test is for. This says "this object has no shadow",
+     * which is a property of the content, not of the frame.
+     */
+    castsShadow = true;
 
     private buffer: GpuBuffer | null = null;
     private bindGroup: GpuBindGroup | null = null;

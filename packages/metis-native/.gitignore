@@ -128,3 +128,6 @@ Cargo.lock
 !.yarn/sdks
 !.yarn/versions
 /npm
+
+# Downloaded Khronos glTF sample assets — re-fetched on demand.
+tests/assets-cache/

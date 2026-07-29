@@ -323,21 +323,42 @@ class Scene {
 class SceneInstance {
     transform: Transform;
     modelMatrixOverride: Mat4f | null;  // bypasses transform (e.g. glTF nodes)
+    castsShadow: boolean;               // default true; see below
     mesh: Mesh; material: Material;
     destroy(): void;
 }
 ```
 
+`castsShadow: false` keeps an instance out of **every** shadow pass — all four
+sun cascades and every spot-shadow layer. It is for geometry that is visual only
+(light gizmos, emissive markers, sky shells, a ground plane with nothing
+beneath it): a hundred small marker spheres otherwise speckle every lit surface
+with their own shadows, which is noise, not lighting. It is **not** a culling
+knob — an off-screen occluder must still cast, and the spot pass's frustum test
+already handles that. Set it for content that has no shadow, never for content
+that is merely out of view.
+
 ### `Mesh`
 
 ```ts
-new Mesh(device: GpuDevice, data: MeshData, label?: string)
+new Mesh(device: GpuDevice, source: MeshData | ImportedMeshBuffers, label?: string)
 readonly indexCount: number;
+readonly indexFormat: GPUIndexFormat;  // "uint32" for MeshData; glTF meshes are often "uint16"
 readonly boundingRadius: number;  // max |vertex| in local space; the shadow frustum uses this
 bind(pass: GpuRenderPassEncoder): void;
 draw(pass: GpuRenderPassEncoder, instanceCount = 1): void;
 destroy(): void;
+
+interface ImportedMeshBuffers {
+    vertexBuffer: GpuBuffer; indexBuffer: GpuBuffer;
+    indexCount: number; indexFormat: GPUIndexFormat; boundingRadius: number;
+}
 ```
+
+`ImportedMeshBuffers` **adopts** buffers something else already uploaded rather
+than uploading vertex data — the glTF path, where `metis-native`'s importer has
+already produced the exact `MESH_VERTEX_LAYOUT` bytes. `boundingRadius` has to be
+supplied with them, since it cannot be recomputed once the geometry is on the GPU.
 
 `MESH_VERTEX_LAYOUT` — the single layout every mesh uses. Stride **48 bytes**:
 `position vec3 @0`, `normal vec3 @12`, `tangent vec4 @24` (w = bitangent sign),
@@ -713,7 +734,11 @@ resolve). Prefer closed/thick meshes for anything casting interior shadows.
 ```ts
 loadTexture(device, path, options?: { srgb?: boolean; label?: string }): Promise<{ texture, view }>
 getMaterialDefaults(device): MaterialDefaults   // cached per device (WeakMap)
-loadGltf(device, gltfPath): Promise<SceneInstance[]>
+loadGltf(device, gltfPath, options?: LoadGltfOptions): Promise<SceneInstance[]>
+loadGltfAsset(device, gltfPath, options?: LoadGltfOptions): Promise<GltfAsset>
+instancesFromAsset(device, asset: GltfAsset): SceneInstance[]
+
+interface LoadGltfOptions { label?: string; loadImages?: boolean; maxAnisotropy?: number }
 ```
 
 `srgb: true` for colour data (albedo, emissive), `false`/omitted for data maps
@@ -724,10 +749,28 @@ Formats: **PNG, TGA, JPEG, Radiance HDR**. `srgb` is **ignored for `.hdr`**,
 which loads as an `rgba16float` texture rather than `rgba8unorm` — check
 `texture.format` if downstream code assumes 8-bit.
 
-`loadGltf` is a **deliberately narrow** reader: separate `.gltf` + `.bin` only
-(no `.glb`, no embedded base64), `f32` POSITION/NORMAL/optional TEXCOORD_0,
-`u16`/`u32` indices. No TANGENT (fabricates one), ignores glTF material textures
-(factors only). Skinning/morph/sparse accessors throw.
+`loadGltf` is a thin adapter over **`metis-native`'s** importer (see its
+`DOC.md` §8b) — `.gltf` and `.glb`, external/embedded/`data:` resources, sparse
+and interleaved and quantised accessors, textures, and the `KHR_*` material
+extensions. It returns one `SceneInstance` per mesh *primitive* per node, with
+the node's world matrix in `modelMatrixOverride`; meshes and materials are shared
+across nodes. The instances are **not** added to a `Scene` — push them onto
+`scene.instances` yourself.
+
+Geometry is requested in the native importer's `GltfVertexLayoutMode.Standard`,
+which is exactly `MESH_VERTEX_LAYOUT` (stride 48), so the buffers are
+adopted rather than re-uploaded — and missing normals/tangents are synthesised
+rather than faked. Materials carry base colour, normal, emissive and the packed
+metallic-roughness texture through (`forward.wgsl` reads metallic from blue and
+roughness from green, glTF's channel assignment).
+
+What it drops: skins, morph targets, animations, cameras and lights — the
+renderer has no pipeline for the first three and no extraction path for the last
+two. **`loadGltfAsset` returns the full `GltfAsset`** if you need them, and
+`instancesFromAsset` is the second half of `loadGltf` for when you want both.
+Non-triangle-list primitives are skipped with a warning (the forward pipeline is
+triangle-list only), and a non-opaque `alphaMode` warns and renders opaque
+(nothing blends yet).
 
 ---
 

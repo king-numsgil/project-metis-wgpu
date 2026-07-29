@@ -343,6 +343,62 @@ fn upload_blocks(
     Arc::new(texture)
 }
 
+/// Parse and upload a KTX2 file that is already **in memory**.
+///
+/// Split out of `LoadKtx2Task::compute` for the glTF importer, which reaches
+/// KTX2 payloads through `KHR_texture_basisu` — where the container may live in
+/// the GLB binary chunk or a `data:` URI and so has no file to read. It is
+/// `pub(crate)`: the public API stays "file readers only" and no byte slice
+/// crosses the napi boundary.
+///
+/// `name` appears in error messages in place of a path. **The caller wraps this
+/// in `with_validation_scope`** — it does not, so that an importer uploading
+/// many textures can bracket the whole GPU phase once.
+pub(crate) fn upload_ktx2_bytes(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    bytes: &[u8],
+    name: &str,
+    usage: u32,
+    label: Option<&str>,
+) -> napi::Result<GpuTexture> {
+    let reader = ktx2::Reader::new(bytes)
+        .map_err(|e| generic_err(format!("'{}' is not a valid KTX2 file: {:?}", name, e)))?;
+
+    let info = validate(name, &reader, device.features())?;
+
+    let format = info.format.wgpu;
+    let (block_w, block_h) = format.block_dimensions();
+    let block_bytes = format.block_copy_size(None).unwrap_or(0) as usize;
+
+    let zstd = matches!(reader.header().supercompression_scheme, Some(ktx2::SupercompressionScheme::Zstandard));
+    let mut levels: Vec<Cow<'_, [u8]>> = Vec::with_capacity(info.level_count as usize);
+
+    for (i, level) in reader.levels().enumerate() {
+        let idx = i as u32;
+        let w = mip_size(info.width, idx);
+        let h = mip_size(info.height, idx);
+        let expected = (w.div_ceil(block_w) as usize) * (h.div_ceil(block_h) as usize) * block_bytes;
+
+        let data: Cow<'_, [u8]> = if zstd {
+            Cow::Owned(decompress_zstd(level.data, expected, name, idx)?)
+        } else {
+            Cow::Borrowed(level.data)
+        };
+
+        if data.len() < expected {
+            return Err(generic_err(format!(
+                "'{}': mip level {} is truncated — {} bytes present, {} required for {}x{} of {:?}",
+                name, idx, data.len(), expected, w, h, format
+            )));
+        }
+        levels.push(data);
+    }
+
+    let inner = upload_blocks(device, queue, &info, &levels, usage, label);
+    Ok(make_gpu_texture(inner, info.width, info.height, info.level_count, format, usage, label.map(str::to_owned)))
+}
+
 // ── loadKtx2Texture (async) ─────────────────────────────────────────────────
 
 pub struct LoadKtx2Task {
@@ -361,55 +417,15 @@ impl Task for LoadKtx2Task {
         let bytes = std::fs::read(&self.path)
             .map_err(|e| generic_err(format!("failed to read '{}': {}", self.path, e)))?;
 
-        let reader = ktx2::Reader::new(bytes.as_slice())
-            .map_err(|e| generic_err(format!("'{}' is not a valid KTX2 file: {:?}", self.path, e)))?;
-
-        let info = validate(&self.path, &reader, self.device.features())?;
-
-        let format = info.format.wgpu;
-        let (block_w, block_h) = format.block_dimensions();
-        let block_bytes = format.block_copy_size(None).unwrap_or(0) as usize;
-
-        // Decompress if needed and check every level's size *before* touching
-        // the GPU. A short level would otherwise become a wgpu validation error
-        // (which this binding does not throw on), leaving the caller with a
-        // texture full of garbage and no indication anything went wrong.
-        let zstd = matches!(reader.header().supercompression_scheme, Some(ktx2::SupercompressionScheme::Zstandard));
-        let mut levels: Vec<Cow<'_, [u8]>> = Vec::with_capacity(info.level_count as usize);
-
-        for (i, level) in reader.levels().enumerate() {
-            let idx = i as u32;
-            let w = mip_size(info.width, idx);
-            let h = mip_size(info.height, idx);
-            let expected = (w.div_ceil(block_w) as usize) * (h.div_ceil(block_h) as usize) * block_bytes;
-
-            let data: Cow<'_, [u8]> = if zstd {
-                Cow::Owned(decompress_zstd(level.data, expected, &self.path, idx)?)
-            } else {
-                Cow::Borrowed(level.data)
-            };
-
-            if data.len() < expected {
-                return Err(generic_err(format!(
-                    "'{}': mip level {} is truncated — {} bytes present, {} required for {}x{} of {:?}",
-                    self.path, idx, data.len(), expected, w, h, format
-                )));
-            }
-            levels.push(data);
-        }
-
-        // Everything above is pure CPU parsing and rejects bad input itself.
-        // From here on wgpu is involved, and this runs on a libuv worker where
-        // the caller's error scope does not reach — see `with_validation_scope`.
-        // A wrong `bytes_per_row` or copy extent is a validation error, not a
+        // The parse rejects bad input itself and cannot panic; wgpu only gets
+        // involved at the upload. That upload runs on a libuv worker, where the
+        // caller's error scope does not reach — see `with_validation_scope`. A
+        // wrong `bytes_per_row` or copy extent is a validation error, not a
         // panic, so without this it would hand back a plausible texture full of
         // garbage.
-        let inner = with_validation_scope(
-            &self.device,
-            &format!("loadKtx2Texture('{}')", self.path),
-            || Ok(upload_blocks(&self.device, &self.queue, &info, &levels, self.usage, self.label.as_deref())),
-        )?;
-        Ok(make_gpu_texture(inner, info.width, info.height, info.level_count, format, self.usage, self.label.clone()))
+        with_validation_scope(&self.device, &format!("loadKtx2Texture('{}')", self.path), || {
+            upload_ktx2_bytes(&self.device, &self.queue, &bytes, &self.path, self.usage, self.label.as_deref())
+        })
     }
 
     fn resolve(&mut self, _env: Env, output: GpuTexture) -> napi::Result<GpuTexture> {

@@ -24,11 +24,11 @@ export type { Mat3f, Mat4f, Quatf, Vec2f, Vec3f, Vec4f } from "./math/types.ts";
 
 export { cube, plane, roomBox, uvSphere } from "./assets/primitives.ts";
 export type { MeshData, WindowCutout } from "./assets/primitives.ts";
-export { loadGltf } from "./assets/gltf.ts";
+export { instancesFromAsset, loadGltf, loadGltfAsset, type LoadGltfOptions } from "./assets/gltf.ts";
 export { getMaterialDefaults, loadTexture } from "./assets/texture.ts";
 export type { LoadedTexture, MaterialDefaults } from "./assets/texture.ts";
 
-export { Mesh, MESH_VERTEX_LAYOUT } from "./scene/mesh.ts";
+export { type ImportedMeshBuffers, Mesh, MESH_VERTEX_LAYOUT } from "./scene/mesh.ts";
 export { Material } from "./scene/material.ts";
 export type { MaterialParams } from "./scene/material.ts";
 export type { Light, PointLight, SpotLight } from "./scene/light.ts";
