@@ -654,14 +654,11 @@ scaling claim survives, only the constant moves.
 
 Two more things that only became visible with real geometry in the scene:
 
-- **CPU encode became a first-class cost.** 8.2 ms at 1 draw, 21.9 ms at 101,
-  81.8 ms at 401 — about 0.2 ms per instance per frame, linear. That is the
-  per-instance `getModelBindGroup` + `writeBuffer` path running once per
-  instance per pass, and with four cascades, four spot layers, a prepass and the
-  forward pass that is ~10x per instance per frame. It sits under the GPU time
-  on this iGPU so it is not yet the bottleneck, but on a fast discrete GPU it
-  would be the first thing to hit. Instancing or a single dynamic-offset model
-  buffer is the fix when it matters; it has not been measured as worth doing yet.
+- **CPU encode became a first-class cost.** ~5.5 ms at 1 draw, ~20 ms at 101,
+  ~60 ms at 401 — roughly linear in instance count. It sits under the GPU time
+  on this iGPU so it is not the bottleneck *here*, but on a fast discrete GPU it
+  would be the first thing to hit. See "Draw-call batching" below for what it is
+  made of and what has been done about it.
 - **The shadow passes scale worse than the forward pass** — see the no
   per-cascade-frustum-culling rough edge above, which this now puts a number on.
 
@@ -1364,6 +1361,60 @@ engine, which is why they are here rather than only in the file's comments.
   **Dimming a light is almost always the better move than removing it** — the
   thing that was actually broken was what was in the shadow pass, not that there
   was one.
+
+### Draw-call batching — and how it nearly got written off as worthless
+
+`shading/drawBatching.ts` sorts the frame's instances so draws sharing a `Mesh`
+and `Material` are adjacent (`DrawOrder`), and skips binds a previous draw
+already made (`PassBinder`). Both are internal: `render(encoder, targets, scene)`
+already receives the whole scene, so nothing in the public API moved, and
+`Scene.instances` is never reordered — sorting the caller's array would be a
+visible side effect of rendering.
+
+**Encode cost here is per call, not per triangle.** Every `setBindGroup` /
+`setVertexBuffer` / `setIndexBuffer` / `draw` / `writeBuffer` is a JS -> napi ->
+Rust -> wgpu crossing, so 400 helmets encode exactly like 400 cubes. The frame's
+call count is `instances x passes-that-draw-them x calls-per-draw`, and with four
+cascades, four spot layers, a prepass and the forward pass the middle term is
+~10. Sorting attacks the third term; it is the cheapest of the three to attack
+and the smallest.
+
+**The first measurement said it was worth nothing, and that measurement was
+wrong.** At 1280x720 on the Intel iGPU, CPU encode read 20.7 ms before and
+20.3 ms after at 100 helmets — noise. The cause was contention, not the change:
+on an integrated GPU the CPU and GPU share memory bandwidth, and
+`queue.writeBuffer` goes through wgpu's staging belt, so a GPU pinned at 80 ms a
+frame inflates and destabilises the CPU number that is nominally independent of
+it. **To isolate CPU encode, shrink the render target, not the scene** —
+`--width 320 --height 240` keeps every draw call and removes the contention.
+Re-measured that way at 400 helmets, over two runs:
+
+| | sort off | sort on |
+|---|---|---|
+| model upload per pass (today) | ~80 ms | **~63 ms** |
+| model upload per frame (not done) | ~52 ms | ~38 ms |
+
+So sorting is worth ~20%, and the thing it was *hiding behind* is worth ~35%:
+`SceneInstance.getModelBindGroup` both computes the model + normal matrices and
+uploads them, and every pass calls it — so the same bytes are re-derived and
+re-uploaded 6-10 times per frame for an object that did not move. Splitting
+"compute once per frame" from "bind per pass" is the next change and the larger
+one; the two compose to ~52%.
+
+Two invariants worth not breaking:
+
+- **`PassBinder.begin()` must run after every `beginRenderPass`.** Bind state
+  does not survive a pass. A tracker carried across passes would skip binds that
+  were never made and draw with stale state.
+- **Sorting is only safe while everything is opaque and depth-tested.** The day
+  alpha blending lands, transparent instances need back-to-front order and must
+  be excluded from this sort — the correct-by-accident property here is that
+  opaque draw order is unobservable, not that order never matters.
+
+Verified by rendering all 14 fixtures with and without the sort *on the same
+machine*: byte-identical, zero differing samples. That is the check to repeat,
+because the committed goldens drift by a few LSBs across machines and a plain
+`git diff` on them proves nothing either way.
 
 ### `SceneInstance.castsShadow` — content, not culling
 

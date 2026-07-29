@@ -342,6 +342,7 @@ that is merely out of view.
 
 ```ts
 new Mesh(device: GpuDevice, source: MeshData | ImportedMeshBuffers, label?: string)
+readonly id: number;              // process-unique; the renderer's draw-sort key
 readonly indexCount: number;
 readonly indexFormat: GPUIndexFormat;  // "uint32" for MeshData; glTF meshes are often "uint16"
 readonly boundingRadius: number;  // max |vertex| in local space; the shadow frustum uses this
@@ -375,8 +376,14 @@ interface MaterialParams {
     albedoTexture?, normalTexture?, metallicTexture?, roughnessTexture?, emissiveTexture?: GpuTextureView;
 }
 new Material(params?: MaterialParams)
+readonly id: number;   // process-unique; the renderer's secondary draw-sort key
 destroy(): void;
 ```
+
+`Mesh.id` and `Material.id` exist so the renderer can sort draws by GPU state
+with an integer compare. They are assigned in construction order, are **not
+stable across runs**, and mean nothing beyond grouping — don't persist them or
+use them as asset keys.
 
 Every material binds **6 texture-ish bindings (1 sampler + 5 textures)** whether
 or not you supply them — unset slots fall back to shared 1x1 neutral

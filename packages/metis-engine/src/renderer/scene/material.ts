@@ -9,6 +9,8 @@ import {
 import { getMaterialDefaults } from "../assets/texture.ts";
 import { MaterialUniforms, stage } from "../shading/gpuLayouts.ts";
 
+let nextMaterialId = 0;
+
 /** Constructor parameters for {@link Material}. Every field is optional; the defaults are a plain white dielectric. */
 export interface MaterialParams {
     /** Linear RGBA albedo factor. Default `[1,1,1,1]`. Alpha is carried but nothing blends yet. */
@@ -39,6 +41,12 @@ export interface MaterialParams {
  * branching on "has texture" flags).
  */
 export class Material {
+    /**
+     * Process-unique, monotonically increasing — the secondary draw-sort key
+     * (see `shading/drawBatching.ts`). Not stable across runs; only grouping is
+     * meaningful.
+     */
+    readonly id: number = nextMaterialId++;
     /** Linear RGBA albedo factor; multiplied by `albedoTexture` if present. */
     baseColor: [number, number, number, number];
     /** Metalness factor; multiplied by `metallicTexture`'s red channel if present. */

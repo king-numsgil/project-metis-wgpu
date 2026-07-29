@@ -16,7 +16,8 @@ import { Mat4, Vec3 } from "metis-data";
 import type { GpuProfiler } from "../debug/gpuProfiler.ts";
 import { type Mat4f, mat4f, type Vec3f, vec3f } from "../math/types.ts";
 import { MESH_VERTEX_LAYOUT } from "../scene/mesh.ts";
-import type { Scene } from "../scene/scene.ts";
+import type { Scene, SceneInstance } from "../scene/scene.ts";
+import { PassBinder } from "./drawBatching.ts";
 import { CASCADE_COUNT, SHADOW_MAP_SIZE } from "./shadowConfig.ts";
 import { CascadeUniforms, SHADOW_RENDER_STRIDE, stage, wrapMat4 } from "./gpuLayouts.ts";
 import commonWgsl from "./wgsl/common.wgsl" with { type: "text" };
@@ -98,6 +99,8 @@ export class ShadowCascades {
 
     private readonly device: GpuDevice;
     private readonly modelBindGroupLayout: GpuBindGroupLayout;
+    /** Redundant-bind tracker, reset at the start of each cascade's pass. */
+    private readonly binder = new PassBinder();
     // All cascades: one depth32float array, one layer each.
     private readonly pcfDepthArray: GpuTexture;
     private readonly pcfDepthLayerViews: GpuTextureView[]; // per-layer, for rendering
@@ -255,12 +258,16 @@ export class ShadowCascades {
      * culling (deliberate: a cascade's ortho frustum is fit to a slice of the
      * camera frustum, so almost nothing the camera sees falls outside it).
      *
+     * @param instances the frame's draw order from `DrawOrder` — **not**
+     *   `scene.instances`. Same array for every pass in the frame, so the
+     *   redundant binds each pass skips are the same ones; see `drawBatching.ts`.
      * @param shadowDistance far reach of the shadowed region, in world units.
      * @param splitLambda practical-split blend: 1 = logarithmic, 0 = uniform.
      */
     render(
         encoder: GpuCommandEncoder,
         scene: Scene,
+        instances: readonly SceneInstance[],
         shadowDistance: number,
         splitLambda: number,
         profiler?: GpuProfiler,
@@ -285,12 +292,17 @@ export class ShadowCascades {
 
         const drawScene = (pass: ReturnType<GpuCommandEncoder["beginRenderPass"]>, cascade: number) => {
             pass.setBindGroup(0, this.cascadeRenderBindGroups[cascade]!);
-            for (const instance of scene.instances) {
+            // Per pass, not per cascade loop: nothing survives beginRenderPass.
+            this.binder.begin();
+            for (const instance of instances) {
                 if (!instance.castsShadow) {
                     continue;
                 }
                 pass.setBindGroup(1, instance.getModelBindGroup(this.device, this.modelBindGroupLayout));
-                instance.mesh.bind(pass);
+                // Depth-only — no material here, which is why the draw sort is
+                // mesh-major: this pass and the three others like it can only
+                // ever batch on mesh.
+                this.binder.setMesh(pass, instance.mesh);
                 instance.mesh.draw(pass);
             }
         };

@@ -18,7 +18,8 @@ import { transformToMat4 } from "../math/transform.ts";
 import { type Mat4f, mat4f, vec3f } from "../math/types.ts";
 import type { Light, SpotLight } from "../scene/light.ts";
 import { MESH_VERTEX_LAYOUT } from "../scene/mesh.ts";
-import type { Scene } from "../scene/scene.ts";
+import type { SceneInstance } from "../scene/scene.ts";
+import { PassBinder } from "./drawBatching.ts";
 import { MAX_SHADOW_SPOTS, SPOT_SHADOW_MAP_SIZE } from "./shadowConfig.ts";
 import { SHADOW_RENDER_STRIDE, SpotShadowUniforms, stage, wrapMat4 } from "./gpuLayouts.ts";
 import commonWgsl from "./wgsl/common.wgsl" with { type: "text" };
@@ -100,6 +101,8 @@ export class SpotShadows {
 
     private readonly device: GpuDevice;
     private readonly modelBindGroupLayout: GpuBindGroupLayout;
+    /** Redundant-bind tracker, reset at the start of each spot layer's pass. */
+    private readonly binder = new PassBinder();
     private readonly depthArray: GpuTexture;
     private readonly layerViews: GpuTextureView[];
     private readonly renderBuffer: GpuBuffer;
@@ -231,8 +234,18 @@ export class SpotShadows {
      *
      * Every layer is cleared each frame, including unused ones: a stale layer
      * would otherwise be sampled by a light that inherited its index later.
+     *
+     * @param instances the frame's draw order from `DrawOrder` — **not**
+     *   `scene.instances`. `lastDrawnInstances`/`lastCandidateInstances` count
+     *   over this list, and the per-frame bounding spheres are indexed by
+     *   position in it, so the two must never be mixed.
      */
-    render(encoder: GpuCommandEncoder, scene: Scene, spots: SpotLight[], profiler?: GpuProfiler) {
+    render(
+        encoder: GpuCommandEncoder,
+        instances: readonly SceneInstance[],
+        spots: SpotLight[],
+        profiler?: GpuProfiler,
+    ) {
         const texelScale = this.texelScaleScratch;
 
         for (let i = 0; i < spots.length; i++) {
@@ -276,7 +289,7 @@ export class SpotShadows {
 
         // World bounding spheres once per frame, reused across every light's
         // frustum test rather than recomputed per (light, instance).
-        const spheres = scene.instances.map((inst) => {
+        const spheres = instances.map((inst) => {
             const model = inst.modelMatrixOverride ?? transformToMat4(inst.transform, this.modelScratch);
             return worldBoundingSphere(model, inst.mesh.boundingRadius);
         });
@@ -302,12 +315,13 @@ export class SpotShadows {
                 frustumFromViewProj(this.renderMatrices[i]!, this.frustum);
                 pass.setPipeline(this.pipeline);
                 pass.setBindGroup(0, this.renderBindGroups[i]!);
-                for (let k = 0; k < scene.instances.length; k++) {
+                this.binder.begin();
+                for (let k = 0; k < instances.length; k++) {
                     // Checked before the counter: a non-caster is not a culling
                     // candidate at all, so counting it would make the
                     // drawn/candidate ratio the HUD reports look worse than the
                     // frustum test actually is.
-                    if (!scene.instances[k]!.castsShadow) {
+                    if (!instances[k]!.castsShadow) {
                         continue;
                     }
                     this.lastCandidateInstances++;
@@ -315,9 +329,9 @@ export class SpotShadows {
                     if (!sphereInFrustum(this.frustum, s.x, s.y, s.z, s.r)) {
                         continue;
                     }
-                    const instance = scene.instances[k]!;
+                    const instance = instances[k]!;
                     pass.setBindGroup(1, instance.getModelBindGroup(this.device, this.modelBindGroupLayout));
-                    instance.mesh.bind(pass);
+                    this.binder.setMesh(pass, instance.mesh);
                     instance.mesh.draw(pass);
                     this.lastDrawnInstances++;
                 }

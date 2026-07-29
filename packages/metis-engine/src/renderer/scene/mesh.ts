@@ -28,6 +28,8 @@ function toBytes(view: Float32Array | Uint32Array): Uint8Array {
     return new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
 }
 
+let nextMeshId = 0;
+
 /**
  * Pre-built GPU buffers to wrap in a `Mesh`, instead of vertex data to upload.
  *
@@ -62,6 +64,13 @@ export interface ImportedMeshBuffers {
  * `uvSphere` in assets/primitives.ts for the shipped instance of that bug).
  */
 export class Mesh {
+    /**
+     * Process-unique, monotonically increasing. Exists so draw sorting has an
+     * integer key (see `shading/drawBatching.ts`) instead of hashing object
+     * identity every frame. Not stable across runs and not meaningful to
+     * compare for anything but grouping.
+     */
+    readonly id: number = nextMeshId++;
     readonly vertexBuffer: GpuBuffer;
     readonly indexBuffer: GpuBuffer;
     readonly indexCount: number;

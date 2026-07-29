@@ -16,6 +16,7 @@ import { type Mat4f, mat4f } from "../math/types.ts";
 import { DEPTH_FORMAT, HDR_COLOR_FORMAT, MSAA_SAMPLE_COUNT, type RenderTargets } from "../rhi/targets.ts";
 import { MESH_VERTEX_LAYOUT } from "../scene/mesh.ts";
 import type { Scene } from "../scene/scene.ts";
+import { DrawOrder, PassBinder } from "./drawBatching.ts";
 import { LightCuller } from "./lightCuller.ts";
 import { CASCADE_SPLIT_LAMBDA_DEFAULT, SHADOW_DISTANCE_DEFAULT, ShadowCascades } from "./shadowCascades.ts";
 import { selectShadowCastingSpots, SpotShadows } from "./spotShadows.ts";
@@ -125,6 +126,10 @@ export class ClusteredForwardRenderer {
     private readonly shadows: ShadowCascades;
     /** Per-spot-light shadow maps. `lastDrawnInstances`/`lastCandidateInstances` report cull effectiveness. */
     readonly spotShadows: SpotShadows;
+    /** Frame-scoped draw sort, shared with the shadow passes. See `drawBatching.ts`. */
+    private readonly drawOrder = new DrawOrder();
+    /** Pass-scoped bind tracker for the prepass and forward passes; `begin()` per pass. */
+    private readonly binder = new PassBinder();
 
     constructor(device: GpuDevice) {
         this.device = device;
@@ -301,9 +306,14 @@ ${depthPrepassWgsl}`,
         // renders the layers in the same order. Two independent derivations
         // could disagree and shadow fragments with the wrong light's map.
         const shadowSpots = selectShadowCastingSpots(scene.lights);
+        // Sorted once per frame and shared by every pass that draws: all four
+        // cascades, every spot layer, the prepass and the forward pass walk the
+        // *same* order, so the redundant binds each of them skips are the same
+        // ones. Sorting per pass would cost six sorts to reach the same place.
+        const instances = this.drawOrder.update(scene.instances);
         this.culler.write(scene, targets, shadowSpots);
-        this.shadows.render(encoder, scene, this.shadowDistance, this.cascadeSplitLambda, this.profiler);
-        this.spotShadows.render(encoder, scene, shadowSpots, this.profiler);
+        this.shadows.render(encoder, scene, instances, this.shadowDistance, this.cascadeSplitLambda, this.profiler);
+        this.spotShadows.render(encoder, instances, shadowSpots, this.profiler);
         this.culler.cull(encoder, this.profiler);
 
         // Ambient occlusion (feeds the forward pass's ambient term). `None`
@@ -344,9 +354,10 @@ ${depthPrepassWgsl}`,
             });
             pre.setPipeline(this.depthPrepassPipeline);
             pre.setBindGroup(0, this.depthPrepassBindGroup);
-            for (const instance of scene.instances) {
+            this.binder.begin();
+            for (const instance of instances) {
                 pre.setBindGroup(1, instance.getModelBindGroup(this.device, this.modelBindGroupLayout));
-                instance.mesh.bind(pre);
+                this.binder.setMesh(pre, instance.mesh);
                 instance.mesh.draw(pre);
             }
             pre.end();
@@ -378,16 +389,21 @@ ${depthPrepassWgsl}`,
         pass.setBindGroup(0, frameBindGroup);
         pass.setBindGroup(3, this.culler.bindGroup);
 
-        scene.instances.forEach((instance, i) => {
-            pass.setBindGroup(1, instance.material.getBindGroup(this.device, this.materialBindGroupLayout));
+        this.binder.begin();
+        for (let i = 0; i < instances.length; i++) {
+            const instance = instances[i]!;
+            // Material and mesh are skipped when the previous draw already bound
+            // them — which the sort makes the common case, not a lucky one. The
+            // model bind group is genuinely per-instance and always rebinds.
+            this.binder.setMaterial(pass, 1, instance.material, this.device, this.materialBindGroupLayout);
             pass.setBindGroup(2, instance.getModelBindGroup(this.device, this.modelBindGroupLayout));
-            instance.mesh.bind(pass);
+            this.binder.setMesh(pass, instance.mesh);
             // Per-draw zones nest under the "forward" span. No-ops unless the
             // device enabled timestamp-query-inside-passes.
             this.profiler?.beginZone(pass, instance.mesh.label ?? `instance ${i}`);
             instance.mesh.draw(pass);
             this.profiler?.endZone(pass);
-        });
+        }
 
         pass.end();
     }
