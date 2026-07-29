@@ -39,8 +39,21 @@ interface RingEntry {
     state: RingState;
 }
 
-/** Timestamps per query set. Each span costs 2; 256 covers every pass plus a per-draw zone on a busy scene. */
-const MAX_QUERIES = 256;
+/**
+ * Timestamps per query set. Each span costs 2, and every instance in
+ * `Scene.instances` gets a per-draw zone, so the budget is really
+ * `2 * (passes + draws)`.
+ *
+ * **This was 256 and that turned out to be a scene-size limit, not a headroom
+ * figure.** `examples/helmet-demo.ts` at 100 lights and 100 scattered helmets
+ * encodes ~200 draws — 400 queries before the passes — and blew the budget the
+ * moment the helmet field landed, which degrades to "spans past here are
+ * untimed" with a warning. Since the demo exists to *measure* a scene that big,
+ * the cap was the wrong side of the trade: 1024 spans is 8 KB per ring buffer
+ * (three of each), well under the 4096 a WebGPU query set may hold, and buys
+ * ~470 draws.
+ */
+const MAX_QUERIES = 1024;
 
 /**
  * Frames in flight for readback. Results therefore lag the live frame by ~2-3

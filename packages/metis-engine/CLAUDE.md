@@ -627,6 +627,44 @@ breakdown; sweep `--lights` to separate fixed cost from per-light cost, and
 `--lights 0` for the true zero-light floor (the reference every light-cost claim
 should be stated against).
 
+**Sweep one axis at a time, and know that they multiply.** The bench used to be
+a single 2-triangle plane, so every per-light number it produced was measured
+against almost no shaded geometry — which is the flattering case, because
+per-light cost is per *shaded fragment*, and a plane fills a fraction of the
+screen at low overdraw with one material fetch. `--helmets N` (default 100)
+scatters that many shared-mesh DamagedHelmets over the plane. On an Intel UHD 620
+at 1280x720, mean GPU frame time:
+
+| lights | helmets | GPU frame | delta |
+|---|---|---|---|
+| 0 | 0 | 11.2 ms | — the floor |
+| 100 | 0 | 16.9 ms | +5.7 ms for 100 lights |
+| 0 | 100 | 62.5 ms | +51.3 ms for 100 helmets |
+| 100 | 100 | 80.2 ms | **+17.7 ms** for the same 100 lights |
+| 200 | 100 | 101.6 ms | +21.4 ms for the next 100 |
+
+**The same 100 lights cost 5.7 ms on the bare plane and 17.7 ms with the helmet
+field — 3x.** Neither number is wrong; the bare-plane one was answering a
+narrower question than it appeared to. Any per-light figure quoted from this
+bench has to name the geometry it was measured against, and the pre-2026-07-29
+figures in this file were all taken at `--helmets 0`. Light cost stays close to
+linear *within* a fixed scene (100 -> 200 lights adds 21.4 ms against the first
+hundred's 17.7), which is what the cluster grid is supposed to deliver — the
+scaling claim survives, only the constant moves.
+
+Two more things that only became visible with real geometry in the scene:
+
+- **CPU encode became a first-class cost.** 8.2 ms at 1 draw, 21.9 ms at 101,
+  81.8 ms at 401 — about 0.2 ms per instance per frame, linear. That is the
+  per-instance `getModelBindGroup` + `writeBuffer` path running once per
+  instance per pass, and with four cascades, four spot layers, a prepass and the
+  forward pass that is ~10x per instance per frame. It sits under the GPU time
+  on this iGPU so it is not yet the bottleneck, but on a fast discrete GPU it
+  would be the first thing to hit. Instancing or a single dynamic-offset model
+  buffer is the fix when it matters; it has not been measured as worth doing yet.
+- **The shadow passes scale worse than the forward pass** — see the no
+  per-cascade-frustum-culling rough edge above, which this now puts a number on.
+
 `--spots <0..1>` sets what fraction of the field is spot lights (default 0.5).
 Two things to know before comparing runs across it. **Spots are slightly
 *cheaper* than point lights here**, not more expensive — the per-fragment cone
@@ -930,11 +968,13 @@ They're computed once per frame and reused across all four light frusta.
 casting light gets its own `spot-shadow-N` span. Two caveats before trusting
 those numbers:
 
-- **The bench scene is one big plane**, which is the *worst* case for culling:
-  a single instance that always intersects every cone. The bench measures pass
-  and rasterization overhead only; it says nothing about how much culling saves
-  on a real interior, which is the whole point of having it. Judge culling on a
-  geometry-dense scene or not at all.
+- **At `--helmets 0` the bench scene is one big plane**, which is the *worst*
+  case for culling: a single instance that always intersects every cone. Those
+  numbers measure pass and rasterization overhead only and say nothing about how
+  much culling saves. That caveat is why the bench grew a geometry axis — at the
+  default `--helmets 100` the cull has a few hundred small bounding spheres to
+  reject per cone, so the drawn/candidate ratio is finally worth reading. Judge
+  culling there, never at `--helmets 0`.
 - **Unused layers still run a clear pass.** That's why `--shadow-spots 0` still
   shows four spans. A stale layer would otherwise be sampled by whichever light
   inherited that index later.
@@ -1381,12 +1421,22 @@ and the waste was invisible both on screen and in the frame time, because a bulb
 behind the camera rasterises nothing. A count of draws is a claim nothing else in
 the HUD makes, which is exactly why it caught something nothing else could.
 
-**This did not fix, and was not meant to fix, the query budget.** `MAX_QUERIES`
-is 256 and each span costs two, so `demo:helmet` sits around 240 with its ~102
-instances — it fits, with about 7% headroom. Adding geometry to that scene will
-trip the "exhausted its query budget" warning, and the fix then is raising
-`MAX_QUERIES` (8 bytes per query per ring entry — the cost is negligible), not
-suppressing zones.
+**This did not fix, and was not meant to fix, the query budget** — and the note
+that used to stand here (256 queries, `demo:helmet` fitting with ~7% headroom,
+"adding geometry will trip the warning") was correct and got cashed in one change
+later, by `bench:lights --helmets`. `MAX_QUERIES` is now **1024**: 8 bytes per
+query per ring entry across three entries, so 8 KB each, against a WebGPU cap of
+4096 entries per set. That buys ~470 draws — enough for `--helmets 400`
+(measured: 401 draws, no warning). The rule it was stated under still holds:
+when a scene outgrows the budget, raise it rather than suppressing zones. An
+untimed span is a measurement you silently do not have, and `allocSpan`'s -1
+degrade path is a guard, not a design.
+
+The merge also earns its keep in the **console** summary now, not just the
+widget: `bench/lights.ts` prints its pass breakdown through `profileSpansToRows`
+rather than walking `profiler.spans` directly, because at `--helmets 100` the raw
+tree is 100 consecutive identical `gltf-mesh-0-0` lines with the passes buried
+under them.
 
 **`test/output/debug-widgets.png` is not a byte-exact golden and cannot be.**
 It renders live GPU timings *as text*, so two consecutive runs of identical code

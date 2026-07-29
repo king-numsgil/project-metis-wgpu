@@ -854,8 +854,8 @@ debug.destroy();
 **`due()` is load-bearing, not optional.** Staging tessellates every glyph;
 `due()` returns true at most every `rebuildIntervalMs` (default 100), and
 `render()` replays the previous geometry on the frames it returns false.
-Measured on `bench/lights.ts --profile`: ~20 ms -> ~5.4 ms mean CPU encode. Stage
-unconditionally only if a widget must be frame-exact.
+Measured on `bench/lights.ts --profile --helmets 0`: ~20 ms -> ~5.4 ms mean CPU
+encode. Stage unconditionally only if a widget must be frame-exact.
 
 ### `GpuProfiler` — per-pass GPU timing
 
@@ -935,8 +935,9 @@ bun run demo:helmet      # glTF + 100 lights + full shadow stack; arrows orbit, 
 bun run demo:interior    # + O cycles AO technique
 bun run demo:spots       # spot-shadow visual test: 4 coloured orbiting casters
                          #   L toggles shadows (the A/B), Space pauses the orbit
-bun run bench:lights     # windowed light benchmark (see bench/lights.ts header for flags)
+bun run bench:lights     # windowed light + geometry benchmark (see bench/lights.ts header)
                          #   --lights N  --spots 0..1 (spot fraction, default 0.5)
+                         #   --helmets N (scattered DamagedHelmets, default 100)
                          #   --shadow-spots 0..4  --profile
 bunx tsc --noEmit        # type-check
 ```
@@ -948,10 +949,18 @@ assertion, `test/clusterNear.test.ts` pins that geometry nearer than
 profiler's per-pass timings are non-zero and renders both widgets, and
 `test/vectorText.smoke.ts` covers text + the colour palette. Run them manually.
 
-`bench/lights.ts` flags: `--lights N` (≤256), `--duration S`, `--warmup S`,
-`--width`, `--height`, `--fps N` (`--vsync` = `--fps 60`), `--profile` (per-pass
-GPU timings + widgets). Uncapped by default so timings are real; the cap is
-applied after GPU timing, so it never skews numbers.
+`bench/lights.ts` flags: `--lights N` (≤256), `--helmets N` (default 100),
+`--duration S`, `--warmup S`, `--width`, `--height`, `--fps N` (`--vsync` =
+`--fps 60`), `--profile` (per-pass GPU timings + widgets). Uncapped by default so
+timings are real; the cap is applied after GPU timing, so it never skews numbers.
+
+**It has two independent axes.** `--lights` scales lighting work; `--helmets`
+scales geometry — N shared-mesh DamagedHelmets (~15k triangles and five 2K
+textures each) through the forward pass, the depth prepass and every shadow
+pass. `--helmets 0` restores the original bare-plane scene byte-for-byte, so
+pre-helmet numbers stay comparable. Sweep one at a time: the axes multiply, and
+`--lights` measured on a bare plane understates the per-light cost several-fold
+(see CLAUDE.md).
 
 **The demos and the bench use `presentMode: "immediate"`** — tearing doesn't
 matter for development, and it keeps present back-pressure out of

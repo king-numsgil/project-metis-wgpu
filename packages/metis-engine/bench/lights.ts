@@ -1,17 +1,30 @@
 // Windowed real-time benchmark for the clustered-forward renderer: a flat
-// plane lit by N animated point lights (default 100), rendered through the full
-// per-frame pipeline — shadow pass, cluster build + light cull (compute),
-// forward shading, and the HDR post chain (luminance -> exposure -> ACES) — in
-// a live SDL window for a fixed duration (default 5s). A HUD overlays live
-// stats; a summary prints when it exits.
+// plane strewn with N Khronos DamagedHelmets (default 100) and lit by N
+// animated point/spot lights (default 100), rendered through the full per-frame
+// pipeline — shadow pass, cluster build + light cull (compute), forward shading,
+// and the HDR post chain (luminance -> exposure -> ACES) — in a live SDL window
+// for a fixed duration (default 5s). A HUD overlays live stats; a summary prints
+// when it exits.
 //
-//   bun run bench/lights.ts                    # 100 lights, 1280x720, 5s
+//   bun run bench/lights.ts                    # 100 lights, 100 helmets, 1280x720, 5s
 //   bun run bench/lights.ts --lights 200       # stress the per-cluster cap
+//   bun run bench/lights.ts --helmets 0        # the old bare-plane scene (see below)
+//   bun run bench/lights.ts --helmets 400      # stress geometry instead of lighting
 //   bun run bench/lights.ts --duration 10      # run longer
 //   bun run bench/lights.ts --width 1920 --height 1080
 //   bun run bench/lights.ts --fps 60           # cap at 60 fps ("what it looks like live")
 //   bun run bench/lights.ts --profile            # per-pass GPU timings via timestamp queries
 //   bun run bench/lights.ts --no-prepass         # disable the depth prepass (on by default)
+//
+// **The helmet field exists because this bench had one axis and needed two.**
+// It was a single 2-triangle plane, so every number it produced described light
+// culling with the vertex, texture-sampling and shadow-raster load pinned at
+// approximately zero — which is the flattering half of the workload. `--lights`
+// still scales the lighting cost; `--helmets` now scales the *geometry* cost,
+// ~15k triangles and five 2K textures per copy, through the forward pass, the
+// depth prepass and every shadow pass. Anything the renderer gets wrong about
+// draw submission, per-instance uniforms or shadow-caster culling was invisible
+// at one draw call.
 //
 // Uses `immediate` present mode — tearing is irrelevant to a benchmark, and it
 // removes the present back-pressure that otherwise parks inside
@@ -45,13 +58,21 @@ import {
     NUM_CLUSTERS,
     plane,
     type Light,
-    type ProfileSpan,
     profileSpansToRows,
     RenderContext,
     Scene,
+    SceneInstance,
+    loadGltf,
+    mat4f,
+    quatf,
+    type TreeRow,
 } from "metis-engine/renderer";
-import { Vec3 } from "metis-data";
+import { Mat4, Vec3 } from "metis-data";
 import { vec3f } from "metis-engine/renderer";
+// Shared with the demos and the fixture — the same cached, gitignored download.
+// `bench/` reaching into `examples/` is deliberate: duplicating the fetch here
+// would mean two caches and two chances to drift.
+import { cacheDamagedHelmet } from "../examples/demoAssets.ts";
 
 const FONT_PATH = new URL("../../../assets/JetBrainsMono-Regular.ttf", import.meta.url).pathname.replace(
     /^\/([A-Za-z]:)/,
@@ -113,16 +134,28 @@ const SPOT_FRACTION = Math.min(Math.max(num("spots", 0.5), 0), 1);
 // `--shadow-spots 0` removes the cost entirely (the passes still run, but only
 // to clear their layer).
 //
-// NB this bench is a *single large plane*, which is the worst possible case for
-// the frustum culling that makes spot shadows affordable: one instance, always
-// intersecting every cone. The numbers here therefore measure pass and
-// rasterization overhead only, and say nothing about how well culling performs
-// on a real interior. See CLAUDE.md "Spot light shadows".
+// NB **at `--helmets 0` this bench is a single large plane**, which is the worst
+// possible case for the frustum culling that makes spot shadows affordable: one
+// instance, always intersecting every cone. Those numbers measure pass and
+// rasterization overhead only and say nothing about culling. With the helmet
+// field on (the default) the cull finally has something to reject — a few
+// hundred small bounding spheres against each cone — so the drawn/candidate
+// ratio becomes meaningful. See CLAUDE.md "Spot light shadows".
 const SHADOW_SPOTS = Math.min(Math.max(Math.round(num("shadow-spots", MAX_SHADOW_SPOTS)), 0), MAX_SHADOW_SPOTS);
+// Static DamagedHelmets scattered over the plane — the geometry axis. Every copy
+// shares one Mesh and one Material, so this scales draw calls, per-instance
+// uniforms and rasterised triangles, and does **not** scale VRAM: the .glb is
+// parsed, decoded and uploaded exactly once however many are drawn.
+//
+// `--helmets 0` restores the original bare-plane scene *exactly* — the helmets
+// draw from their own RNG stream and are appended to `scene.instances` after the
+// floor, so no light parameter and no draw order changes. That makes it a valid
+// baseline against pre-helmet numbers, the same property `--spots 0` has.
+const HELMET_COUNT = Math.max(Math.round(num("helmets", 100)), 0);
 
 // The plane the lights hover over, and the volume the lights animate within.
 const PLANE_SIZE = 60;
-const FIELD_HALF = 24; // lights spread over [-24, 24] in x/z
+const FIELD_HALF = 24; // lights spread over [-24, 24] in x/z, and the helmets with them
 
 // ── Animated light field (point + spot) ─────────────────────────────────────
 interface AnimatedLight {
@@ -326,10 +359,59 @@ const floorMesh = new Mesh(ctx.device, plane(PLANE_SIZE, PLANE_SIZE), "bench-flo
 const floorMaterial = new Material({baseColor: [0.5, 0.5, 0.52, 1], metallic: 0.0, roughness: 0.85});
 scene.add(floorMesh, floorMaterial);
 
+// ── Helmet field (static geometry load) ──────────────────────────────────────
+//
+// Loaded once and shared: `loadGltf` gives back one SceneInstance per
+// mesh-primitive-bearing node, and every scattered copy reuses that node's
+// `Mesh` and `Material`. What varies per helmet is a single 4x4
+// `modelMatrixOverride`.
+let helmetTriangles = 0;
+let helmetDraws = 0;
+if (HELMET_COUNT > 0) {
+    const helmetPath = await cacheDamagedHelmet();
+    const source = await loadGltf(ctx.device, helmetPath, {label: "bench-helmet"});
+    // Its own stream, seeded independently of buildLightField's two: `--lights N`
+    // must not move the helmets and `--helmets N` must not move the lights, or
+    // an A/B on either axis would quietly be an A/B on both. Same discipline as
+    // the `spotRand` stream above, and for the same reason.
+    const helmetRand = mulberry32(0x4d51_31c7);
+    // The imported override is the glTF node's world matrix — for DamagedHelmet,
+    // the +X 90deg that makes it Z-up. Placement composes on its **left** so it
+    // happens in world space and that correction survives.
+    const bases = source.map((s) => Mat4.copy(mat4f(), s.modelMatrixOverride ?? mat4f()));
+
+    for (let i = 0; i < HELMET_COUNT; i++) {
+        const x = (helmetRand() * 2 - 1) * FIELD_HALF;
+        const z = (helmetRand() * 2 - 1) * FIELD_HALF;
+        // Shoemake's uniform random rotation. Three random Euler angles would be
+        // shorter and biased towards the poles — visible as a subtly aligned
+        // field at this many samples, and it would make the vertex-shader and
+        // raster load systematically unrepresentative.
+        const u1 = helmetRand();
+        const u2 = helmetRand() * Math.PI * 2;
+        const u3 = helmetRand() * Math.PI * 2;
+        const s1 = Math.sqrt(1 - u1);
+        const s2 = Math.sqrt(u1);
+        const rotation = quatf(s1 * Math.sin(u2), s1 * Math.cos(u2), s2 * Math.sin(u3), s2 * Math.cos(u3));
+        // y = 1 puts a ~1-unit-radius helmet on top of the plane rather than
+        // half inside it, whatever it is rotated to.
+        const placement = Mat4.composeTRS(mat4f(), x, 1, z, rotation, 1, 1, 1);
+
+        for (let j = 0; j < source.length; j++) {
+            const copy = new SceneInstance(source[j]!.mesh, source[j]!.material);
+            copy.modelMatrixOverride = Mat4.multiply(mat4f(), placement, bases[j]!);
+            scene.instances.push(copy);
+        }
+    }
+    helmetDraws = HELMET_COUNT * source.length;
+    helmetTriangles = HELMET_COUNT * source.reduce((n, s) => n + s.mesh.indexCount / 3, 0);
+}
+
 const activeLights = buildLightField(LIGHT_COUNT);
 scene.lights = activeLights.map((a) => a.light);
 
-const triangles = floorMesh.indexCount / 3;
+const triangles = floorMesh.indexCount / 3 + helmetTriangles;
+const drawCalls = 1 + helmetDraws;
 
 /**
  * Records + submits one frame. `hudLine` is drawn as an overlay. Returns the
@@ -424,7 +506,10 @@ console.log(`    Lights ................ ${LIGHT_COUNT}   (${Math.round(LIGHT_CO
 console.log(`    Cluster grid .......... ${CLUSTER_COUNT_X} x ${CLUSTER_COUNT_Y} x ${CLUSTER_COUNT_Z} = ${NUM_CLUSTERS} clusters`);
 console.log(`    Max lights / cluster .. ${MAX_LIGHTS_PER_CLUSTER}   (capacity cap)`);
 console.log(`    Max lights / scene .... ${MAX_LIGHTS}`);
-console.log(`    Forward draw calls .... 1   (${triangles} triangles — a single plane)`);
+console.log(
+    `    Forward draw calls .... ${drawCalls}   (${triangles.toLocaleString("en-US")} triangles — ` +
+        `${HELMET_COUNT ? `a plane + ${HELMET_COUNT} DamagedHelmets, 1 mesh shared` : "a single plane — --helmets N to add geometry"})`,
+);
 console.log(
     `    Per frame ............. shadow + cluster-build + light-cull + ${PREPASS ? "depth-prepass + " : ""}forward + HDR post`,
 );
@@ -532,16 +617,21 @@ if (gpuSamples.length === 0) {
     if (profiler && profiler.spans.length > 0) {
         console.log(`
   GPU pass breakdown  (timestamp queries, last completed frame)`);
-        const printSpan = (span: ProfileSpan, depth: number) => {
+        // The same merge the on-screen widget uses, and here it is not cosmetic:
+        // raw spans carry one per-draw zone per instance, so at the default
+        // --helmets 100 an unmerged tree prints 100 consecutive identical
+        // `gltf-mesh-0-0` lines and buries the passes worth reading. Merged, they
+        // collapse to one `xN` row holding their summed time.
+        const printRow = (row: TreeRow, depth: number) => {
             const indent = "    " + "  ".repeat(depth + 1);
-            const pct = profiler.frameTotalMs > 0 ? (span.gpuMs / profiler.frameTotalMs) * 100 : 0;
-            console.log(`${indent}${span.label.padEnd(30 - depth * 2)} ${ms(span.gpuMs).padStart(10)}  ${pct.toFixed(1).padStart(5)}%`);
-            for (const child of span.children) {
-                printSpan(child, depth + 1);
+            const pct = (row.fraction ?? 0) * 100;
+            console.log(`${indent}${row.label.padEnd(30 - depth * 2)} ${(row.value ?? "").padStart(10)}  ${pct.toFixed(1).padStart(5)}%`);
+            for (const child of row.children ?? []) {
+                printRow(child, depth + 1);
             }
         };
-        for (const span of profiler.spans) {
-            printSpan(span, 0);
+        for (const row of profileSpansToRows(profiler.spans, profiler.frameTotalMs)) {
+            printRow(row, 0);
         }
         if (!profiler.canProfileFrameTotal) {
             console.log(`    (no timestamp-query-inside-encoders — total is the sum of passes, excluding gaps between them)`);
