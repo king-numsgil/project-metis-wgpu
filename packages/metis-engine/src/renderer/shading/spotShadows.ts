@@ -13,8 +13,7 @@ import {
 } from "metis-native";
 import { Mat4, Vec3 } from "metis-data";
 import type { GpuProfiler } from "../debug/gpuProfiler.ts";
-import { type Frustum, frustumFromViewProj, sphereInFrustum, worldBoundingSphere } from "../math/frustum.ts";
-import { transformToMat4 } from "../math/transform.ts";
+import { type Frustum, frustumFromViewProj, sphereInFrustum } from "../math/frustum.ts";
 import { type Mat4f, mat4f, vec3f } from "../math/types.ts";
 import type { Light, SpotLight } from "../scene/light.ts";
 import { MESH_VERTEX_LAYOUT } from "../scene/mesh.ts";
@@ -125,7 +124,6 @@ export class SpotShadows {
     private readonly viewScratch = mat4f();
     private readonly projScratch = mat4f();
     /** Scratch for the per-instance model matrix behind the frustum cull. */
-    private readonly modelScratch = mat4f();
     private readonly texelScaleScratch = new Float32Array(MAX_SHADOW_SPOTS);
 
     /**
@@ -246,6 +244,8 @@ export class SpotShadows {
         encoder: GpuCommandEncoder,
         instances: readonly SceneInstance[],
         modelBindGroup: GpuBindGroup,
+        /** Shared per-frame world bounding spheres, flat `[x,y,z,r]`. */
+        spheres: Float32Array,
         spots: SpotLight[],
         profiler?: GpuProfiler,
     ) {
@@ -300,13 +300,6 @@ export class SpotShadows {
         this.device.queue.writeBuffer(this.renderBuffer, 0, this.renderBytes);
         this.device.queue.writeBuffer(this.uniformBuffer, 0, this.forwardBytes);
 
-        // World bounding spheres once per frame, reused across every light's
-        // frustum test rather than recomputed per (light, instance).
-        const spheres = instances.map((inst) => {
-            const model = inst.modelMatrixOverride ?? transformToMat4(inst.transform, this.modelScratch);
-            return worldBoundingSphere(model, inst.mesh.boundingRadius);
-        });
-
         this.lastDrawnInstances = 0;
         this.lastCandidateInstances = 0;
 
@@ -340,8 +333,9 @@ export class SpotShadows {
                         continue;
                     }
                     this.lastCandidateInstances++;
-                    const s = spheres[k]!;
-                    const inFrustum = sphereInFrustum(this.frustum, s.x, s.y, s.z, s.r);
+                    const b = k * 4;
+                    const inFrustum = sphereInFrustum(
+                        this.frustum, spheres[b]!, spheres[b + 1]!, spheres[b + 2]!, spheres[b + 3]!);
                     visible[k] = inFrustum ? 1 : 0;
                     if (inFrustum) {
                         this.lastDrawnInstances++;

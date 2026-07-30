@@ -18,7 +18,7 @@ import { type Mat4f, mat4f, type Vec3f, vec3f } from "../math/types.ts";
 import { MESH_VERTEX_LAYOUT } from "../scene/mesh.ts";
 import type { Scene, SceneInstance } from "../scene/scene.ts";
 import { castsShadow, forEachDrawRun, PassBinder } from "./drawBatching.ts";
-import { type Frustum, frustumFromViewProj, sphereInFrustum, worldBoundingSphereInto } from "../math/frustum.ts";
+import { type Frustum, frustumFromViewProj, sphereInFrustum } from "../math/frustum.ts";
 import { CASCADE_COUNT, SHADOW_MAP_SIZE } from "./shadowConfig.ts";
 import { CascadeUniforms, SHADOW_RENDER_STRIDE, stage, wrapMat4 } from "./gpuLayouts.ts";
 import commonWgsl from "./wgsl/common.wgsl" with { type: "text" };
@@ -193,8 +193,6 @@ export class ShadowCascades {
     lastDrawnInstances = 0;
     lastCandidateInstances = 0;
 
-    /** Per-frame world bounding spheres, flat [x,y,z,r] per instance. */
-    private spheres = new Float32Array(0);
     /** Per-cascade visibility mask; see the purity note on `forEachDrawRun`. */
     private visible = new Uint8Array(0);
     private readonly cascadeFrustum: Frustum = frustumFromViewProj(mat4f());
@@ -328,6 +326,8 @@ export class ShadowCascades {
         scene: Scene,
         instances: readonly SceneInstance[],
         modelBindGroup: GpuBindGroup,
+        /** Shared per-frame world bounding spheres, flat `[x,y,z,r]`. */
+        spheres: Float32Array,
         shadowDistance: number,
         splitLambda: number,
         profiler?: GpuProfiler,
@@ -359,16 +359,6 @@ export class ShadowCascades {
         // first time this was written, and the fixtures caught it.
         if (this.visible.length < instances.length) {
             this.visible = new Uint8Array(instances.length);
-            this.spheres = new Float32Array(instances.length * 4);
-        }
-        if (this.cullPerCascade) {
-            // Once per frame, shared by all four cascades — the spheres do not
-            // depend on which cascade is being fitted. Flat, so this allocates
-            // nothing per frame.
-            for (let k = 0; k < instances.length; k++) {
-                const inst = instances[k]!;
-                worldBoundingSphereInto(inst.modelFloats, inst.mesh.boundingRadius, this.spheres, k * 4);
-            }
         }
         const visible = this.visible;
         const isVisible = (_instance: SceneInstance, index: number) => visible[index] === 1;
@@ -395,7 +385,7 @@ export class ShadowCascades {
                     const b = k * 4;
                     const inside = sphereInFrustum(
                         this.cascadeFrustum,
-                        this.spheres[b]!, this.spheres[b + 1]!, this.spheres[b + 2]!, this.spheres[b + 3]!,
+                        spheres[b]!, spheres[b + 1]!, spheres[b + 2]!, spheres[b + 3]!,
                     );
                     visible[k] = inside ? 1 : 0;
                     if (inside) {

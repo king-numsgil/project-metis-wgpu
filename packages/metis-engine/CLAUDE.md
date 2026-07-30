@@ -984,9 +984,10 @@ same array to both the culler and `SpotShadows`. Do not re-derive it in either
 place.
 
 **Frustum culling shipped with this, deliberately, and it is the load-bearing
-part.** There is no frustum culling anywhere else in the engine — every cascade
-and the forward pass both redraw every instance. Spot shadows are where it
-finally pays, because of an asymmetry worth internalising:
+part.** It was for a long time the *only* culling in the engine; the camera
+passes and the cascades have it now too (see "Frustum culling everywhere else"
+below), but spot shadows remain where it most obviously pays, because of an
+asymmetry worth internalising:
 
 - A **cascade's** ortho frustum is fit to a slice of the camera frustum, so
   essentially everything the camera can see is inside it. Culling wins little.
@@ -1607,6 +1608,80 @@ Two rules out of it, both stricter than "measure, don't guess":
 Resolving the instancing question properly needs locked clocks or a runtime
 toggle to alternate against; neither exists, and the honest state is *unknown*.
 
+### Frustum culling everywhere else — and the reverse-Z plane that isn't there
+
+The camera passes (depth prepass, forward, AO prepass) cull against the camera
+frustum (`ClusteredForwardRenderer.frustumCulling`, **on**), and the sun cascades
+can cull against their own ortho volume (`ShadowCascades.cullPerCascade`,
+**off**). Both test each instance's world bounding sphere.
+
+**Bounding spheres are computed once per frame by the renderer and lent out.**
+`SpotShadows` and `ShadowCascades` each used to derive their own — `SpotShadows`
+allocating an object per instance per frame — which was three passes over the
+same matrices producing identical numbers, since a bounding sphere depends on the
+instance and nothing about the viewer. `ModelBuffer.update` has just written
+every matrix, so `SceneInstance.modelFloats` is this frame's and nothing needs
+recomputing.
+
+**One visibility mask serves the prepass, the forward pass and the AO prepass,
+and that is a correctness requirement, not tidiness.** With the prepass on, the
+forward pass tests `depthCompare: "equal"` — so anything the forward pass draws
+that the prepass skipped has no matching depth value and renders as *nothing*.
+Deriving the visible set twice would make that agreement a matter of luck. The AO
+prepass shares it too, or AO would occlude against geometry the frame never
+shaded.
+
+**The camera's frustum has no far plane, and its near plane is in the far
+slot.** `Camera.projectionMatrix()` is reverse-Z with an infinite far plane, so
+Gribb-Hartmann extraction behaves unlike the textbook case:
+
+- the slot `frustumFromViewProj` labels **near** (`row2`) is `(0, 0, 0, near)` —
+  a **zero normal**. It is inert, and the `|| 1` guard in the normalisation is
+  what keeps it from becoming NaN;
+- the slot labelled **far** (`row3 - row2`) is the *actual near plane*, and is
+  what rejects geometry behind the camera;
+- there is **no far plane at all**, correctly — nothing is ever culled for being
+  distant. In a space sim that matters: a finite far plane introduced here would
+  silently start culling the planet.
+
+So the extraction works by luck rather than design, and `test/cameraFrustum.test.ts`
+exists to keep it that way — it asserts the degenerate plane *stays* degenerate,
+because if a future projection change gives it a real normal the other five
+planes would go on passing while that one quietly culled everything in front of
+the camera.
+
+**Both culls measure as nothing on this bench, and the bench is the wrong
+witness for both.** Forward culling rejects ~15-19% of draws, per-cascade culling
+~16%, and neither moves frame time beyond this machine's run-to-run drift
+(alternate `--no-frustum-cull` / `--cascade-cull` and see). The reason is the
+scene: `bench/lights.ts` is a dense field entirely in front of the camera, so
+there is little off-screen to reject. **Judge these on a world larger than the
+screen, or not at all** — the same caveat the spot-shadow cull carries.
+
+They default differently anyway, and the reasoning is not "one measured better":
+
+- **Forward culling is on** because its ceiling is high and the bench simply
+  cannot show it. A camera inside a real level routinely sees a small fraction of
+  the world, and nothing else in the engine can reject that geometry.
+- **Per-cascade culling is off** because its ceiling is structurally low: a
+  cascade's ortho volume is *fit to the camera frustum*, so it contains
+  approximately what the camera sees by construction. It also costs four sphere
+  tests per instance and fragments instanced draws (`forEachDrawRun`), so it is
+  not free while it waits for a scene that wants it.
+
+**Two mutation checks, and the first one failed to fail.** `test/frustumCull.test.ts`
+pairs "culling changes no pixels" with "culling actually rejected something",
+because either alone passes trivially. Zeroing the bounding radius — an
+over-eager cull — initially passed *every* test, because the scene had nothing
+straddling a frustum edge: every instance was wholly inside or wholly behind the
+camera. It needed an instance whose centre is outside the left plane but whose
+radius reaches into view. Second: counting `lastDrawnInstances` from the
+filter's *opinion* rather than from the draws themselves could not detect a
+filter that is computed and then ignored — a dead optimisation that still renders
+correctly. It is accumulated in the forward pass's `emit` now. Both are the same
+lesson this file keeps relearning: a green test proves nothing until it has been
+watched failing for the right reason.
+
 ### Cascade shadow maps are cached — and exactly how much that is worth
 
 `ShadowCascades` skips a cascade's depth pass entirely (no pass encoded at all,
@@ -1723,9 +1798,9 @@ of that is worth keeping. `demo:helmet`'s `-` key reported 25 lights while the
 tree kept reading `light-bulb x100` — which looked like the merge miscounting and
 was the merge being *honest*: deactivated bulbs were parked far below the deck
 rather than removed from `scene.instances`, so all 100 were still being drawn.
-**Off-screen is not undrawn** — there is no frustum culling in the forward pass —
-and the waste was invisible both on screen and in the frame time, because a bulb
-behind the camera rasterises nothing. A count of draws is a claim nothing else in
+**Off-screen was not undrawn** — the forward pass had no frustum culling at the
+time, which it does now — and the waste was invisible both on screen and in the
+frame time, because a bulb behind the camera rasterises nothing. A count of draws is a claim nothing else in
 the HUD makes, which is exactly why it caught something nothing else could.
 
 **This did not fix, and was not meant to fix, the query budget** — and the note

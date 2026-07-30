@@ -313,6 +313,8 @@ export class AmbientOcclusion {
         scene: Scene,
         instances: readonly SceneInstance[],
         modelBindGroup: GpuBindGroup,
+        /** The forward pass's camera-visibility filter, or null when culling is off. */
+        cameraFilter: ((instance: SceneInstance, index: number) => boolean) | null,
         _targets: RenderTargets,
         profiler?: GpuProfiler,
     ) {
@@ -341,7 +343,10 @@ export class AmbientOcclusion {
         // could not have been fixed in isolation anyway, since `firstInstance`
         // only means anything against the sorted order.
         this.binder.begin();
-        forEachDrawRun(instances, null, false, (mesh, _material, first, count) => {
+        // The same filter the forward pass uses: this prepass produces the
+        // depth/normals AO is computed from, so culling it differently would
+        // occlude against geometry the frame never shaded.
+        forEachDrawRun(instances, cameraFilter, false, (mesh, _material, first, count) => {
             this.binder.setMesh(prepass, mesh);
             mesh.draw(prepass, count, first);
         });

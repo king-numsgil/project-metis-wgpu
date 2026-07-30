@@ -546,6 +546,9 @@ class ClusteredForwardRenderer {
     shadowDistance: number;       // far reach of the cascaded shadows (default 400)
     cascadeSplitLambda: number;   // practical-split blend, 1=log 0=uniform (default 0.85)
     readonly shadows: ShadowCascades;      // .cacheEnabled, .cullPerCascade, .lastRenderedCascades
+    frustumCulling: boolean;               // camera-frustum cull, default true
+    readonly lastDrawnInstances: number;   // forward-pass draws / candidates last frame
+    readonly lastCandidateInstances: number;
     readonly spotShadows: SpotShadows;
     readonly frameBindGroupLayout, materialBindGroupLayout, modelBindGroupLayout: GpuBindGroupLayout;
     render(encoder: GpuCommandEncoder, targets: RenderTargets, scene: Scene): void;
@@ -590,6 +593,19 @@ updates with a fitting margin, neither of which exists.
 One thing it does *not* detect: mutating a `Mesh`'s vertex buffer in place. The
 caster fingerprint covers mesh *identity*, not mesh contents.
 
+**Camera culling never rejects for distance.** The projection is reverse-Z with
+an infinite far plane, so the frustum has four side planes and a near plane and
+that is all — geometry is only culled behind the camera or off to the sides. A
+finite far plane introduced here would silently start culling distant geometry;
+`test/cameraFrustum.test.ts` pins that, along with the degenerate plane the
+reverse-Z form produces.
+
+**Both culls measure as nothing on `bench:lights`**, which is a dense field
+entirely in front of the camera and therefore the wrong witness — they reject
+15-19% of draws and move frame time less than run-to-run drift. Judge them on a
+world larger than the screen. A/B with `--no-frustum-cull` / `--cascade-cull`,
+alternating runs.
+
 **`renderer.shadows.cullPerCascade`** (default **off**) frustum-culls each
 cascade's draws against its own ortho volume. It is pixel-exact — the fixtures are
 byte-identical either way — but it measured as *no* frame-time change on the
@@ -608,6 +624,11 @@ for the design.
 
 `render()` records, in order, every frame:
 
+0. **Cull.** One camera-frustum visibility mask, shared by the depth prepass, the
+   forward pass and the AO prepass — they must agree, because `depthCompare:
+   "equal"` makes anything the forward pass draws that the prepass skipped render
+   as nothing. `renderer.frustumCulling = false` disables it;
+   `lastDrawnInstances`/`lastCandidateInstances` report the ratio.
 1. Write camera + environment uniforms, and **fill the frame's model array** —
    every instance's model + normal matrices, written once into one storage buffer
    and uploaded in a single call, skipped entirely when nothing moved. Each pass
@@ -1005,6 +1026,7 @@ bun run bench:lights     # windowed light + geometry benchmark (see bench/lights
                          #   --orbit N   (camera revolutions/sec; 0 = static, the default)
                          #   --no-shadow-cache  (A/B the cascade cache — pair with --orbit)
                          #   --cascade-cull     (per-cascade frustum culling, default off)
+                         #   --no-frustum-cull  (disable camera-frustum culling, default on)
 bunx tsc --noEmit        # type-check
 ```
 

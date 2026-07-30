@@ -15,8 +15,9 @@ import type { GpuProfiler } from "../debug/gpuProfiler.ts";
 import { type Mat4f, mat4f } from "../math/types.ts";
 import { DEPTH_FORMAT, HDR_COLOR_FORMAT, MSAA_SAMPLE_COUNT, type RenderTargets } from "../rhi/targets.ts";
 import { MESH_VERTEX_LAYOUT } from "../scene/mesh.ts";
-import type { Scene } from "../scene/scene.ts";
+import type { Scene, SceneInstance } from "../scene/scene.ts";
 import { DrawOrder, forEachDrawRun, PassBinder } from "./drawBatching.ts";
+import { type Frustum, frustumFromViewProj, sphereInFrustum, worldBoundingSphereInto } from "../math/frustum.ts";
 import { ModelBuffer } from "./modelBuffer.ts";
 import { LightCuller } from "./lightCuller.ts";
 import { CASCADE_SPLIT_LAMBDA_DEFAULT, SHADOW_DISTANCE_DEFAULT, ShadowCascades } from "./shadowCascades.ts";
@@ -103,6 +104,26 @@ export class ClusteredForwardRenderer {
      *   either vertex shader, this is the first thing to check.
      */
     depthPrepass = true;
+    /**
+     * Cull draws against the camera frustum, in the depth prepass, the forward
+     * pass and the AO prepass.
+     *
+     * Before this existed, **off-screen was not undrawn** — every instance was
+     * submitted every frame however far outside the view it sat. In a world
+     * bigger than the screen that is the single largest source of wasted draws,
+     * which is why this defaults on despite the bench barely exercising it (its
+     * whole field is in front of the camera).
+     *
+     * The camera's projection is reverse-Z with an **infinite far plane**, so
+     * this only ever rejects geometry behind the camera or off to the sides —
+     * never for being distant. `test/cameraFrustum.test.ts` pins that, including
+     * the degenerate plane the reverse-Z form produces.
+     */
+    frustumCulling = true;
+
+    /** Instances drawn / considered by the forward pass last frame. */
+    lastDrawnInstances = 0;
+    lastCandidateInstances = 0;
 
     private readonly device: GpuDevice;
     private readonly pipeline: GpuRenderPipeline;
@@ -132,6 +153,19 @@ export class ClusteredForwardRenderer {
     private readonly drawOrder = new DrawOrder();
     /** The frame's shared `array<Model>`; every pass binds this one group. */
     private readonly models: ModelBuffer;
+    /**
+     * World bounding spheres for the frame's draw order, flat `[x,y,z,r]`.
+     *
+     * Computed **once here** and lent to `ShadowCascades` and `SpotShadows`.
+     * They each used to derive their own — `SpotShadows` allocating an object
+     * per instance per frame — which was three passes over the same matrices to
+     * produce identical numbers, since a bounding sphere depends on the
+     * instance and nothing about the viewer.
+     */
+    private worldSpheres = new Float32Array(0);
+    /** Camera visibility for the frame's draw order; see `frustumCulling`. */
+    private cameraVisible = new Uint8Array(0);
+    private readonly cameraFrustum: Frustum = frustumFromViewProj(mat4f());
     /** Pass-scoped bind tracker for the prepass and forward passes; `begin()` per pass. */
     private readonly binder = new PassBinder();
 
@@ -325,10 +359,47 @@ ${depthPrepassWgsl}`,
         // `firstInstance = run start`. See modelBuffer.ts.
         this.models.update(instances);
         const modelBindGroup = this.models.bindGroup;
+
+        // Bounding spheres once, for every consumer. `models.update` has just
+        // written each instance's matrix, so `modelFloats` is this frame's.
+        if (this.worldSpheres.length < instances.length * 4) {
+            this.worldSpheres = new Float32Array(instances.length * 4);
+            this.cameraVisible = new Uint8Array(instances.length);
+        }
+        for (let i = 0; i < instances.length; i++) {
+            const instance = instances[i]!;
+            worldBoundingSphereInto(instance.modelFloats, instance.mesh.boundingRadius, this.worldSpheres, i * 4);
+        }
+
+        // ONE camera visibility mask, shared by the depth prepass, the forward
+        // pass and the AO prepass. They must agree: with a prepass the forward
+        // pass tests `depthCompare: "equal"`, so anything the forward pass draws
+        // that the prepass skipped has no matching depth and renders as nothing.
+        // Deriving the set twice would make that a matter of luck.
+        this.lastCandidateInstances = instances.length;
+        this.lastDrawnInstances = 0;
+        if (this.frustumCulling) {
+            frustumFromViewProj(this.cameraStaging.viewProj, this.cameraFrustum);
+            for (let i = 0; i < instances.length; i++) {
+                const b = i * 4;
+                const inside = sphereInFrustum(
+                    this.cameraFrustum,
+                    this.worldSpheres[b]!, this.worldSpheres[b + 1]!,
+                    this.worldSpheres[b + 2]!, this.worldSpheres[b + 3]!,
+                );
+                this.cameraVisible[i] = inside ? 1 : 0;
+            }
+        }
+        const visible = this.cameraVisible;
+        const cameraFilter = this.frustumCulling
+            ? (_instance: SceneInstance, index: number) => visible[index] === 1
+            : null;
+
         this.culler.write(scene, targets, shadowSpots);
         this.shadows.render(
-            encoder, scene, instances, modelBindGroup, this.shadowDistance, this.cascadeSplitLambda, this.profiler);
-        this.spotShadows.render(encoder, instances, modelBindGroup, shadowSpots, this.profiler);
+            encoder, scene, instances, modelBindGroup, this.worldSpheres,
+            this.shadowDistance, this.cascadeSplitLambda, this.profiler);
+        this.spotShadows.render(encoder, instances, modelBindGroup, this.worldSpheres, shadowSpots, this.profiler);
         this.culler.cull(encoder, this.profiler);
 
         // Ambient occlusion (feeds the forward pass's ambient term). `None`
@@ -337,7 +408,7 @@ ${depthPrepassWgsl}`,
         if (this.ao.technique === AoTechnique.None) {
             this.ao.clearToWhite(encoder, this.profiler);
         } else {
-            this.ao.render(encoder, scene, instances, modelBindGroup, targets, this.profiler);
+            this.ao.render(encoder, scene, instances, modelBindGroup, cameraFilter, targets, this.profiler);
         }
 
         const frameBindGroup = this.device.createBindGroup({
@@ -372,7 +443,7 @@ ${depthPrepassWgsl}`,
             // Bound once for the whole pass now, not once per draw.
             pre.setBindGroup(1, modelBindGroup);
             this.binder.begin();
-            forEachDrawRun(instances, null, false, (mesh, _material, first, count) => {
+            forEachDrawRun(instances, cameraFilter, false, (mesh, _material, first, count) => {
                 this.binder.setMesh(pre, mesh);
                 mesh.draw(pre, count, first);
             });
@@ -409,7 +480,11 @@ ${depthPrepassWgsl}`,
         this.binder.begin();
         // Grouped by material as well as mesh: this is the one pass that binds a
         // material, so a run here is the intersection of both.
-        forEachDrawRun(instances, null, true, (mesh, material, first, count) => {
+        forEachDrawRun(instances, cameraFilter, true, (mesh, material, first, count) => {
+            // Accumulated from the draws themselves, so `lastDrawnInstances`
+            // reports submission rather than intent — see the note above
+            // `frustumCulling`.
+            this.lastDrawnInstances += count;
             this.binder.setMaterial(pass, 1, material, this.device, this.materialBindGroupLayout);
             this.binder.setMesh(pass, mesh);
             // One zone per *run*, so a scene of N identical meshes now reports a
