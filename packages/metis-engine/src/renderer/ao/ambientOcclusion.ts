@@ -325,7 +325,7 @@ export class AmbientOcclusion {
         prepass.setPipeline(this.prepassPipeline);
         prepass.setBindGroup(0, this.prepassCameraBindGroup);
         for (const instance of scene.instances) {
-            prepass.setBindGroup(1, instance.getModelBindGroup(this.device, this.modelBindGroupLayout));
+            prepass.setBindGroup(1, instance.modelBindGroup);
             instance.mesh.bind(prepass);
             instance.mesh.draw(prepass);
         }

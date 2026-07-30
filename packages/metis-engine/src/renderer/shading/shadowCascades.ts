@@ -143,6 +143,29 @@ export class ShadowCascades {
         corners: Array.from({length: 8}, () => vec3f()),
     };
 
+    /**
+     * Per-cascade copy of the `viewProj` its depth layer was last rendered with.
+     * NaN-filled, so the first frame's compare cannot match and every cascade
+     * renders once before anything is skipped — the depth array's contents are
+     * undefined until something writes them.
+     */
+    private readonly cachedMatrices: Float32Array[] = Array.from({length: CASCADE_COUNT}, () =>
+        new Float32Array(16).fill(NaN),
+    );
+    /** Caster-set fingerprint from the previous frame; see `castersChanged`. */
+    private previousCasterCount = -1;
+    private previousCasterHash = 0;
+    /** How many cascades actually re-rendered last frame (0..CASCADE_COUNT). Diagnostics only. */
+    lastRenderedCascades = CASCADE_COUNT;
+
+    /**
+     * Set `false` to re-render every cascade every frame, as this class did
+     * before the cache existed. Exists so the cache can be A/B'd against itself
+     * on one machine in one sitting (`bench:lights --no-shadow-cache`), which is
+     * this package's standing requirement for a performance claim.
+     */
+    cacheEnabled = true;
+
     constructor(device: GpuDevice, modelBindGroupLayout: GpuBindGroupLayout) {
         this.device = device;
         this.modelBindGroupLayout = modelBindGroupLayout;
@@ -254,9 +277,12 @@ export class ShadowCascades {
      * Also uploads the per-frame cascade matrices/splits/offsets the forward
      * pass reads from {@link uniformBuffer}.
      *
-     * Every cascade redraws every instance — there is no per-cascade frustum
-     * culling (deliberate: a cascade's ortho frustum is fit to a slice of the
-     * camera frustum, so almost nothing the camera sees falls outside it).
+     * **A cascade whose fit and casters are unchanged is skipped entirely** —
+     * see `cacheEnabled` and CLAUDE.md "Cascade shadow maps are cached". When a
+     * cascade does render it redraws every instance: there is no per-cascade
+     * frustum culling (deliberate: a cascade's ortho frustum is fit to a slice
+     * of the camera frustum, so almost nothing the camera sees falls outside
+     * it), which is also why invalidation is frame-global.
      *
      * @param instances the frame's draw order from `DrawOrder` — **not**
      *   `scene.instances`. Same array for every pass in the frame, so the
@@ -298,7 +324,7 @@ export class ShadowCascades {
                 if (!instance.castsShadow) {
                     continue;
                 }
-                pass.setBindGroup(1, instance.getModelBindGroup(this.device, this.modelBindGroupLayout));
+                pass.setBindGroup(1, instance.modelBindGroup);
                 // Depth-only — no material here, which is why the draw sort is
                 // mesh-major: this pass and the three others like it can only
                 // ever batch on mesh.
@@ -307,8 +333,28 @@ export class ShadowCascades {
             }
         };
 
+        // A caster that moved, appeared, vanished or swapped its mesh invalidates
+        // every cascade at once: knowing *which* cascades a given caster falls in
+        // would need a per-instance/per-cascade frustum test, which does not
+        // exist yet (see CLAUDE.md's per-cascade frustum culling entry). Until it
+        // does, one moved object costs a full re-render — correct, and no worse
+        // than the uncached behaviour it replaces.
+        const castersMoved = this.castersChanged(instances);
+
         // Every cascade (PCF): single-sample depth into its array layer.
+        this.lastRenderedCascades = 0;
         for (let c = 0; c < CASCADE_COUNT; c++) {
+            if (this.cacheEnabled && !castersMoved && this.matchesCached(c)) {
+                // Skip the pass entirely — not a cheaper pass, no pass at all.
+                // The layer keeps the depth it was last rendered with, which is
+                // still exactly right: we only get here when this cascade's
+                // viewProj is bit-identical to the one that produced it, so the
+                // `CascadeUniforms.viewProj` the forward pass samples with still
+                // matches the map it samples. That agreement is the whole
+                // correctness argument, and it is why the test is on the matrix
+                // rather than on "did the camera move".
+                continue;
+            }
             const pass = encoder.beginRenderPass({
                 label: `metis-engine/pcf-cascade-${c}-depth-pass`,
                 timestampWrites: profiler?.pass(`pcf-cascade-${c}-depth`),
@@ -323,7 +369,55 @@ export class ShadowCascades {
             pass.setPipeline(this.pcfDepthPipeline);
             drawScene(pass, c);
             pass.end();
+            this.cachedMatrices[c]!.set(this.renderMatrixViews[c]!);
+            this.lastRenderedCascades++;
         }
+    }
+
+    /** True when cascade `c`'s fit is bit-identical to the one its layer holds. */
+    private matchesCached(c: number): boolean {
+        const now = this.renderMatrixViews[c]!;
+        const cached = this.cachedMatrices[c]!;
+        for (let i = 0; i < 16; i++) {
+            if (now[i] !== cached[i]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Whether anything about the shadow-casting set differs from last frame:
+     * a caster moved, one was added or removed, `castsShadow` was toggled, or an
+     * instance's `mesh` was swapped under it.
+     *
+     * **The mesh hash is not paranoia.** Movement is caught by
+     * `SceneInstance.modelChanged` and membership by the count, but reassigning
+     * `instance.mesh` in place changes the silhouette while leaving both
+     * unchanged — and unlike `DrawOrder`, where a stale answer is merely a missed
+     * optimisation, a stale answer here is a *wrong picture*: an object casting
+     * the shadow of the mesh it used to be. Hashing the ids costs one multiply
+     * per caster in a loop that already exists.
+     */
+    private castersChanged(instances: readonly SceneInstance[]): boolean {
+        let count = 0;
+        let hash = 0;
+        let moved = false;
+        for (let i = 0; i < instances.length; i++) {
+            const instance = instances[i]!;
+            if (!instance.castsShadow) {
+                continue;
+            }
+            count++;
+            hash = (Math.imul(hash, 31) + instance.mesh.id) | 0;
+            if (instance.modelChanged) {
+                moved = true;
+            }
+        }
+        const changed = moved || count !== this.previousCasterCount || hash !== this.previousCasterHash;
+        this.previousCasterCount = count;
+        this.previousCasterHash = hash;
+        return changed;
     }
 
     /** Releases the depth array and both uniform buffers. */

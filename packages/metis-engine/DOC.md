@@ -325,9 +325,32 @@ class SceneInstance {
     modelMatrixOverride: Mat4f | null;  // bypasses transform (e.g. glTF nodes)
     castsShadow: boolean;               // default true; see below
     mesh: Mesh; material: Material;
+    readonly modelChanged: boolean;     // did the last prepareModel move it? (see below)
+    get modelBindGroup(): GpuBindGroup; // throws if not prepared this frame
+    prepareModel(device, layout): GpuBindGroup;   // renderer-internal; call once per frame
     destroy(): void;
 }
 ```
+
+**`prepareModel` / `modelBindGroup` are the renderer's business, not yours.**
+`ClusteredForwardRenderer.render()` calls `prepareModel` once per frame for every
+instance in the scene, and each of the six-to-ten passes that draw it then reads
+`modelBindGroup` — a bare getter that binds and nothing else. They are split
+because they used to be one method that every pass called, which re-derived and
+re-uploaded identical bytes once per pass.
+
+Two consequences if you write a custom pass:
+
+- **Reading `modelBindGroup` for an instance the renderer did not prepare
+  throws.** That is deliberate — lazily preparing instead would render the object
+  at a stale transform, which looks like a bug in your game code rather than in
+  the renderer.
+- **Mutate `transform` before `render()`, never between passes.** Everything the
+  frame draws is snapshotted by the prepare loop at the top of `render()`.
+
+`modelChanged` reports whether that snapshot differed from the previous frame's.
+A static instance skips its GPU upload entirely, and `ShadowCascades` reads the
+flag to decide whether its cached cascades are still valid.
 
 `castsShadow: false` keeps an instance out of **every** shadow pass — all four
 sun cascades and every spot-shadow layer. It is for geometry that is visual only
@@ -527,6 +550,8 @@ class ClusteredForwardRenderer {
     readonly ao: AmbientOcclusion;
     shadowDistance: number;       // far reach of the cascaded shadows (default 400)
     cascadeSplitLambda: number;   // practical-split blend, 1=log 0=uniform (default 0.85)
+    readonly shadows: ShadowCascades;      // .cacheEnabled, .lastRenderedCascades
+    readonly spotShadows: SpotShadows;
     readonly frameBindGroupLayout, materialBindGroupLayout, modelBindGroupLayout: GpuBindGroupLayout;
     render(encoder: GpuCommandEncoder, targets: RenderTargets, scene: Scene): void;
     destroy(): void;
@@ -547,6 +572,29 @@ comparison PCF. You get correct shadows across a wide depth range without tuning
   `1` = fully logarithmic (tightest near cascade), `0` = uniform. Raise it if near
   shadows aren't crisp enough; lower it if the far cascade is starved.
 
+**Cascade depth maps are cached.** A cascade's pass is skipped outright — not
+made cheaper, not run — when its fitted `viewProj` is bit-identical to the one
+its depth layer already holds *and* no shadow caster moved, appeared, vanished or
+swapped its mesh. The cached image is correct by construction: the same matrix
+that produced the map is the one the forward pass samples it with.
+
+Read the hit rate from **`renderer.shadows.lastRenderedCascades`** (0 = the whole
+sun-shadow cost was skipped, 4 = none of it was). Set
+**`renderer.shadows.cacheEnabled = false`** to restore the always-re-render
+behaviour, which is what `bench:lights --no-shadow-cache` does.
+
+**Know what this is worth before relying on it.** A cascade's fit follows the
+camera, so the cache is near-total for a still camera and *nothing at all* for a
+moving one — there is no partial credit in between. Measure both:
+`bun run bench:lights --helmets 400` against
+`bun run bench:lights --helmets 400 --orbit 0.1`. Quoting the static number as
+"the win" would be measuring the benchmark rather than the renderer. Making a
+moving camera benefit needs per-cascade frustum culling or scheduled cascade
+updates with a fitting margin, neither of which exists.
+
+One thing it does *not* detect: mutating a `Mesh`'s vertex buffer in place. The
+caster fingerprint covers mesh *identity*, not mesh contents.
+
 Fixed internals: `SHADOW_MAP_SIZE = 2048` per cascade, one `depth32float`
 `2d-array` with a layer per cascade; VRAM ≈ 67 MB. The per-cascade normal-offset
 bias is texel-scaled automatically. Cascade boundaries cross-fade, so there's no
@@ -556,9 +604,12 @@ for the design.
 
 `render()` records, in order, every frame:
 
-1. Write camera + environment uniforms.
+1. Write camera + environment uniforms, and **prepare every instance's model
+   uniform** — the model + normal matrices are computed and uploaded exactly once
+   here, then bound (not rebuilt) by each pass below. An instance whose matrix is
+   unchanged from last frame skips its upload entirely.
 2. Write cluster params + pack the point-light array.
-3. **Cascaded shadow passes** (`cullMode: "none"`): one single-sample depth-only pass per cascade, each into its own `depth_2d_array` layer.
+3. **Cascaded shadow passes** (`cullMode: "none"`): one single-sample depth-only pass per cascade, each into its own `depth_2d_array` layer — **skipped when cached** (above).
 3b. **Spot shadow passes**, one per `MAX_SHADOW_SPOTS` layer. Layers without an active caster are still cleared (so a stale map can't be sampled) but draw nothing. Draws are **frustum-culled per light** against each instance's world bounding sphere.
 4. **Cluster build** (compute) — per-cluster view-space AABBs.
 5. **Light cull** (compute) — sphere-vs-AABB, writes per-cluster light index lists.
@@ -946,6 +997,8 @@ bun run bench:lights     # windowed light + geometry benchmark (see bench/lights
                          #   --lights N  --spots 0..1 (spot fraction, default 0.5)
                          #   --helmets N (scattered DamagedHelmets, default 100)
                          #   --shadow-spots 0..4  --profile
+                         #   --orbit N   (camera revolutions/sec; 0 = static, the default)
+                         #   --no-shadow-cache  (A/B the cascade cache — pair with --orbit)
 bunx tsc --noEmit        # type-check
 ```
 

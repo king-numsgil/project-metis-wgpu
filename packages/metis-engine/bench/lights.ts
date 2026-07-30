@@ -38,6 +38,7 @@
 // frame, so it only moves the achieved-frame-rate line, never the GPU number.
 import { SdlEventType, SdlKeycode, sdlPollEvents } from "metis-native";
 import {
+    CASCADE_COUNT,
     CLUSTER_COUNT_X,
     CLUSTER_COUNT_Y,
     CLUSTER_COUNT_Z,
@@ -152,6 +153,22 @@ const SHADOW_SPOTS = Math.min(Math.max(Math.round(num("shadow-spots", MAX_SHADOW
 // floor, so no light parameter and no draw order changes. That makes it a valid
 // baseline against pre-helmet numbers, the same property `--spots 0` has.
 const HELMET_COUNT = Math.max(Math.round(num("helmets", 100)), 0);
+// Camera orbit speed, revolutions/sec. **0 (the default) keeps the camera
+// static, which is the baseline every earlier number was taken against.**
+//
+// It exists for one reason: anything that caches per-frame work keyed on the
+// camera looks free when the camera never moves. `ShadowCascades`' cache is
+// exactly that — a static camera skips all four cascade passes, and quoting
+// that as the win would be measuring the bench, not the renderer. `--orbit 0.1`
+// is the honest case, and the two numbers should always be reported together.
+// See CLAUDE.md "Cascade shadow maps are cached".
+const ORBIT_RPS = num("orbit", 0);
+// Cascade shadow-map caching — ON by default, matching the engine. Pass
+// --no-shadow-cache to A/B it against the always-re-render behaviour, which is
+// the only honest way to state what it's worth: it must be measured against
+// itself on one machine in one sitting, and its value swings completely with
+// --orbit.
+const SHADOW_CACHE = !flag("no-shadow-cache");
 
 // The plane the lights hover over, and the volume the lights animate within.
 const PLANE_SIZE = 60;
@@ -341,6 +358,7 @@ if (PROFILE && !profiler) {
     console.warn("[bench] --profile requested but this adapter has no timestamp-query support; continuing without it");
 }
 forward.depthPrepass = PREPASS;  // engine default is on; --no-prepass turns it off
+forward.shadows.cacheEnabled = SHADOW_CACHE;
 if (profiler) {
     forward.profiler = profiler;
     // The HUD draws into the same frame, so it belongs in the same tree.
@@ -350,7 +368,10 @@ const gpuHistory = new History(120);
 
 const scene = new Scene();
 scene.environment = createExteriorEnvironment({ambientIntensity: 0.02});
-scene.camera.position = vec3f(0, 11, 30);
+// Radius/height the camera sits at, static or orbiting — see ORBIT_RPS.
+const CAMERA_HEIGHT = 11;
+const CAMERA_RADIUS = 30;
+scene.camera.position = vec3f(0, CAMERA_HEIGHT, CAMERA_RADIUS);
 scene.camera.target = vec3f(0, 1, 0);
 scene.camera.clusterFar = 200; // light-culling range; the projection itself is infinite
 scene.camera.setAspectFromSize(ctx.width, ctx.height);
@@ -502,7 +523,9 @@ console.log("═".repeat(72));
 console.log(`    Resolution ............ ${ctx.width} x ${ctx.height}  (4x MSAA, immediate, ${CAP_FPS ? `${CAP_FPS} fps cap` : "uncapped"})`);
 console.log(`    GPU profiler .......... ${profiler ? `on (draw zones: ${profiler.canProfileDraws})` : "off  (--profile to enable)"}`);
 console.log(`    Depth prepass ......... ${PREPASS ? "on" : "off  (--no-prepass given)"}`);
+console.log(`    Cascade shadow cache .. ${SHADOW_CACHE ? "on" : "off  (--no-shadow-cache given)"}`);
 console.log(`    Lights ................ ${LIGHT_COUNT}   (${Math.round(LIGHT_COUNT * SPOT_FRACTION)} spot, ${LIGHT_COUNT - Math.round(LIGHT_COUNT * SPOT_FRACTION)} point — --spots 0..1, ${SHADOW_SPOTS} casting shadows)`);
+console.log(`    Camera ................ ${ORBIT_RPS === 0 ? "static  (--orbit N moves it — cascade caching is free when it doesn't)" : `orbiting ${ORBIT_RPS} rev/s`}`);
 console.log(`    Cluster grid .......... ${CLUSTER_COUNT_X} x ${CLUSTER_COUNT_Y} x ${CLUSTER_COUNT_Z} = ${NUM_CLUSTERS} clusters`);
 console.log(`    Max lights / cluster .. ${MAX_LIGHTS_PER_CLUSTER}   (capacity cap)`);
 console.log(`    Max lights / scene .... ${MAX_LIGHTS}`);
@@ -522,6 +545,10 @@ const intervalSamples: number[] = []; // wall time between frame starts (real ac
 const encodeSamples: number[] = []; // JS encode + submit cost
 const acquireSamples: number[] = []; // swapchain-image acquire wait (present back-pressure)
 const gpuSamples: number[] = []; // GPU execution cost
+// How many of the 4 sun cascades actually re-rendered. 0 means the cache took
+// the whole shadow pass; 4 means it took nothing. Under --orbit this is the
+// number that says whether the cache is doing anything at all.
+const cascadeSamples: number[] = [];
 
 let running = true;
 let virtualTime = 0;
@@ -552,6 +579,14 @@ while (running) {
 
     virtualTime += dt;
     animateLights(activeLights, virtualTime);
+    if (ORBIT_RPS !== 0) {
+        // Same radius/height as the static placement, so `--orbit` changes only
+        // whether the camera moves — not what it can see or how much of the
+        // field is on screen. An orbit that also changed the framing would make
+        // every A/B against `--orbit 0` a comparison of two different scenes.
+        const a = virtualTime * ORBIT_RPS * Math.PI * 2;
+        Vec3.set(scene.camera.position, Math.sin(a) * CAMERA_RADIUS, CAMERA_HEIGHT, Math.cos(a) * CAMERA_RADIUS);
+    }
 
     const r = renderFrame(dt, hudLine);
     const afterSubmit = performance.now();
@@ -565,6 +600,7 @@ while (running) {
         encodeSamples.push(r.encodeMs);
         acquireSamples.push(r.acquireMs);
         gpuSamples.push(gpuMs);
+        cascadeSamples.push(forward.shadows.lastRenderedCascades);
     }
 
     // Smooth on-screen fps for the HUD; refresh the text ~4x/sec.
@@ -599,6 +635,9 @@ if (gpuSamples.length === 0) {
     console.log(`    min / max .. ${ms(gpu.min)}  /  ${ms(gpu.max)}`);
     console.log(`    p95 / p99 .. ${ms(gpu.p95)}  /  ${ms(gpu.p99)}`);
     console.log(`    stddev ..... ${ms(gpu.stddev)}`);
+    const cascadesMean = cascadeSamples.reduce((s, x) => s + x, 0) / cascadeSamples.length;
+    console.log(`\n  Sun cascades re-rendered  (of ${CASCADE_COUNT} per frame — the cascade cache's hit rate)`);
+    console.log(`    ${cascadesMean.toFixed(2)} / ${CASCADE_COUNT} per frame   (${(100 - (cascadesMean / CASCADE_COUNT) * 100).toFixed(0)}% of cascade passes skipped)`);
     console.log(`\n  CPU encode time  (JS: encode every pass + submit, per frame)`);
     console.log(`    mean ....... ${ms(encode.mean)}   (p95 ${ms(encode.p95)})`);
     console.log(`\n  beginFrame  (getCurrentTexture + createView)`);

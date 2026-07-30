@@ -31,33 +31,30 @@ import type { SceneInstance } from "../scene/scene.ts";
  *
  * ## What it is worth, measured
  *
- * ~20% of CPU encode at 400 helmets — **but only once the per-instance model
- * uniform stops being re-uploaded in every pass.** Measured 2x2 at 400 helmets,
- * 320x240 (small on purpose — see below):
+ * Roughly a fifth of CPU encode at `--helmets 400`. Re-measure with
+ * `bun run bench:lights --helmets 400`; there is no toggle, so an A/B means
+ * reverting `DrawOrder.update` to return its input unsorted.
  *
- * | | sort off | sort on |
- * |---|---|---|
- * | model upload per pass | ~80 ms | ~63 ms |
- * | model upload per frame | ~52 ms | ~38 ms |
+ * The first measurement of this read as *zero*, on an Intel iGPU laptop, and the
+ * diagnosis was contention: an integrated GPU shares memory bandwidth with the
+ * CPU and `queue.writeBuffer` goes through wgpu's staging belt, so a saturated
+ * GPU destabilises the CPU encode number it is supposedly independent of. The
+ * workaround was to isolate encode by shrinking the render target rather than the
+ * scene (`--width 320 --height 240` keeps every draw call).
  *
- * The first measurement of this change at 1280x720 read as *zero*, and that was
- * a measurement artifact worth remembering: on an integrated GPU the CPU and GPU
- * share memory bandwidth, and `queue.writeBuffer` goes through wgpu's staging
- * belt, so a saturated GPU inflates and destabilises the CPU encode number it is
- * supposedly independent of. **Isolate CPU encode by shrinking the render
- * target, not the scene** — `--width 320 --height 240` keeps every draw call and
- * removes the contention.
+ * **That workaround is machine-specific — check before applying it.** On a
+ * discrete GPU (GTX 1070) encode measures identically at 320x240 and 1280x720 at
+ * every helmet count: no shared bandwidth, no contention, and shrinking the
+ * target just costs you a realistic scene.
  *
  * ## What it does not do
  *
  * Nothing here reduces the *number of draws* — that is instancing or indirect
- * drawing, and both are larger changes. Nor does it touch the per-instance model
- * uniform, which is unique per draw and still costs a `writeBuffer` plus a
- * `setBindGroup` in every pass that draws it. That upload is the larger cost of
- * the two (~35% on its own), and it is redundant work rather than necessary
- * work: the same bytes are uploaded 6-10 times per frame because
- * `SceneInstance.getModelBindGroup` both computes and uploads, and every pass
- * calls it. Splitting those two jobs is the next change.
+ * drawing, and both are larger changes. It also no longer has the larger cost
+ * hiding behind it: the per-instance model uniform used to be recomputed and
+ * re-uploaded in every pass, and is now prepared once per frame (see
+ * `SceneInstance.prepareModel` and CLAUDE.md "The model uniform is computed once
+ * per frame"). Instancing is the remaining item.
  */
 
 /** Sort key: mesh first, material second. See {@link DrawOrder} for why that order. */

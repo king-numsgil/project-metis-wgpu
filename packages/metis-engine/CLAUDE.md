@@ -66,6 +66,19 @@ bun run demo:helmet     # glTF import + 100-light clustered forward, orbiting ca
 # Standalone VectorContext (text rendering) smoke test
 bun run test/vectorText.smoke.ts
 
+# Windowed renderer benchmark. Two independent load axes — `--lights N` scales
+# shading, `--helmets N` scales geometry/draw submission — plus `--profile` for a
+# per-pass GPU breakdown. See "What the forward pass actually costs" below;
+# sweep ONE axis at a time and state which geometry a light figure was taken at.
+bun run bench:lights --profile
+bun run bench:lights --helmets 400            # geometry-bound regime
+bun run bench:lights --helmets 400 --orbit 0.1   # ...with a MOVING camera
+bun run bench:lights --helmets 400 --no-shadow-cache
+
+# The three above are one measurement, not three: the cascade cache is total for
+# a static camera and worthless for a moving one, so a number from any single one
+# of them is not a claim about the renderer. See "Cascade shadow maps are cached".
+
 # ECS stress benchmark (pure CPU — no GPU, no window). See "What the ECS
 # actually costs" below before reading its output.
 bun run bench:ecs
@@ -75,7 +88,13 @@ bun run bench:ecs --quick --only A,C
 bunx tsc --noEmit
 ```
 
-There is no `bun test` suite — `test/fixture.ts` (screenshots + a hard failure if `VectorContext` draws nothing) is the automated check, run manually rather than wired into a test runner.
+Two automated checks, both run manually rather than wired into a runner.
+`test/fixture.ts` (`bun run fixture`) renders the screenshot goldens and fails
+hard if `VectorContext` draws nothing. Alongside it there **is** a `bun test`
+suite — `ao`, `clusterNear`, `spotLight`, `spotShadow` and `shadowCache` — every
+one of which exists because the thing it covers can render plausibly while being
+wrong, and every one of which has been watched failing for the right reason
+before being trusted. `bun test test/` runs them; they need a GPU.
 
 ## Architecture
 
@@ -614,9 +633,11 @@ pass with no `wgpu` errors. Note that a scene pays 4× its shadow *draw* count
 under CSM — the standard cost, and the reason the per-cascade passes are now the
 thing to watch rather than any per-texel reconstruction.
 
-Known rough edges, deliberate for now: no per-cascade frustum culling (every
-cascade redraws every instance); the blend band double-samples two cascades in
-the overlap; and the light frustum's ortho near is pulled generously toward the
+Known rough edges, deliberate for now: no per-cascade frustum culling (when a
+cascade does render, it redraws every instance — and because the cache's
+invalidation is frame-global, this is also why one moved object re-renders all
+four; see "Cascade shadow maps are cached"); the blend band double-samples two
+cascades in the overlap; and the light frustum's ortho near is pulled generously toward the
 sun (`CASCADE_ORTHO_NEAR_SCALE`) to catch off-slice occluders rather than doing
 a proper occluder-inclusive fit.
 
@@ -654,13 +675,37 @@ scaling claim survives, only the constant moves.
 
 Two more things that only became visible with real geometry in the scene:
 
-- **CPU encode became a first-class cost.** ~5.5 ms at 1 draw, ~20 ms at 101,
-  ~60 ms at 401 — roughly linear in instance count. It sits under the GPU time
-  on this iGPU so it is not the bottleneck *here*, but on a fast discrete GPU it
-  would be the first thing to hit. See "Draw-call batching" below for what it is
-  made of and what has been done about it.
+- **CPU encode became a first-class cost**, roughly linear in instance count.
+  It sat under the GPU time on the iGPU so it was not the bottleneck *there* —
+  and the prediction that "on a fast discrete GPU it would be the first thing to
+  hit" was then confirmed on the GTX 1070, where encode and GPU time measured
+  **equal** per instance. Because the bench serialises (it awaits
+  `onSubmittedWorkDone` before present), that made encode worth half the frame
+  rate. See "Draw-call batching" and "The model uniform is computed once per
+  frame" below for what it was made of and what has been done about it.
 - **The shadow passes scale worse than the forward pass** — see the no
   per-cascade-frustum-culling rough edge above, which this now puts a number on.
+  On the discrete GPU the four cascades measured *larger than the forward pass*
+  at `--helmets 400`, which is what motivated caching them.
+
+**Read the section title literally, and re-derive the bottleneck per machine.**
+The iGPU table above and the desktop's conclusions are both correct and they
+point at different things, because the two machines sit on opposite sides of the
+CPU/GPU balance. Two findings that only appear on the discrete GPU, both worth
+re-checking rather than assuming:
+
+- **The frame is vertex/draw-submission bound, not fill bound, once geometry is
+  in it.** At `--helmets 400`, dropping from 1280x720 to 320x240 — twelve times
+  fewer pixels — moved GPU frame time by roughly a tenth. Stripping the lights
+  and the spot shadows *as well* barely moved it further. Optimising shading
+  against that scene is optimising the wrong thing; `--width`/`--height` is the
+  cheap way to find out which regime you are in.
+- **The depth prepass is a net loss on a geometry-heavy, overdraw-light scene**,
+  on both GPU time and encode — exactly as `depthPrepass`'s own doc comment
+  predicts, which makes the bench's default scene an argument against the
+  engine's default setting. Not changed, because the default should be decided on
+  a scene that represents the game rather than on this one; but re-run
+  `--no-prepass` before treating "on" as settled.
 
 `--spots <0..1>` sets what fraction of the field is spot lights (default 0.5).
 Two things to know before comparing runs across it. **Spots are slightly
@@ -992,9 +1037,13 @@ fixtures, then the cargo bay's. The renderer takes "here are the flagged spots"
 and knows nothing about rooms, portals, or zones. Keep that boundary; it is what
 lets a real zone system arrive later without touching the render path.
 
-Known rough edges, deliberate for now: shadow maps are re-rendered every frame
-even when neither the light nor the geometry moved (caching static casters is the
-obvious next win, and probably a bigger one than any micro-optimization here);
+Known rough edges, deliberate for now: **spot** shadow maps are re-rendered every
+frame even when neither the light nor the geometry moved. The sun cascades no
+longer are (see "Cascade shadow maps are cached"), and the same trick would
+apply here — a spot's frustum depends on the *light*, not the camera, so a
+static fixture in a static room would cache far better than a cascade does. It
+is only undone because the demos and the bench animate every spot, so there was
+nothing to measure it against;
 resolution is fixed per light rather than scaled by importance or distance (an
 atlas rather than an array would be the enabling change); and there is no
 filtering beyond 3x3 PCF.
@@ -1380,26 +1429,25 @@ cascades, four spot layers, a prepass and the forward pass the middle term is
 and the smallest.
 
 **The first measurement said it was worth nothing, and that measurement was
-wrong.** At 1280x720 on the Intel iGPU, CPU encode read 20.7 ms before and
-20.3 ms after at 100 helmets — noise. The cause was contention, not the change:
-on an integrated GPU the CPU and GPU share memory bandwidth, and
-`queue.writeBuffer` goes through wgpu's staging belt, so a GPU pinned at 80 ms a
-frame inflates and destabilises the CPU number that is nominally independent of
-it. **To isolate CPU encode, shrink the render target, not the scene** —
-`--width 320 --height 240` keeps every draw call and removes the contention.
-Re-measured that way at 400 helmets, over two runs:
+wrong** — but the *reason* given for it turned out to be machine-specific, and
+that is the part worth carrying forward. On the Intel iGPU laptop, CPU encode
+read the same before and after, and the cause was diagnosed as contention: an
+integrated GPU shares memory bandwidth with the CPU, and `queue.writeBuffer` goes
+through wgpu's staging belt, so a saturated GPU destabilises the CPU number that
+is nominally independent of it. The workaround was to **shrink the render target,
+not the scene** (`--width 320 --height 240` keeps every draw call and removes the
+contention).
 
-| | sort off | sort on |
-|---|---|---|
-| model upload per pass (today) | ~80 ms | **~63 ms** |
-| model upload per frame (not done) | ~52 ms | ~38 ms |
+**That workaround does not generalise, and shouldn't be applied blindly.** On the
+discrete GTX 1070 desktop, CPU encode measures the same at 320x240 as at
+1280x720 at every helmet count — there is no contention to remove, because there
+is no shared bandwidth. Re-derive which situation you are in before reaching for
+the small render target; on a discrete GPU it buys nothing and costs you a
+realistic scene.
 
-So sorting is worth ~20%, and the thing it was *hiding behind* is worth ~35%:
-`SceneInstance.getModelBindGroup` both computes the model + normal matrices and
-uploads them, and every pass calls it — so the same bytes are re-derived and
-re-uploaded 6-10 times per frame for an object that did not move. Splitting
-"compute once per frame" from "bind per pass" is the next change and the larger
-one; the two compose to ~52%.
+Sorting is worth roughly a fifth of encode. The thing it was *hiding behind* was
+worth substantially more, and is now done — see "The model uniform is computed
+once per frame" below. Re-measure both with `bun run bench:lights --helmets 400`.
 
 Two invariants worth not breaking:
 
@@ -1415,6 +1463,117 @@ Verified by rendering all 14 fixtures with and without the sort *on the same
 machine*: byte-identical, zero differing samples. That is the check to repeat,
 because the committed goldens drift by a few LSBs across machines and a plain
 `git diff` on them proves nothing either way.
+
+### The model uniform is computed once per frame, not once per pass
+
+`SceneInstance` splits **`prepareModel`** (compute the model + normal matrices,
+upload them) from **`modelBindGroup`** (a bare getter that binds what was
+uploaded). `ClusteredForwardRenderer.render()` calls the first for every instance
+in the frame's draw order, up front; the six-to-ten passes that draw an instance
+call only the second.
+
+They used to be one method, `getModelBindGroup`, and every pass called it — so
+the same matrices were re-derived and the same bytes re-uploaded once per cascade,
+once per spot layer, once for the AO prepass, once for the depth prepass and once
+for the forward pass, for an object that had not moved. **This was the single
+largest item in CPU encode**, by a distance, and removing it is the largest
+frame-rate win the renderer has taken: measure it with
+`bun run bench:lights --helmets 400`, which is where the per-instance costs
+dominate everything else.
+
+Three things about it are load-bearing:
+
+- **`modelBindGroup` throws when the instance was never prepared.** Lazily
+  preparing there instead would paper over an instance that some pass draws but
+  `render()`'s prepare loop never walked, and the symptom is an object drawn at a
+  stale transform — which reads as a game-logic bug, not a renderer one. This
+  package's recurring lesson is that the dangerous failures are the ones that
+  render plausibly; a throw is the cheap way to not have one here.
+- **The prepare loop walks `DrawOrder`'s output, which is a permutation of
+  `scene.instances`.** That is what makes the getter safe for *every* pass,
+  including `AmbientOcclusion`'s prepass, which still iterates `scene.instances`
+  directly and is the one draw loop that never adopted the draw sort or
+  `PassBinder`. Worth fixing, not yet fixed.
+- **A transform mutated between passes is ignored.** Everything the frame draws
+  is snapshotted at the top of `render()`. This is a narrowing of what was
+  previously possible-by-accident, and the right semantics: a single frame should
+  not show one object at two positions.
+
+**Unchanged instances skip their upload entirely.** `prepareModel` compares the
+freshly computed model matrix against the last one it uploaded — 16 float
+compares, far cheaper than the JS -> napi -> Rust crossing they avoid — and sets
+`modelChanged`. Comparing the model alone is sufficient because the normal matrix
+is a pure function of it. The stored copy is **NaN-filled at construction** so the
+first frame can never match: a zero-filled one would silently skip the first
+upload for any instance whose model matrix is legitimately all zeros.
+
+`modelChanged` is not only an optimisation — `ShadowCascades` reads it, which is
+what makes the next section possible.
+
+### Cascade shadow maps are cached — and exactly how much that is worth
+
+`ShadowCascades` skips a cascade's depth pass entirely (no pass encoded at all,
+not a cheaper one) when its fitted `viewProj` is bit-identical to the one its
+depth layer already holds *and* nothing about the caster set changed.
+
+**The correctness argument is the matrix, not the camera.** A cascade is only
+reused when the exact matrix that produced its depth map is the matrix the
+forward pass will sample it with. Testing "did the camera move" instead would be
+both weaker and wrong — texel snapping means the fit is *quantized*, so a camera
+can move without the fit changing, and the sun or `shadowDistance` can change
+without the camera moving.
+
+**Invalidation is frame-global, deliberately.** Any caster moving, appearing,
+vanishing or swapping its mesh re-renders all four cascades. Knowing *which*
+cascades a given caster falls in needs a per-instance/per-cascade frustum test,
+which still doesn't exist — so one moved object costs a full re-render. That is
+no worse than the uncached behaviour it replaces.
+
+**The mesh-identity hash is not paranoia.** Movement is caught by
+`modelChanged` and membership by the caster count, but reassigning
+`instance.mesh` in place changes the silhouette while leaving both unchanged.
+Unlike `DrawOrder` — where a stale answer is a missed optimisation — a stale
+answer here is a *wrong picture*: an object casting the shadow of the mesh it used
+to be. It costs one multiply per caster in a loop that already runs. It does
+**not** cover mutating a `Mesh`'s vertex buffer in place; nothing does.
+
+**Now the honest part: this is all-or-nothing on camera motion.** A cascade's fit
+follows the camera, so a still camera skips every cascade and a moving one skips
+none. There is no partial credit. On the geometry-heavy bench the static case is
+one of the largest wins in this file and the orbiting case is *exactly zero* —
+same build, same machine, same sitting.
+
+**That is why `bench:lights` grew `--orbit`.** The bench camera was static, so a
+cache keyed on the camera would have measured as free, and quoting that number
+would have been measuring the benchmark rather than the renderer — the exact
+mistake "don't let a benchmark's labels assert a cause it hasn't measured"
+warns about. Always report the pair:
+
+```powershell
+bun run bench:lights --helmets 400                      # static — best case
+bun run bench:lights --helmets 400 --orbit 0.1          # moving — worst case
+bun run bench:lights --helmets 400 --no-shadow-cache    # the A/B baseline
+```
+
+The summary prints cascades-re-rendered-per-frame, which is the number that says
+whether the cache engaged at all. If a change ever makes the static case look
+good and you have not run the orbiting one, you have not measured anything.
+
+**Making a moving camera benefit is a different change**, and neither half
+exists: per-cascade frustum culling (so a moved caster only dirties the cascades
+it is in), or scheduled cascade updates — refreshing distant cascades every Nth
+frame, which needs a fitting margin so the camera cannot leave a stale cascade's
+coverage, and accepts lag in far shadows.
+
+`test/shadowCache.test.ts` pins all of this, and its invalidation case is
+**mutation-checked**: deleting the `modelChanged` term from `castersChanged`
+makes the cached run keep drawing a moved cube's shadow at its old position, and
+the test fails on thousands of differing pixels. Per this package's history with
+`clusterNear.test.ts` and `spotLight.test.ts`, that is the point — a render-based
+test proves nothing until it has been seen failing for the right reason. The test
+also asserts the cache actually *hits* (`lastRenderedCascades === 0` on a warm
+static frame), because "cached matches uncached" passes just as happily with a
+cache that never engages.
 
 ### `SceneInstance.castsShadow` — content, not culling
 

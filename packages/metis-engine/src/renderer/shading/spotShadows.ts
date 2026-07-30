@@ -330,7 +330,7 @@ export class SpotShadows {
                         continue;
                     }
                     const instance = instances[k]!;
-                    pass.setBindGroup(1, instance.getModelBindGroup(this.device, this.modelBindGroupLayout));
+                    pass.setBindGroup(1, instance.modelBindGroup);
                     this.binder.setMesh(pass, instance.mesh);
                     instance.mesh.draw(pass);
                     this.lastDrawnInstances++;

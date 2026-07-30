@@ -123,7 +123,8 @@ export class ClusteredForwardRenderer {
         ambientColorIntensity: Float32Array;
     };
     private readonly culler: LightCuller;
-    private readonly shadows: ShadowCascades;
+    /** The 4-cascade directional shadow. Public for `cacheEnabled` and `lastRenderedCascades`. */
+    readonly shadows: ShadowCascades;
     /** Per-spot-light shadow maps. `lastDrawnInstances`/`lastCandidateInstances` report cull effectiveness. */
     readonly spotShadows: SpotShadows;
     /** Frame-scoped draw sort, shared with the shadow passes. See `drawBatching.ts`. */
@@ -311,6 +312,18 @@ ${depthPrepassWgsl}`,
         // *same* order, so the redundant binds each of them skips are the same
         // ones. Sorting per pass would cost six sorts to reach the same place.
         const instances = this.drawOrder.update(scene.instances);
+        // Every instance's model + normal matrix, computed and uploaded ONCE
+        // here rather than once per pass that draws it. Six to ten passes bind
+        // these per frame (four cascades, up to four spot layers, the AO
+        // prepass, the depth prepass, the forward pass) and every one of them
+        // used to re-derive and re-upload identical bytes.
+        //
+        // This loop is why `modelBindGroup` is allowed to be a bare getter: it
+        // walks the same `instances` array every pass below walks, so an
+        // instance a pass can draw is an instance this prepared.
+        for (let i = 0; i < instances.length; i++) {
+            instances[i]!.prepareModel(this.device, this.modelBindGroupLayout);
+        }
         this.culler.write(scene, targets, shadowSpots);
         this.shadows.render(encoder, scene, instances, this.shadowDistance, this.cascadeSplitLambda, this.profiler);
         this.spotShadows.render(encoder, instances, shadowSpots, this.profiler);
@@ -356,7 +369,7 @@ ${depthPrepassWgsl}`,
             pre.setBindGroup(0, this.depthPrepassBindGroup);
             this.binder.begin();
             for (const instance of instances) {
-                pre.setBindGroup(1, instance.getModelBindGroup(this.device, this.modelBindGroupLayout));
+                pre.setBindGroup(1, instance.modelBindGroup);
                 this.binder.setMesh(pre, instance.mesh);
                 instance.mesh.draw(pre);
             }
@@ -396,7 +409,7 @@ ${depthPrepassWgsl}`,
             // them — which the sort makes the common case, not a lucky one. The
             // model bind group is genuinely per-instance and always rebinds.
             this.binder.setMaterial(pass, 1, instance.material, this.device, this.materialBindGroupLayout);
-            pass.setBindGroup(2, instance.getModelBindGroup(this.device, this.modelBindGroupLayout));
+            pass.setBindGroup(2, instance.modelBindGroup);
             this.binder.setMesh(pass, instance.mesh);
             // Per-draw zones nest under the "forward" span. No-ops unless the
             // device enabled timestamp-query-inside-passes.

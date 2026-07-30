@@ -54,7 +54,25 @@ export class SceneInstance {
      * so the two matrices below are computed directly into what gets uploaded.
      * There is no intermediate matrix and no copy on this path any more.
      */
-    private staging: {bytes: Uint8Array; model: Mat4f; normalMatrix: Mat3f} | null = null;
+    private staging: {
+        bytes: Uint8Array;
+        model: Mat4f;
+        normalMatrix: Mat3f;
+        /** Flat float view of `model`, for the cheap frame-to-frame compare below. */
+        modelFloats: Float32Array;
+        /** Last *uploaded* model matrix, so `prepareModel` can tell a no-op from a move. */
+        uploadedModel: Float32Array;
+    } | null = null;
+    /**
+     * Whether the last {@link prepareModel} produced a different model matrix
+     * than the frame before — i.e. whether this instance actually moved.
+     *
+     * `ShadowCascades` reads it to decide whether a cached cascade is still
+     * valid. It is per-frame state, meaningless before the first `prepareModel`,
+     * and `true` on the frame the instance is first prepared (nothing to
+     * compare against, so it counts as a change).
+     */
+    modelChanged = true;
 
     /**
      * @param mesh geometry to draw; shared freely between instances.
@@ -69,8 +87,44 @@ export class SceneInstance {
         this.transform = createTransform(transform);
     }
 
-    /** Recomputes model + normal matrices from `transform` (or uses `modelMatrixOverride`) and returns a bind group for group(2) of the forward pipeline. */
-    getModelBindGroup(device: GpuDevice, layout: GpuBindGroupLayout): GpuBindGroup {
+    /**
+     * The bind group {@link prepareModel} last uploaded — group(2) of the
+     * forward pipeline, group(1) of every depth-only one.
+     *
+     * Binding is all this does: no matrix math, no upload. That split is the
+     * whole point, because ~6-10 passes bind this per frame and only one of them
+     * needs the value recomputed.
+     *
+     * **Throws if the instance was never prepared this frame.** The alternative
+     * — lazily preparing here — would silently paper over an instance that a
+     * pass draws but `render()` never walked, and the symptom would be an object
+     * rendered at a stale transform, which looks like a game-logic bug rather
+     * than a renderer one. Loud is better; see CLAUDE.md's running theme of
+     * things that "render plausibly" while being wrong.
+     */
+    get modelBindGroup(): GpuBindGroup {
+        if (!this.bindGroup) {
+            throw new Error(
+                "SceneInstance.modelBindGroup read before prepareModel() — every pass that draws an " +
+                    "instance must draw one the frame's prepare loop walked (see ClusteredForwardRenderer.render).",
+            );
+        }
+        return this.bindGroup;
+    }
+
+    /**
+     * Recomputes model + normal matrices from `transform` (or
+     * `modelMatrixOverride`), uploads them, and returns the bind group.
+     *
+     * **Call exactly once per frame per instance, before any pass draws it** —
+     * `ClusteredForwardRenderer.render()` does this for the whole draw order up
+     * front. Passes then bind {@link modelBindGroup}.
+     *
+     * This used to be one method that every pass called, so the same bytes were
+     * re-derived and re-uploaded once per pass. See CLAUDE.md "The model uniform
+     * is computed once per frame" for what that cost.
+     */
+    prepareModel(device: GpuDevice, layout: GpuBindGroupLayout): GpuBindGroup {
         if (!this.staging) {
             const s = stage(ModelUniforms);
             this.staging = {
@@ -78,6 +132,12 @@ export class SceneInstance {
                 model: s.mat4("model"),
                 // A std140 mat3 is three *vec4* columns — 48 bytes, not 36.
                 normalMatrix: s.mat3("normalMatrix"),
+                modelFloats: s.f32("model", 16),
+                // NaN-filled so the first compare below cannot match: NaN !== NaN,
+                // so frame 1 always counts as a change and always uploads. A
+                // zero-filled array would silently skip the first upload for any
+                // instance whose model matrix happens to be all zeros.
+                uploadedModel: new Float32Array(16).fill(NaN),
             };
             this.buffer = device.createBuffer({
                 label: "metis-engine/model",
@@ -99,9 +159,28 @@ export class SceneInstance {
         } else {
             transformToMat4(this.transform, model);
         }
-        normalMatrixFromModel(model, this.staging.normalMatrix);
+        // The normal matrix is a pure function of the model matrix, so comparing
+        // the model alone decides both — 16 floats, not the whole 112-byte
+        // struct.
+        const {modelFloats, uploadedModel} = this.staging;
+        let changed = false;
+        for (let i = 0; i < 16; i++) {
+            if (modelFloats[i] !== uploadedModel[i]) {
+                changed = true;
+                break;
+            }
+        }
+        this.modelChanged = changed;
 
-        device.queue.writeBuffer(this.buffer!, 0, this.staging.bytes);
+        // A static instance stops uploading entirely. The GPU buffer keeps what
+        // it was last given, so skipping the write is not "stale data" — it is
+        // the same data, not re-sent. 16 float compares are far cheaper than the
+        // JS -> napi -> Rust crossing they avoid.
+        if (changed) {
+            normalMatrixFromModel(model, this.staging.normalMatrix);
+            device.queue.writeBuffer(this.buffer!, 0, this.staging.bytes);
+            uploadedModel.set(modelFloats);
+        }
         return this.bindGroup!;
     }
 
