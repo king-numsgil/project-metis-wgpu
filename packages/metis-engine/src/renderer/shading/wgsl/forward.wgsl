@@ -18,7 +18,10 @@
 @group(1) @binding(5) var roughnessTex: texture_2d<f32>;
 @group(1) @binding(6) var emissiveTex: texture_2d<f32>;
 
-@group(2) @binding(0) var<uniform> modelUniform: Model;
+// One array for every instance in the frame, indexed by @builtin(instance_index)
+// — see shading/modelBuffer.ts. Slot i is draw-order position i, and a draw's
+// `firstInstance` is its run's start, so this lands on the right transform.
+@group(2) @binding(0) var<storage, read> models: array<Model>;
 
 @group(3) @binding(0) var<uniform> clusterParams: ClusterParams;
 @group(3) @binding(1) var<storage, read> lights: array<GpuLight>;
@@ -26,6 +29,7 @@
 @group(3) @binding(3) var<storage, read> clusterLightIndices: array<u32>;
 
 struct VertexInput {
+    @builtin(instance_index) instanceIndex: u32,
     @location(0) position: vec3<f32>,
     @location(1) normal: vec3<f32>,
     @location(2) tangent: vec4<f32>, // xyz = tangent, w = bitangent sign
@@ -154,10 +158,12 @@ fn sampleSunShadow(worldPosition: vec3<f32>, N: vec3<f32>, linearDepth: f32) -> 
 @vertex
 fn vs(input: VertexInput) -> VertexOutput {
     var out: VertexOutput;
-    let worldPos4 = modelUniform.model * vec4<f32>(input.position, 1.0);
+    // Field-wise, NOT `let instance = models[i]` — see the note above the binding.
+    let worldPos4 = models[input.instanceIndex].model * vec4<f32>(input.position, 1.0);
     out.worldPosition = worldPos4.xyz;
-    out.worldNormal = normalize(modelUniform.normalMat * input.normal);
-    out.worldTangent = vec4<f32>(normalize(modelUniform.normalMat * input.tangent.xyz), input.tangent.w);
+    let nrm = models[input.instanceIndex].normalMat;
+    out.worldNormal = normalize(nrm * input.normal);
+    out.worldTangent = vec4<f32>(normalize(nrm * input.tangent.xyz), input.tangent.w);
     out.uv = input.uv;
     out.viewZ = (camera.view * worldPos4).z;
     out.clipPosition = camera.viewProj * worldPos4;

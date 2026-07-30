@@ -1,21 +1,19 @@
-import {
-    type GpuBindGroup,
-    type GpuBindGroupLayout,
-    type GpuBuffer,
-    GPUBufferUsage,
-    type GpuDevice,
-} from "metis-native";
 import { Mat4 } from "metis-data";
 import { Camera } from "../math/camera.ts";
 import { createTransform, normalMatrixFromModel, type Transform, transformToMat4 } from "../math/transform.ts";
 import type { Mat3f, Mat4f } from "../math/types.ts";
-import { ModelUniforms, stage } from "../shading/gpuLayouts.ts";
 import { createExteriorEnvironment, type Environment } from "./environment.ts";
 import type { Light } from "./light.ts";
 import type { Material } from "./material.ts";
 import type { Mesh } from "./mesh.ts";
 
-/** One drawable: a mesh + material pairing, placed in the world by `transform`. Owns its own per-instance model uniform buffer. */
+/**
+ * One drawable: a mesh + material pairing, placed in the world by `transform`.
+ *
+ * It owns **no GPU resources**. Its model + normal matrices are written into a
+ * slot of the renderer's shared model array (`shading/modelBuffer.ts`), which is
+ * what lets instances sharing a mesh collapse into one instanced draw.
+ */
 export class SceneInstance {
     transform: Transform;
     /**
@@ -42,37 +40,37 @@ export class SceneInstance {
      */
     castsShadow = true;
 
-    private buffer: GpuBuffer | null = null;
-    private bindGroup: GpuBindGroup | null = null;
     /**
-     * Per-instance CPU staging, created with the GPU buffer on first use and
-     * rewritten in place every frame. This is the allocation that scaled with
-     * scene size before — one `Std140Writer` per instance per frame, each with
-     * five allocations of its own.
-     *
-     * `model`/`normalMatrix` are `Mat4f`/`Mat3f` **aliasing the upload bytes**,
-     * so the two matrices below are computed directly into what gets uploaded.
-     * There is no intermediate matrix and no copy on this path any more.
+     * Last model matrix written, so {@link writeModel} can tell a no-op from a
+     * move. NaN-filled so the first write can never match: a zero-filled one
+     * would silently report "unchanged" for an instance whose model matrix is
+     * legitimately all zeros.
      */
-    private staging: {
-        bytes: Uint8Array;
-        model: Mat4f;
-        normalMatrix: Mat3f;
-        /** Flat float view of `model`, for the cheap frame-to-frame compare below. */
-        modelFloats: Float32Array;
-        /** Last *uploaded* model matrix, so `prepareModel` can tell a no-op from a move. */
-        uploadedModel: Float32Array;
-    } | null = null;
+    private readonly writtenModel = new Float32Array(16).fill(NaN);
     /**
-     * Whether the last {@link prepareModel} produced a different model matrix
-     * than the frame before — i.e. whether this instance actually moved.
+     * Whether the last {@link writeModel} produced a different model matrix than
+     * the frame before — i.e. whether this instance actually moved.
      *
      * `ShadowCascades` reads it to decide whether a cached cascade is still
-     * valid. It is per-frame state, meaningless before the first `prepareModel`,
-     * and `true` on the frame the instance is first prepared (nothing to
-     * compare against, so it counts as a change).
+     * valid, and `ModelBuffer` sums it to decide whether to upload at all. It is
+     * per-frame state, meaningless before the first write, and `true` on the
+     * frame the instance is first written (nothing to compare against, so it
+     * counts as a change).
      */
     modelChanged = true;
+
+    /**
+     * This frame's model matrix as a flat column-major 16-float view — valid
+     * after {@link writeModel}, which every instance gets once per frame.
+     *
+     * `ShadowCascades` culls against it rather than recomputing
+     * `transformToMat4`, which is the whole reason it is exposed: the matrix has
+     * already been built this frame and rebuilding it per cascade would cost
+     * more than the culling saves.
+     */
+    get modelFloats(): Readonly<Float32Array> {
+        return this.writtenModel;
+    }
 
     /**
      * @param mesh geometry to draw; shared freely between instances.
@@ -88,109 +86,65 @@ export class SceneInstance {
     }
 
     /**
-     * The bind group {@link prepareModel} last uploaded — group(2) of the
-     * forward pipeline, group(1) of every depth-only one.
+     * Composes this instance's model matrix into `model` and its normal matrix
+     * into `normalMatrix` — both views into the renderer's shared model array —
+     * and returns whether the result differs from the last frame's.
      *
-     * Binding is all this does: no matrix math, no upload. That split is the
-     * whole point, because ~6-10 passes bind this per frame and only one of them
-     * needs the value recomputed.
+     * **Renderer-internal, called once per frame per instance** by
+     * `ModelBuffer.update`, over `DrawOrder`'s output. The slot it writes into is
+     * the instance's position in that order, which is what the passes' instanced
+     * draws index by; see `shading/modelBuffer.ts` for why that has to line up.
      *
-     * **Throws if the instance was never prepared this frame.** The alternative
-     * — lazily preparing here — would silently paper over an instance that a
-     * pass draws but `render()` never walked, and the symptom would be an object
-     * rendered at a stale transform, which looks like a game-logic bug rather
-     * than a renderer one. Loud is better; see CLAUDE.md's running theme of
-     * things that "render plausibly" while being wrong.
+     * Writing straight into the upload bytes means there is no intermediate
+     * matrix and no copy — an override is the only case that copies, and only
+     * because the caller owns that matrix.
      */
-    get modelBindGroup(): GpuBindGroup {
-        if (!this.bindGroup) {
-            throw new Error(
-                "SceneInstance.modelBindGroup read before prepareModel() — every pass that draws an " +
-                    "instance must draw one the frame's prepare loop walked (see ClusteredForwardRenderer.render).",
-            );
-        }
-        return this.bindGroup;
-    }
-
-    /**
-     * Recomputes model + normal matrices from `transform` (or
-     * `modelMatrixOverride`), uploads them, and returns the bind group.
-     *
-     * **Call exactly once per frame per instance, before any pass draws it** —
-     * `ClusteredForwardRenderer.render()` does this for the whole draw order up
-     * front. Passes then bind {@link modelBindGroup}.
-     *
-     * This used to be one method that every pass called, so the same bytes were
-     * re-derived and re-uploaded once per pass. See CLAUDE.md "The model uniform
-     * is computed once per frame" for what that cost.
-     */
-    prepareModel(device: GpuDevice, layout: GpuBindGroupLayout): GpuBindGroup {
-        if (!this.staging) {
-            const s = stage(ModelUniforms);
-            this.staging = {
-                bytes: s.bytes,
-                model: s.mat4("model"),
-                // A std140 mat3 is three *vec4* columns — 48 bytes, not 36.
-                normalMatrix: s.mat3("normalMatrix"),
-                modelFloats: s.f32("model", 16),
-                // NaN-filled so the first compare below cannot match: NaN !== NaN,
-                // so frame 1 always counts as a change and always uploads. A
-                // zero-filled array would silently skip the first upload for any
-                // instance whose model matrix happens to be all zeros.
-                uploadedModel: new Float32Array(16).fill(NaN),
-            };
-            this.buffer = device.createBuffer({
-                label: "metis-engine/model",
-                size: ModelUniforms.byteSize,
-                usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-            });
-            this.bindGroup = device.createBindGroup({
-                label: "metis-engine/model-bind-group",
-                layout,
-                entries: [{binding: 0, buffer: {buffer: this.buffer}}],
-            });
-        }
-
-        // Composed straight into the upload bytes. An override is the only case
-        // that copies, and only because the caller owns that matrix.
-        const model = this.staging.model;
+    writeModel(model: Mat4f, normalMatrix: Mat3f): boolean {
         if (this.modelMatrixOverride) {
             Mat4.copy(model, this.modelMatrixOverride);
         } else {
             transformToMat4(this.transform, model);
         }
+
         // The normal matrix is a pure function of the model matrix, so comparing
         // the model alone decides both — 16 floats, not the whole 112-byte
-        // struct.
-        const {modelFloats, uploadedModel} = this.staging;
+        // struct. Cheap enough to be worth doing on every instance every frame,
+        // because what it saves is a whole-array upload and (via
+        // ShadowCascades) four depth passes.
+        // `view()` is allocation-free and cached (metis-data DOC.md's allocation
+        // table), and a mat4's columns are unpadded under both packings, so this
+        // is a flat 16-element float view — not `get()`, which allocates a tuple
+        // per column and would undo the point of doing this per instance.
+        const current = model.view();
+        const written = this.writtenModel;
         let changed = false;
         for (let i = 0; i < 16; i++) {
-            if (modelFloats[i] !== uploadedModel[i]) {
+            if (current[i] !== written[i]) {
                 changed = true;
                 break;
             }
         }
         this.modelChanged = changed;
 
-        // A static instance stops uploading entirely. The GPU buffer keeps what
-        // it was last given, so skipping the write is not "stale data" — it is
-        // the same data, not re-sent. 16 float compares are far cheaper than the
-        // JS -> napi -> Rust crossing they avoid.
         if (changed) {
-            normalMatrixFromModel(model, this.staging.normalMatrix);
-            device.queue.writeBuffer(this.buffer!, 0, this.staging.bytes);
-            uploadedModel.set(modelFloats);
+            normalMatrixFromModel(model, normalMatrix);
+            written.set(current);
         }
-        return this.bindGroup!;
+        return changed;
     }
 
-    /** Releases this instance's model uniform buffer. Does **not** touch the shared mesh or material. */
-    destroy() {
-        this.buffer?.destroy();
-        this.buffer = null;
-        this.bindGroup = null;
-        this.staging = null;
-    }
+    /**
+     * No-op, kept because callers hold `SceneInstance`s and used to have to
+     * release them.
+     *
+     * An instance owned a GPU buffer and a bind group until the renderer moved
+     * every transform into one shared model array; it now owns nothing, and the
+     * shared mesh and material were never its to free. Dropping the reference is
+     * all that is required.
+     *
+     * @deprecated Nothing to release; safe to stop calling.
+     */
+    destroy() {}
 }
 
 /**

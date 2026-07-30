@@ -16,9 +16,10 @@
 // must be kept in lockstep: same expression, same order of operations.
 
 @group(0) @binding(0) var<uniform> prepassCamera: Camera;
-@group(1) @binding(0) var<uniform> prepassModel: Model;
+@group(1) @binding(0) var<storage, read> prepassModels: array<Model>;
 
 struct DepthOnlyInput {
+    @builtin(instance_index) instanceIndex: u32,
     @location(0) position: vec3<f32>,
 };
 
@@ -29,8 +30,9 @@ struct DepthOnlyOutput {
 @vertex
 fn vs(input: DepthOnlyInput) -> DepthOnlyOutput {
     var out: DepthOnlyOutput;
-    // Must match forward.wgsl's `vs` exactly, including the intermediate.
-    let worldPos4 = prepassModel.model * vec4<f32>(input.position, 1.0);
+    // Must match forward.wgsl's `vs` exactly, including the intermediate and
+    // the array indexing.
+    let worldPos4 = prepassModels[input.instanceIndex].model * vec4<f32>(input.position, 1.0);
     out.clipPosition = prepassCamera.viewProj * worldPos4;
     return out;
 }

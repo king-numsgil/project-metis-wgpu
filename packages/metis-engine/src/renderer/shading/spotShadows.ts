@@ -19,7 +19,7 @@ import { type Mat4f, mat4f, vec3f } from "../math/types.ts";
 import type { Light, SpotLight } from "../scene/light.ts";
 import { MESH_VERTEX_LAYOUT } from "../scene/mesh.ts";
 import type { SceneInstance } from "../scene/scene.ts";
-import { PassBinder } from "./drawBatching.ts";
+import { forEachDrawRun, PassBinder } from "./drawBatching.ts";
 import { MAX_SHADOW_SPOTS, SPOT_SHADOW_MAP_SIZE } from "./shadowConfig.ts";
 import { SHADOW_RENDER_STRIDE, SpotShadowUniforms, stage, wrapMat4 } from "./gpuLayouts.ts";
 import commonWgsl from "./wgsl/common.wgsl" with { type: "text" };
@@ -103,6 +103,8 @@ export class SpotShadows {
     private readonly modelBindGroupLayout: GpuBindGroupLayout;
     /** Redundant-bind tracker, reset at the start of each spot layer's pass. */
     private readonly binder = new PassBinder();
+    /** Scratch visibility mask for the current light; grown with the instance count. */
+    private visible = new Uint8Array(0);
     private readonly depthArray: GpuTexture;
     private readonly layerViews: GpuTextureView[];
     private readonly renderBuffer: GpuBuffer;
@@ -243,9 +245,20 @@ export class SpotShadows {
     render(
         encoder: GpuCommandEncoder,
         instances: readonly SceneInstance[],
+        modelBindGroup: GpuBindGroup,
         spots: SpotLight[],
         profiler?: GpuProfiler,
     ) {
+        // Per-instance visibility for the current light, filled below. It exists
+        // because `forEachDrawRun` may test an instance twice at a run boundary:
+        // the frustum test is real work and the drawn/candidate counters are a
+        // side effect, so both have to happen exactly once, here, in a plain
+        // loop — and the predicate handed to the run walker is a pure lookup.
+        if (this.visible.length < instances.length) {
+            this.visible = new Uint8Array(instances.length);
+        }
+        const visible = this.visible;
+        const isVisible = (_instance: SceneInstance, index: number) => visible[index] === 1;
         const texelScale = this.texelScaleScratch;
 
         for (let i = 0; i < spots.length; i++) {
@@ -315,6 +328,7 @@ export class SpotShadows {
                 frustumFromViewProj(this.renderMatrices[i]!, this.frustum);
                 pass.setPipeline(this.pipeline);
                 pass.setBindGroup(0, this.renderBindGroups[i]!);
+                pass.setBindGroup(1, modelBindGroup);
                 this.binder.begin();
                 for (let k = 0; k < instances.length; k++) {
                     // Checked before the counter: a non-caster is not a culling
@@ -322,19 +336,21 @@ export class SpotShadows {
                     // drawn/candidate ratio the HUD reports look worse than the
                     // frustum test actually is.
                     if (!instances[k]!.castsShadow) {
+                        visible[k] = 0;
                         continue;
                     }
                     this.lastCandidateInstances++;
                     const s = spheres[k]!;
-                    if (!sphereInFrustum(this.frustum, s.x, s.y, s.z, s.r)) {
-                        continue;
+                    const inFrustum = sphereInFrustum(this.frustum, s.x, s.y, s.z, s.r);
+                    visible[k] = inFrustum ? 1 : 0;
+                    if (inFrustum) {
+                        this.lastDrawnInstances++;
                     }
-                    const instance = instances[k]!;
-                    pass.setBindGroup(1, instance.modelBindGroup);
-                    this.binder.setMesh(pass, instance.mesh);
-                    instance.mesh.draw(pass);
-                    this.lastDrawnInstances++;
                 }
+                forEachDrawRun(instances, isVisible, false, (mesh, _material, first, count) => {
+                    this.binder.setMesh(pass, mesh);
+                    mesh.draw(pass, count, first);
+                });
             }
             pass.end();
         }

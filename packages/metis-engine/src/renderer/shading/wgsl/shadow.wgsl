@@ -7,10 +7,10 @@
 // sampleSunShadow() tests with a hardware comparison sampler (PCF).
 
 @group(0) @binding(0) var<uniform> shadowUniforms: ShadowUniforms;
-@group(1) @binding(0) var<uniform> modelUniform: Model;
+@group(1) @binding(0) var<storage, read> models: array<Model>;
 
 @vertex
-fn vs(@location(0) position: vec3<f32>) -> @builtin(position) vec4<f32> {
-    let worldPos = modelUniform.model * vec4<f32>(position, 1.0);
+fn vs(@builtin(instance_index) instanceIndex: u32, @location(0) position: vec3<f32>) -> @builtin(position) vec4<f32> {
+    let worldPos = models[instanceIndex].model * vec4<f32>(position, 1.0);
     return shadowUniforms.lightViewProj * worldPos;
 }

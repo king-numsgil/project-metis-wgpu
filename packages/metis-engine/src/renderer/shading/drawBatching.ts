@@ -57,6 +57,9 @@ import type { SceneInstance } from "../scene/scene.ts";
  * per frame"). Instancing is the remaining item.
  */
 
+/** Shared `forEachDrawRun` filter: the shadow passes draw only casters. */
+export const castsShadow = (instance: SceneInstance) => instance.castsShadow;
+
 /** Sort key: mesh first, material second. See {@link DrawOrder} for why that order. */
 function compareInstances(a: SceneInstance, b: SceneInstance): number {
     return a.mesh.id - b.mesh.id || a.material.id - b.material.id;
@@ -117,6 +120,66 @@ export class DrawOrder {
             }
         }
         return true;
+    }
+}
+
+/**
+ * Walks the frame's draw order and calls `emit` once per **instanced draw run**:
+ * a maximal span of consecutive instances that share a mesh (and a material, if
+ * `groupByMaterial`) and that `include` accepts.
+ *
+ * `firstInstance` is the run's start index in the draw order, which is also its
+ * slot in the shared model array — see `modelBuffer.ts` for why those must be
+ * the same number.
+ *
+ * **A run breaks at every gap, and that is the whole design decision here.**
+ * Passes that draw a subset — the cascades skip non-casters, the spot passes
+ * frustum-cull — cannot renumber their instances, because `instance_index`
+ * indexes the frame-wide array. So a rejected instance splits the run rather
+ * than being compacted out. The consequence is that a *scattered* cull pattern
+ * yields more, smaller draws than a contiguous one, and in the pathological case
+ * (every other instance rejected) instancing degrades to one draw per instance —
+ * i.e. exactly the pre-instancing cost, never worse. Compacting instead would
+ * need a per-pass index-remap buffer and an extra indirection in every vertex
+ * shader; that is a real option if a spot-heavy scene ever shows it mattering,
+ * and it is not built.
+ *
+ * @param include filter, receiving the instance and its draw-order index.
+ *   **Must be pure and cheap: an instance at a run boundary is tested twice** —
+ *   once as the reason a run ended, once as the candidate that starts the next
+ *   one. A predicate that counts, mutates, or does real work (a frustum test)
+ *   must precompute into a lookup and have this read it; `SpotShadows` does
+ *   exactly that, and its drawn/candidate counters would double-count otherwise.
+ * @param groupByMaterial `true` for the forward pass, which binds a material per
+ *   run. The depth-only passes pass `false` — no material is involved, so their
+ *   runs are longer, which is exactly why `DrawOrder` sorts mesh-major.
+ */
+export function forEachDrawRun(
+    instances: readonly SceneInstance[],
+    include: ((instance: SceneInstance, index: number) => boolean) | null,
+    groupByMaterial: boolean,
+    emit: (mesh: Mesh, material: Material, firstInstance: number, instanceCount: number) => void,
+): void {
+    let i = 0;
+    while (i < instances.length) {
+        const first = instances[i]!;
+        if (include && !include(first, i)) {
+            i++;
+            continue;
+        }
+        let count = 1;
+        while (i + count < instances.length) {
+            const next = instances[i + count]!;
+            if (next.mesh !== first.mesh || (groupByMaterial && next.material !== first.material)) {
+                break;
+            }
+            if (include && !include(next, i + count)) {
+                break;
+            }
+            count++;
+        }
+        emit(first.mesh, first.material, i, count);
+        i += count;
     }
 }
 

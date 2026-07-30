@@ -17,7 +17,8 @@ import type { GpuProfiler } from "../debug/gpuProfiler.ts";
 import { type Mat4f, mat4f, type Vec3f, vec3f } from "../math/types.ts";
 import { MESH_VERTEX_LAYOUT } from "../scene/mesh.ts";
 import type { Scene, SceneInstance } from "../scene/scene.ts";
-import { PassBinder } from "./drawBatching.ts";
+import { castsShadow, forEachDrawRun, PassBinder } from "./drawBatching.ts";
+import { type Frustum, frustumFromViewProj, sphereInFrustum, worldBoundingSphereInto } from "../math/frustum.ts";
 import { CASCADE_COUNT, SHADOW_MAP_SIZE } from "./shadowConfig.ts";
 import { CascadeUniforms, SHADOW_RENDER_STRIDE, stage, wrapMat4 } from "./gpuLayouts.ts";
 import commonWgsl from "./wgsl/common.wgsl" with { type: "text" };
@@ -166,6 +167,38 @@ export class ShadowCascades {
      */
     cacheEnabled = true;
 
+    /**
+     * Cull each cascade's draws against its own ortho frustum.
+     *
+     * **Free of visual consequence by construction**: the test volume is the
+     * exact matrix the pass renders with, so anything it rejects would have been
+     * clipped anyway. The fixtures assert that — they come back byte-identical
+     * either way.
+     *
+     * **Off by default, on measurement rather than principle.** On the only
+     * scene the bench can build it rejects ~16-20% of cascade draws and produces
+     * *no* frame-time change that survives this machine's run-to-run drift,
+     * while costing per-frame CPU: four sphere tests per instance, plus run
+     * fragmentation, since a culled instance splits an instanced draw
+     * (`forEachDrawRun`). Turn it on for a world genuinely larger than the
+     * cascades — see CLAUDE.md "Per-cascade frustum culling measured as
+     * nothing" for why this bench cannot show that and what would.
+     *
+     * A/B with `bench:lights --helmets 400 --no-shadow-cache --cascade-cull`,
+     * alternating runs; the cache has to be off or there is nothing to cull.
+     */
+    cullPerCascade = false;
+
+    /** Draws issued / casters considered, summed over all four cascades last frame. */
+    lastDrawnInstances = 0;
+    lastCandidateInstances = 0;
+
+    /** Per-frame world bounding spheres, flat [x,y,z,r] per instance. */
+    private spheres = new Float32Array(0);
+    /** Per-cascade visibility mask; see the purity note on `forEachDrawRun`. */
+    private visible = new Uint8Array(0);
+    private readonly cascadeFrustum: Frustum = frustumFromViewProj(mat4f());
+
     constructor(device: GpuDevice, modelBindGroupLayout: GpuBindGroupLayout) {
         this.device = device;
         this.modelBindGroupLayout = modelBindGroupLayout;
@@ -294,6 +327,7 @@ export class ShadowCascades {
         encoder: GpuCommandEncoder,
         scene: Scene,
         instances: readonly SceneInstance[],
+        modelBindGroup: GpuBindGroup,
         shadowDistance: number,
         splitLambda: number,
         profiler?: GpuProfiler,
@@ -316,21 +350,68 @@ export class ShadowCascades {
         this.device.queue.writeBuffer(this.cascadeRenderBuffer, 0, this.renderBytes);
         this.device.queue.writeBuffer(this.uniformBuffer, 0, this.forwardBytes);
 
+        this.lastDrawnInstances = 0;
+        this.lastCandidateInstances = 0;
+        // Grow BEFORE the capture below. `visible` is closed over by `isVisible`,
+        // so reallocating it afterwards would leave the predicate reading a
+        // stale zero-length array — every index `undefined`, every instance
+        // culled, every shadow silently gone. That is exactly what happened the
+        // first time this was written, and the fixtures caught it.
+        if (this.visible.length < instances.length) {
+            this.visible = new Uint8Array(instances.length);
+            this.spheres = new Float32Array(instances.length * 4);
+        }
+        if (this.cullPerCascade) {
+            // Once per frame, shared by all four cascades — the spheres do not
+            // depend on which cascade is being fitted. Flat, so this allocates
+            // nothing per frame.
+            for (let k = 0; k < instances.length; k++) {
+                const inst = instances[k]!;
+                worldBoundingSphereInto(inst.modelFloats, inst.mesh.boundingRadius, this.spheres, k * 4);
+            }
+        }
+        const visible = this.visible;
+        const isVisible = (_instance: SceneInstance, index: number) => visible[index] === 1;
+
         const drawScene = (pass: ReturnType<GpuCommandEncoder["beginRenderPass"]>, cascade: number) => {
             pass.setBindGroup(0, this.cascadeRenderBindGroups[cascade]!);
+            pass.setBindGroup(1, modelBindGroup);
             // Per pass, not per cascade loop: nothing survives beginRenderPass.
             this.binder.begin();
-            for (const instance of instances) {
-                if (!instance.castsShadow) {
-                    continue;
+
+            let filter: ((instance: SceneInstance, index: number) => boolean) | null = castsShadow;
+            if (this.cullPerCascade) {
+                // Tested once per instance here, in a plain loop, because the
+                // sphere test is real work and the counters are a side effect —
+                // `forEachDrawRun` may consult its predicate twice at a run
+                // boundary, so what it gets is the pure lookup below.
+                frustumFromViewProj(this.renderMatrices[cascade]!, this.cascadeFrustum);
+                for (let k = 0; k < instances.length; k++) {
+                    if (!instances[k]!.castsShadow) {
+                        visible[k] = 0;
+                        continue;
+                    }
+                    this.lastCandidateInstances++;
+                    const b = k * 4;
+                    const inside = sphereInFrustum(
+                        this.cascadeFrustum,
+                        this.spheres[b]!, this.spheres[b + 1]!, this.spheres[b + 2]!, this.spheres[b + 3]!,
+                    );
+                    visible[k] = inside ? 1 : 0;
+                    if (inside) {
+                        this.lastDrawnInstances++;
+                    }
                 }
-                pass.setBindGroup(1, instance.modelBindGroup);
-                // Depth-only — no material here, which is why the draw sort is
-                // mesh-major: this pass and the three others like it can only
-                // ever batch on mesh.
-                this.binder.setMesh(pass, instance.mesh);
-                instance.mesh.draw(pass);
+                filter = isVisible;
             }
+
+            // Depth-only — no material here, which is why the draw sort is
+            // mesh-major: this pass and the three others like it can only ever
+            // batch on mesh, and so get the longest runs.
+            forEachDrawRun(instances, filter, false, (mesh, _material, first, count) => {
+                this.binder.setMesh(pass, mesh);
+                mesh.draw(pass, count, first);
+            });
         };
 
         // A caster that moved, appeared, vanished or swapped its mesh invalidates
@@ -340,6 +421,7 @@ export class ShadowCascades {
         // does, one moved object costs a full re-render — correct, and no worse
         // than the uncached behaviour it replaces.
         const castersMoved = this.castersChanged(instances);
+
 
         // Every cascade (PCF): single-sample depth into its array layer.
         this.lastRenderedCascades = 0;

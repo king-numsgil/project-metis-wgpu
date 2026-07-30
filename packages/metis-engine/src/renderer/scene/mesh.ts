@@ -142,9 +142,16 @@ export class Mesh {
         pass.setIndexBuffer(this.indexBuffer, this.indexFormat);
     }
 
-    /** Issues the indexed draw. Requires a prior {@link bind} on the same pass. */
-    draw(pass: GpuRenderPassEncoder, instanceCount = 1) {
-        pass.drawIndexed(this.indexCount, instanceCount);
+    /**
+     * Issues the indexed draw. Requires a prior {@link bind} on the same pass.
+     *
+     * `firstInstance` is the base of `@builtin(instance_index)` in the vertex
+     * shader, which every pass uses to index the frame's shared model array —
+     * so it is the run's start position in the renderer's draw order, not a
+     * decoration. See `shading/modelBuffer.ts`.
+     */
+    draw(pass: GpuRenderPassEncoder, instanceCount = 1, firstInstance = 0) {
+        pass.drawIndexed(this.indexCount, instanceCount, 0, 0, firstInstance);
     }
 
     /** Releases both buffers. Every instance referencing this mesh becomes unusable. */

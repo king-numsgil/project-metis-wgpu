@@ -93,6 +93,55 @@ export const ModelUniforms = StructOf({
     normalMatrix: Mat3f,
 }, STD140);
 
+// ── The instanced model array (a storage buffer, hence Std430) ───────────────
+const Mat4fStorage = Mat(F32, 4, STD430);
+const Mat3fStorage = Mat(F32, 3, STD430);
+
+/**
+ * `ModelUniforms` again, packed for a **storage** buffer — the element type of
+ * the frame's `array<Model>` that every vertex shader indexes by
+ * `@builtin(instance_index)`.
+ *
+ * **It is byte-identical to the Std140 version, and that is a coincidence worth
+ * not relying on silently.** `mat4x4<f32>` is 64 bytes under both, and a
+ * `mat3x3<f32>` pads its columns to 16 under both (a `vec3` aligns to 16 in
+ * std430 too — `mat2x2` is where the two packings actually diverge). Declaring
+ * it Std430 anyway costs nothing and means metis-data validates the rules that
+ * genuinely apply to the binding, rather than rules that happen to agree today.
+ */
+export const ModelStorage = StructOf({
+    model: Mat4fStorage,
+    normalMatrix: Mat3fStorage,
+}, STD430);
+
+/**
+ * Staging for `capacity` model entries, with a `Mat4f`/`Mat3f` per element
+ * **aliasing the upload bytes** — so an instance's matrices are composed
+ * directly into what gets uploaded, exactly as the per-instance path did before
+ * instancing, but into one shared allocation.
+ *
+ * The element views are built once here rather than per frame: they are cheap
+ * wrappers, but there are two per instance and this runs on every growth, not
+ * every frame.
+ */
+export function stageModelArray(capacity: number): {
+    bytes: Uint8Array;
+    byteSize: number;
+    elements: {model: MatMemoryBuffer<F32Descriptor, 4>; normalMatrix: MatMemoryBuffer<F32Descriptor, 3>}[];
+} {
+    const desc = ArrayOf(ModelStorage, capacity, STD430);
+    const buffer = new ArrayBuffer(desc.byteSize);
+    const elements = [];
+    for (let i = 0; i < capacity; i++) {
+        const base = desc.offsetAt(i);
+        elements.push({
+            model: wrap(Mat4fStorage, buffer, base + ModelStorage.offsetOf("model")),
+            normalMatrix: wrap(Mat3fStorage, buffer, base + ModelStorage.offsetOf("normalMatrix")),
+        });
+    }
+    return {bytes: new Uint8Array(buffer), byteSize: desc.byteSize, elements};
+}
+
 /**
  * `MaterialUniforms` — 48 bytes. `metallicRoughness` packs both scalars into
  * one vec4 (xy used, zw unused) exactly as the shader reads them.

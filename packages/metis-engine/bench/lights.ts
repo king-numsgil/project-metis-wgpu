@@ -169,6 +169,10 @@ const ORBIT_RPS = num("orbit", 0);
 // itself on one machine in one sitting, and its value swings completely with
 // --orbit.
 const SHADOW_CACHE = !flag("no-shadow-cache");
+// Per-cascade frustum culling — OFF by default, matching the engine. Pair it
+// with --no-shadow-cache (or --orbit): while the cascade cache is hitting, the
+// passes do not run at all and there is nothing to cull.
+const CASCADE_CULL = flag("cascade-cull");
 
 // The plane the lights hover over, and the volume the lights animate within.
 const PLANE_SIZE = 60;
@@ -359,6 +363,7 @@ if (PROFILE && !profiler) {
 }
 forward.depthPrepass = PREPASS;  // engine default is on; --no-prepass turns it off
 forward.shadows.cacheEnabled = SHADOW_CACHE;
+forward.shadows.cullPerCascade = CASCADE_CULL;
 if (profiler) {
     forward.profiler = profiler;
     // The HUD draws into the same frame, so it belongs in the same tree.
@@ -524,6 +529,7 @@ console.log(`    Resolution ............ ${ctx.width} x ${ctx.height}  (4x MSAA,
 console.log(`    GPU profiler .......... ${profiler ? `on (draw zones: ${profiler.canProfileDraws})` : "off  (--profile to enable)"}`);
 console.log(`    Depth prepass ......... ${PREPASS ? "on" : "off  (--no-prepass given)"}`);
 console.log(`    Cascade shadow cache .. ${SHADOW_CACHE ? "on" : "off  (--no-shadow-cache given)"}`);
+console.log(`    Per-cascade cull ...... ${CASCADE_CULL ? "on  (--cascade-cull given)" : "off"}`);
 console.log(`    Lights ................ ${LIGHT_COUNT}   (${Math.round(LIGHT_COUNT * SPOT_FRACTION)} spot, ${LIGHT_COUNT - Math.round(LIGHT_COUNT * SPOT_FRACTION)} point — --spots 0..1, ${SHADOW_SPOTS} casting shadows)`);
 console.log(`    Camera ................ ${ORBIT_RPS === 0 ? "static  (--orbit N moves it — cascade caching is free when it doesn't)" : `orbiting ${ORBIT_RPS} rev/s`}`);
 console.log(`    Cluster grid .......... ${CLUSTER_COUNT_X} x ${CLUSTER_COUNT_Y} x ${CLUSTER_COUNT_Z} = ${NUM_CLUSTERS} clusters`);
@@ -636,6 +642,8 @@ if (gpuSamples.length === 0) {
     console.log(`    p95 / p99 .. ${ms(gpu.p95)}  /  ${ms(gpu.p99)}`);
     console.log(`    stddev ..... ${ms(gpu.stddev)}`);
     const cascadesMean = cascadeSamples.reduce((s, x) => s + x, 0) / cascadeSamples.length;
+    console.log(`\n  Cascade draw culling  (summed over the 4 cascades, last frame)`);
+    console.log(`    ${forward.shadows.lastDrawnInstances} drawn / ${forward.shadows.lastCandidateInstances} candidates`);
     console.log(`\n  Sun cascades re-rendered  (of ${CASCADE_COUNT} per frame — the cascade cache's hit rate)`);
     console.log(`    ${cascadesMean.toFixed(2)} / ${CASCADE_COUNT} per frame   (${(100 - (cascadesMean / CASCADE_COUNT) * 100).toFixed(0)}% of cascade passes skipped)`);
     console.log(`\n  CPU encode time  (JS: encode every pass + submit, per frame)`);

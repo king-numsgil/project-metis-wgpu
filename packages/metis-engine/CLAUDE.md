@@ -1510,6 +1510,103 @@ upload for any instance whose model matrix is legitimately all zeros.
 `modelChanged` is not only an optimisation — `ShadowCascades` reads it, which is
 what makes the next section possible.
 
+### Instanced draws — one `array<Model>`, and an unresolved GPU question
+
+Every instance's model + normal matrix lives in **one storage buffer**
+(`shading/modelBuffer.ts`), bound once per pass, and a run of consecutive
+instances sharing a mesh (plus a material, in the forward pass) is issued as a
+single `drawIndexed(..., instanceCount, firstInstance)`. `SceneInstance` owns no
+GPU resources at all now; its `destroy()` is a documented no-op.
+
+**The enabling invariant is a three-way agreement**: `DrawOrder` fixes the
+order, `ModelBuffer` writes slot *i* for draw-order position *i*, and a run's
+`firstInstance` is its start index — so `@builtin(instance_index)` lands on the
+right transform. All three read the same `instances` array from `render()`
+precisely so they cannot drift.
+
+**A pass that draws a subset cannot renumber.** The cascades skip non-casters and
+the spot passes frustum-cull, and because `instance_index` addresses the
+frame-wide array, a rejected instance *splits* the run rather than being
+compacted out. Worst case (alternate instances rejected) that degrades to one
+draw per instance — the pre-instancing cost, never worse. Compacting needs a
+per-pass index-remap buffer plus an indirection in every vertex shader; not
+built, and the reason per-cascade culling costs CPU (below).
+
+**`forEachDrawRun`'s predicate is called twice at a run boundary.** Once as the
+reason a run ended, once as the candidate starting the next. Anything that
+counts or does real work — the spot frustum test, the cascade sphere test — must
+precompute into a lookup and hand the walker a pure read. `SpotShadows`'
+drawn/candidate counters would double-count otherwise.
+
+**Verified byte-exact**, which is the strong claim: all 14 fixture goldens
+reproduced with zero differing bytes through a completely rewritten draw path —
+uniform buffer to storage buffer, per-instance bind groups to one, N draws to
+one, and a different indexing expression in four shaders. A repacking-plus-
+rebatching *should* be bit-identical, so a clean `git status` asserts the
+rewrite is faithful rather than merely plausible.
+
+**What it is worth: CPU encode, unambiguously. GPU, unknown.** Encode dropped
+again on top of the once-per-frame model upload, and that result is stable across
+many runs. The GPU-side effect could **not** be resolved on this machine — see
+the next section, which is the more important finding.
+
+**`@invariant` now has a third thing to keep in lockstep.** `forward.wgsl` and
+`depth_prepass.wgsl` must compute `worldPos4` identically for `depthCompare:
+"equal"` to work, and that now includes the array indexing, not just the
+expression. Both read `models[input.instanceIndex].model`; changing how one
+indexes without the other makes geometry vanish wholesale.
+
+### Per-cascade frustum culling measured as nothing — and how the machine hid it
+
+`ShadowCascades.cullPerCascade` tests each caster's world bounding sphere against
+the cascade's own ortho frustum. It is **correct** — the test volume is the exact
+matrix the pass renders with, so anything rejected would have been clipped
+anyway, and the fixtures come back byte-identical with it on. It is **off by
+default** because on the only scene the bench can build it does nothing
+measurable: it rejects ~16-20% of cascade draws and moves frame time by less than
+this machine's run-to-run drift, while costing four sphere tests per instance per
+frame plus run fragmentation.
+
+That is not a surprise, and this file predicted it: a cascade's ortho frustum is
+fit to a slice of the *camera* frustum, so nearly everything the camera sees is
+inside it. The bench's field is smaller than the cascade coverage, which is close
+to the worst case for culling. **Judge it on a world genuinely larger than
+`shadowDistance`, or not at all** — the same caveat the spot-shadow cull carries,
+for the same reason.
+
+**The methodological finding is the valuable part of this exercise.** On this
+GTX 1070, a *GPU-bound* profiler span swings enormously run to run while the
+light passes in the same frame do not. Three consecutive runs of one unmodified
+build at `--helmets 400`:
+
+| span | run 1 | run 2 | run 3 |
+|---|---|---|---|
+| `gltf-mesh-0-0` (GPU-bound) | 4.22 | 5.89 | 5.55 |
+| `depth-prepass` | 0.78 | 0.74 | 0.74 |
+| `bench-floor` | 0.27 | 0.23 | 0.23 |
+
+**So a stable light pass is NOT a control for a heavy one.** During this work a
+20% "regression" was attributed to instancing on exactly that reasoning — two
+spans held constant to three decimals while a third moved — and repetition showed
+the moved span's own spread was twice the effect. The overhead-dominated passes
+are stable *because* they are overhead-dominated; they say nothing about the
+clock state the throughput-bound pass is subject to. The claim was wrong and is
+retracted here rather than quietly dropped, because the reasoning behind it is
+seductive and will otherwise be reinvented.
+
+Two rules out of it, both stricter than "measure, don't guess":
+
+- **A single before/after pair on this machine is worth nothing for a GPU-bound
+  pass.** Alternate A/B/A/B in one sitting and look at the spread, not the means.
+  This is the same lesson as the wgpu-matrix migration's "273 / 215 / 273 fps in
+  three consecutive runs", now with a per-pass mechanism attached.
+- **CPU encode is the trustworthy signal here**, because it is not subject to GPU
+  clock state — which is why every conclusion in this file's recent perf sections
+  that survived was an encode conclusion.
+
+Resolving the instancing question properly needs locked clocks or a runtime
+toggle to alternate against; neither exists, and the honest state is *unknown*.
+
 ### Cascade shadow maps are cached — and exactly how much that is worth
 
 `ShadowCascades` skips a cascade's depth pass entirely (no pass encoded at all,

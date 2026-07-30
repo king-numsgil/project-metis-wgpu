@@ -325,32 +325,27 @@ class SceneInstance {
     modelMatrixOverride: Mat4f | null;  // bypasses transform (e.g. glTF nodes)
     castsShadow: boolean;               // default true; see below
     mesh: Mesh; material: Material;
-    readonly modelChanged: boolean;     // did the last prepareModel move it? (see below)
-    get modelBindGroup(): GpuBindGroup; // throws if not prepared this frame
-    prepareModel(device, layout): GpuBindGroup;   // renderer-internal; call once per frame
-    destroy(): void;
+    readonly modelChanged: boolean;      // did the last writeModel move it?
+    readonly modelFloats: Float32Array;  // this frame's model matrix, column-major
+    writeModel(model, normalMatrix): boolean;  // renderer-internal, once per frame
+    destroy(): void;                     // no-op; instances own no GPU resources
 }
 ```
 
-**`prepareModel` / `modelBindGroup` are the renderer's business, not yours.**
-`ClusteredForwardRenderer.render()` calls `prepareModel` once per frame for every
-instance in the scene, and each of the six-to-ten passes that draw it then reads
-`modelBindGroup` — a bare getter that binds and nothing else. They are split
-because they used to be one method that every pass called, which re-derived and
-re-uploaded identical bytes once per pass.
+**A `SceneInstance` owns no GPU resources.** Its matrices are written into a slot
+of the renderer's shared `array<Model>` storage buffer once per frame, which is
+what lets instances sharing a mesh collapse into a single instanced draw.
+`destroy()` is a no-op kept for callers that used to need it — dropping the
+reference is enough.
 
-Two consequences if you write a custom pass:
+Two consequences that do reach you:
 
-- **Reading `modelBindGroup` for an instance the renderer did not prepare
-  throws.** That is deliberate — lazily preparing instead would render the object
-  at a stale transform, which looks like a bug in your game code rather than in
-  the renderer.
 - **Mutate `transform` before `render()`, never between passes.** Everything the
-  frame draws is snapshotted by the prepare loop at the top of `render()`.
-
-`modelChanged` reports whether that snapshot differed from the previous frame's.
-A static instance skips its GPU upload entirely, and `ShadowCascades` reads the
-flag to decide whether its cached cascades are still valid.
+  frame draws is snapshotted at the top of `render()`; a single frame cannot show
+  one object at two positions.
+- **`modelChanged` / `modelFloats` are valid after that snapshot.** A static
+  instance skips the GPU upload entirely, and `ShadowCascades` reads
+  `modelChanged` to decide whether its cached cascades are still valid.
 
 `castsShadow: false` keeps an instance out of **every** shadow pass — all four
 sun cascades and every spot-shadow layer. It is for geometry that is visual only
@@ -550,7 +545,7 @@ class ClusteredForwardRenderer {
     readonly ao: AmbientOcclusion;
     shadowDistance: number;       // far reach of the cascaded shadows (default 400)
     cascadeSplitLambda: number;   // practical-split blend, 1=log 0=uniform (default 0.85)
-    readonly shadows: ShadowCascades;      // .cacheEnabled, .lastRenderedCascades
+    readonly shadows: ShadowCascades;      // .cacheEnabled, .cullPerCascade, .lastRenderedCascades
     readonly spotShadows: SpotShadows;
     readonly frameBindGroupLayout, materialBindGroupLayout, modelBindGroupLayout: GpuBindGroupLayout;
     render(encoder: GpuCommandEncoder, targets: RenderTargets, scene: Scene): void;
@@ -595,6 +590,15 @@ updates with a fitting margin, neither of which exists.
 One thing it does *not* detect: mutating a `Mesh`'s vertex buffer in place. The
 caster fingerprint covers mesh *identity*, not mesh contents.
 
+**`renderer.shadows.cullPerCascade`** (default **off**) frustum-culls each
+cascade's draws against its own ortho volume. It is pixel-exact — the fixtures are
+byte-identical either way — but it measured as *no* frame-time change on the
+bench scene while costing per-frame CPU, because a cascade is fit to the camera
+frustum and so contains nearly everything visible. Turn it on for a world
+genuinely larger than `shadowDistance`, and A/B it yourself:
+`bun run bench:lights --helmets 400 --no-shadow-cache --cascade-cull`,
+alternating runs. See CLAUDE.md before trusting any single pair of runs.
+
 Fixed internals: `SHADOW_MAP_SIZE = 2048` per cascade, one `depth32float`
 `2d-array` with a layer per cascade; VRAM ≈ 67 MB. The per-cascade normal-offset
 bias is texel-scaled automatically. Cascade boundaries cross-fade, so there's no
@@ -604,17 +608,18 @@ for the design.
 
 `render()` records, in order, every frame:
 
-1. Write camera + environment uniforms, and **prepare every instance's model
-   uniform** — the model + normal matrices are computed and uploaded exactly once
-   here, then bound (not rebuilt) by each pass below. An instance whose matrix is
-   unchanged from last frame skips its upload entirely.
+1. Write camera + environment uniforms, and **fill the frame's model array** —
+   every instance's model + normal matrices, written once into one storage buffer
+   and uploaded in a single call, skipped entirely when nothing moved. Each pass
+   below binds that one group and issues **instanced** draws over runs of
+   consecutive instances sharing a mesh.
 2. Write cluster params + pack the point-light array.
 3. **Cascaded shadow passes** (`cullMode: "none"`): one single-sample depth-only pass per cascade, each into its own `depth_2d_array` layer — **skipped when cached** (above).
 3b. **Spot shadow passes**, one per `MAX_SHADOW_SPOTS` layer. Layers without an active caster are still cleared (so a stale map can't be sampled) but draw nothing. Draws are **frustum-culled per light** against each instance's world bounding sphere.
 4. **Cluster build** (compute) — per-cluster view-space AABBs.
 5. **Light cull** (compute) — sphere-vs-AABB, writes per-cluster light index lists.
 6. **AO** — `clearToWhite` if `technique === None`, else prepass + SSAO/HBAO + blur.
-7. **Forward pass** — one draw per `SceneInstance`, bind groups `0=frame 1=material 2=model 3=cluster-lights`.
+7. **Forward pass** — one instanced draw per mesh+material run, bind groups `0=frame 1=material 2=model-array 3=cluster-lights`.
 
 Everything is internal; there are **no per-pass GPU timestamp hooks**. To time
 passes you'd have to thread `timestampWrites` into the private passes.
@@ -999,6 +1004,7 @@ bun run bench:lights     # windowed light + geometry benchmark (see bench/lights
                          #   --shadow-spots 0..4  --profile
                          #   --orbit N   (camera revolutions/sec; 0 = static, the default)
                          #   --no-shadow-cache  (A/B the cascade cache — pair with --orbit)
+                         #   --cascade-cull     (per-cascade frustum culling, default off)
 bunx tsc --noEmit        # type-check
 ```
 

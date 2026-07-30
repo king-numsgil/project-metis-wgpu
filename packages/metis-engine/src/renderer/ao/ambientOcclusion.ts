@@ -16,7 +16,8 @@ import type { GpuProfiler } from "../debug/gpuProfiler.ts";
 import type { Mat4f } from "../math/types.ts";
 import type { RenderTargets } from "../rhi/targets.ts";
 import { MESH_VERTEX_LAYOUT } from "../scene/mesh.ts";
-import type { Scene } from "../scene/scene.ts";
+import type { Scene, SceneInstance } from "../scene/scene.ts";
+import { forEachDrawRun, PassBinder } from "../shading/drawBatching.ts";
 import { AoUniforms, stage } from "../shading/gpuLayouts.ts";
 import {
     AO_NOISE_DIM,
@@ -92,6 +93,8 @@ export class AmbientOcclusion {
     private readonly kernelBuffer: GpuBuffer;
     private readonly noiseBuffer: GpuBuffer;
     private readonly prepassPipeline: GpuRenderPipeline;
+    /** Pass-scoped bind tracker; `begin()` after `beginRenderPass`. */
+    private readonly binder = new PassBinder();
     private readonly ssaoPipeline: GpuRenderPipeline;
     private readonly hbaoPipeline: GpuRenderPipeline;
     private readonly blurPipeline: GpuRenderPipeline;
@@ -305,7 +308,14 @@ export class AmbientOcclusion {
     }
 
     /** Runs the prepass + selected AO technique + blur, leaving the result in `resultView`. Assumes `technique !== None`. */
-    render(encoder: GpuCommandEncoder, scene: Scene, _targets: RenderTargets, profiler?: GpuProfiler) {
+    render(
+        encoder: GpuCommandEncoder,
+        scene: Scene,
+        instances: readonly SceneInstance[],
+        modelBindGroup: GpuBindGroup,
+        _targets: RenderTargets,
+        profiler?: GpuProfiler,
+    ) {
         this.writeUniforms(scene);
 
         // Geometry prepass -> view-space normals + depth.
@@ -324,11 +334,17 @@ export class AmbientOcclusion {
         });
         prepass.setPipeline(this.prepassPipeline);
         prepass.setBindGroup(0, this.prepassCameraBindGroup);
-        for (const instance of scene.instances) {
-            prepass.setBindGroup(1, instance.modelBindGroup);
-            instance.mesh.bind(prepass);
-            instance.mesh.draw(prepass);
-        }
+        prepass.setBindGroup(1, modelBindGroup);
+        // Takes the frame's draw order (not `scene.instances`) and the shared
+        // bind tracker, like every other pass. It did neither until instancing
+        // landed — it was the one draw loop the batching work missed, and it
+        // could not have been fixed in isolation anyway, since `firstInstance`
+        // only means anything against the sorted order.
+        this.binder.begin();
+        forEachDrawRun(instances, null, false, (mesh, _material, first, count) => {
+            this.binder.setMesh(prepass, mesh);
+            mesh.draw(prepass, count, first);
+        });
         prepass.end();
 
         // Occlusion pass -> raw AO.

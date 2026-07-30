@@ -85,6 +85,30 @@ export function sphereInFrustum(f: Frustum, cx: number, cy: number, cz: number, 
  * the matrix's fourth column; the scale factor is the longest of its three basis
  * columns, which is the correct conservative choice under non-uniform scale.
  */
+/**
+ * {@link worldBoundingSphere} over a flat column-major 16-float matrix, writing
+ * `[x, y, z, r]` into `out` at `outOffset`.
+ *
+ * The flat form exists because the per-frame cull paths hold their matrices as
+ * `SceneInstance.modelFloats` and their spheres as one packed `Float32Array` —
+ * the object-returning version above allocates one object per instance per
+ * frame, which is fine once and not fine four times.
+ */
+export function worldBoundingSphereInto(
+    m: Readonly<Float32Array>,
+    localRadius: number,
+    out: Float32Array,
+    outOffset: number,
+): void {
+    const sx = Math.hypot(m[0]!, m[1]!, m[2]!);
+    const sy = Math.hypot(m[4]!, m[5]!, m[6]!);
+    const sz = Math.hypot(m[8]!, m[9]!, m[10]!);
+    out[outOffset] = m[12]!;
+    out[outOffset + 1] = m[13]!;
+    out[outOffset + 2] = m[14]!;
+    out[outOffset + 3] = localRadius * Math.max(sx, sy, sz);
+}
+
 export function worldBoundingSphere(model: Mat4f, localRadius: number): {x: number; y: number; z: number; r: number} {
     const m = model.view();
     const c = model.columnElements;

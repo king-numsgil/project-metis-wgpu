@@ -23,7 +23,7 @@ struct Model {
 };
 
 @group(0) @binding(0) var<uniform> ao: AoUniforms;
-@group(1) @binding(0) var<uniform> modelUniform: Model;
+@group(1) @binding(0) var<storage, read> models: array<Model>;
 
 struct VertexOutput {
     @builtin(position) clipPosition: vec4<f32>,
@@ -31,9 +31,10 @@ struct VertexOutput {
 };
 
 @vertex
-fn vs(@location(0) position: vec3<f32>, @location(1) normal: vec3<f32>) -> VertexOutput {
-    let worldPos = modelUniform.model * vec4<f32>(position, 1.0);
-    let worldNormal = modelUniform.normalMat * normal;
+fn vs(@builtin(instance_index) instanceIndex: u32, @location(0) position: vec3<f32>, @location(1) normal: vec3<f32>) -> VertexOutput {
+    let instance = models[instanceIndex];
+    let worldPos = instance.model * vec4<f32>(position, 1.0);
+    let worldNormal = instance.normalMat * normal;
     // lookAt views have no scale, so the view's upper-left 3x3 is a pure
     // rotation — safe to apply directly to a direction.
     let viewRot = mat3x3<f32>(ao.view[0].xyz, ao.view[1].xyz, ao.view[2].xyz);

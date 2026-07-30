@@ -16,7 +16,8 @@ import { type Mat4f, mat4f } from "../math/types.ts";
 import { DEPTH_FORMAT, HDR_COLOR_FORMAT, MSAA_SAMPLE_COUNT, type RenderTargets } from "../rhi/targets.ts";
 import { MESH_VERTEX_LAYOUT } from "../scene/mesh.ts";
 import type { Scene } from "../scene/scene.ts";
-import { DrawOrder, PassBinder } from "./drawBatching.ts";
+import { DrawOrder, forEachDrawRun, PassBinder } from "./drawBatching.ts";
+import { ModelBuffer } from "./modelBuffer.ts";
 import { LightCuller } from "./lightCuller.ts";
 import { CASCADE_SPLIT_LAMBDA_DEFAULT, SHADOW_DISTANCE_DEFAULT, ShadowCascades } from "./shadowCascades.ts";
 import { selectShadowCastingSpots, SpotShadows } from "./spotShadows.ts";
@@ -129,6 +130,8 @@ export class ClusteredForwardRenderer {
     readonly spotShadows: SpotShadows;
     /** Frame-scoped draw sort, shared with the shadow passes. See `drawBatching.ts`. */
     private readonly drawOrder = new DrawOrder();
+    /** The frame's shared `array<Model>`; every pass binds this one group. */
+    private readonly models: ModelBuffer;
     /** Pass-scoped bind tracker for the prepass and forward passes; `begin()` per pass. */
     private readonly binder = new PassBinder();
 
@@ -177,11 +180,14 @@ export class ClusteredForwardRenderer {
         });
         this.modelBindGroupLayout = device.createBindGroupLayout({
             label: "metis-engine/model-bgl",
-            entries: [{binding: 0, visibility: GPUShaderStage.VERTEX, buffer: {bindingType: "uniform"}}],
+            // read-only-storage, not uniform: this is the frame-wide array<Model>
+            // that every vertex shader indexes by @builtin(instance_index).
+            entries: [{binding: 0, visibility: GPUShaderStage.VERTEX, buffer: {bindingType: "read-only-storage"}}],
         });
 
         // Collaborators. The culler owns the group-3 layout the forward pipeline
         // needs; the shadow + AO subsystems both render from the model layout.
+        this.models = new ModelBuffer(device, this.modelBindGroupLayout);
         this.culler = new LightCuller(device);
         this.shadows = new ShadowCascades(device, this.modelBindGroupLayout);
         this.spotShadows = new SpotShadows(device, this.modelBindGroupLayout);
@@ -312,21 +318,17 @@ ${depthPrepassWgsl}`,
         // *same* order, so the redundant binds each of them skips are the same
         // ones. Sorting per pass would cost six sorts to reach the same place.
         const instances = this.drawOrder.update(scene.instances);
-        // Every instance's model + normal matrix, computed and uploaded ONCE
-        // here rather than once per pass that draws it. Six to ten passes bind
-        // these per frame (four cascades, up to four spot layers, the AO
-        // prepass, the depth prepass, the forward pass) and every one of them
-        // used to re-derive and re-upload identical bytes.
-        //
-        // This loop is why `modelBindGroup` is allowed to be a bare getter: it
-        // walks the same `instances` array every pass below walks, so an
-        // instance a pass can draw is an instance this prepared.
-        for (let i = 0; i < instances.length; i++) {
-            instances[i]!.prepareModel(this.device, this.modelBindGroupLayout);
-        }
+        // Every instance's model + normal matrix, written ONCE per frame into
+        // one shared storage array and uploaded in a single crossing (skipped
+        // entirely when nothing moved). Slot i is draw-order position i, which
+        // every pass below relies on when it issues an instanced draw with
+        // `firstInstance = run start`. See modelBuffer.ts.
+        this.models.update(instances);
+        const modelBindGroup = this.models.bindGroup;
         this.culler.write(scene, targets, shadowSpots);
-        this.shadows.render(encoder, scene, instances, this.shadowDistance, this.cascadeSplitLambda, this.profiler);
-        this.spotShadows.render(encoder, instances, shadowSpots, this.profiler);
+        this.shadows.render(
+            encoder, scene, instances, modelBindGroup, this.shadowDistance, this.cascadeSplitLambda, this.profiler);
+        this.spotShadows.render(encoder, instances, modelBindGroup, shadowSpots, this.profiler);
         this.culler.cull(encoder, this.profiler);
 
         // Ambient occlusion (feeds the forward pass's ambient term). `None`
@@ -335,7 +337,7 @@ ${depthPrepassWgsl}`,
         if (this.ao.technique === AoTechnique.None) {
             this.ao.clearToWhite(encoder, this.profiler);
         } else {
-            this.ao.render(encoder, scene, targets, this.profiler);
+            this.ao.render(encoder, scene, instances, modelBindGroup, targets, this.profiler);
         }
 
         const frameBindGroup = this.device.createBindGroup({
@@ -367,12 +369,13 @@ ${depthPrepassWgsl}`,
             });
             pre.setPipeline(this.depthPrepassPipeline);
             pre.setBindGroup(0, this.depthPrepassBindGroup);
+            // Bound once for the whole pass now, not once per draw.
+            pre.setBindGroup(1, modelBindGroup);
             this.binder.begin();
-            for (const instance of instances) {
-                pre.setBindGroup(1, instance.modelBindGroup);
-                this.binder.setMesh(pre, instance.mesh);
-                instance.mesh.draw(pre);
-            }
+            forEachDrawRun(instances, null, false, (mesh, _material, first, count) => {
+                this.binder.setMesh(pre, mesh);
+                mesh.draw(pre, count, first);
+            });
             pre.end();
         }
 
@@ -400,23 +403,22 @@ ${depthPrepassWgsl}`,
 
         pass.setPipeline(this.depthPrepass ? this.pipelineDepthEqual : this.pipeline);
         pass.setBindGroup(0, frameBindGroup);
+        pass.setBindGroup(2, modelBindGroup);
         pass.setBindGroup(3, this.culler.bindGroup);
 
         this.binder.begin();
-        for (let i = 0; i < instances.length; i++) {
-            const instance = instances[i]!;
-            // Material and mesh are skipped when the previous draw already bound
-            // them — which the sort makes the common case, not a lucky one. The
-            // model bind group is genuinely per-instance and always rebinds.
-            this.binder.setMaterial(pass, 1, instance.material, this.device, this.materialBindGroupLayout);
-            pass.setBindGroup(2, instance.modelBindGroup);
-            this.binder.setMesh(pass, instance.mesh);
-            // Per-draw zones nest under the "forward" span. No-ops unless the
-            // device enabled timestamp-query-inside-passes.
-            this.profiler?.beginZone(pass, instance.mesh.label ?? `instance ${i}`);
-            instance.mesh.draw(pass);
+        // Grouped by material as well as mesh: this is the one pass that binds a
+        // material, so a run here is the intersection of both.
+        forEachDrawRun(instances, null, true, (mesh, material, first, count) => {
+            this.binder.setMaterial(pass, 1, material, this.device, this.materialBindGroupLayout);
+            this.binder.setMesh(pass, mesh);
+            // One zone per *run*, so a scene of N identical meshes now reports a
+            // single row instead of N — the profiler tree's `xN` merge counts
+            // draws, and there is genuinely one draw. See CLAUDE.md.
+            this.profiler?.beginZone(pass, mesh.label ?? `instances ${first}..${first + count - 1}`);
+            mesh.draw(pass, count, first);
             this.profiler?.endZone(pass);
-        }
+        });
 
         pass.end();
     }
@@ -429,6 +431,7 @@ ${depthPrepassWgsl}`,
     destroy() {
         this.cameraBuffer.destroy();
         this.environmentBuffer.destroy();
+        this.models.destroy();
         this.culler.destroy();
         this.shadows.destroy();
         this.spotShadows.destroy();
