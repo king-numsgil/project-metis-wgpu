@@ -172,7 +172,15 @@ const SHADOW_CACHE = !flag("no-shadow-cache");
 // Per-cascade frustum culling — OFF by default, matching the engine. Pair it
 // with --no-shadow-cache (or --orbit): while the cascade cache is hitting, the
 // passes do not run at all and there is nothing to cull.
-const CASCADE_CULL = flag("cascade-cull");
+// Per-cascade shadow-caster culling — ON by default, matching the engine. Pass
+// --no-cascade-cull to A/B it. Pair with --orbit (or --no-shadow-cache): while
+// the cascade cache is hitting, the passes do not run and there is nothing to cull.
+const CASCADE_CULL = !flag("no-cascade-cull");
+// Which per-cascade cull test to use. Default is the shadow-sweep test (does
+// this caster's shadow reach anything this cascade shades?); --cascade-cull-box
+// selects the original caster-vs-ortho-box test, purely so the two can be
+// alternated in one sitting. See ShadowCascades.cullMode.
+const CASCADE_CULL_BOX = flag("cascade-cull-box");
 // Camera-frustum culling in the forward/prepass/AO passes — ON by default,
 // matching the engine. NB this bench is a weak test of it: the whole helmet
 // field sits in front of the camera, so little is ever rejected. A world larger
@@ -368,7 +376,8 @@ if (PROFILE && !profiler) {
 }
 forward.depthPrepass = PREPASS;  // engine default is on; --no-prepass turns it off
 forward.shadows.cacheEnabled = SHADOW_CACHE;
-forward.shadows.cullPerCascade = CASCADE_CULL;
+forward.shadows.cullPerCascade = CASCADE_CULL || CASCADE_CULL_BOX;
+forward.shadows.cullMode = CASCADE_CULL_BOX ? "ortho-box" : "shadow-sweep";
 forward.frustumCulling = FRUSTUM_CULL;
 if (profiler) {
     forward.profiler = profiler;
@@ -535,7 +544,7 @@ console.log(`    Resolution ............ ${ctx.width} x ${ctx.height}  (4x MSAA,
 console.log(`    GPU profiler .......... ${profiler ? `on (draw zones: ${profiler.canProfileDraws})` : "off  (--profile to enable)"}`);
 console.log(`    Depth prepass ......... ${PREPASS ? "on" : "off  (--no-prepass given)"}`);
 console.log(`    Cascade shadow cache .. ${SHADOW_CACHE ? "on" : "off  (--no-shadow-cache given)"}`);
-console.log(`    Per-cascade cull ...... ${CASCADE_CULL ? "on  (--cascade-cull given)" : "off"}`);
+console.log(`    Per-cascade cull ...... ${forward.shadows.cullPerCascade ? `on  (${forward.shadows.cullMode})` : "off"}`);
 console.log(`    Camera frustum cull ... ${FRUSTUM_CULL ? "on" : "off  (--no-frustum-cull given)"}`);
 console.log(`    Lights ................ ${LIGHT_COUNT}   (${Math.round(LIGHT_COUNT * SPOT_FRACTION)} spot, ${LIGHT_COUNT - Math.round(LIGHT_COUNT * SPOT_FRACTION)} point — --spots 0..1, ${SHADOW_SPOTS} casting shadows)`);
 console.log(`    Camera ................ ${ORBIT_RPS === 0 ? "static  (--orbit N moves it — cascade caching is free when it doesn't)" : `orbiting ${ORBIT_RPS} rev/s`}`);

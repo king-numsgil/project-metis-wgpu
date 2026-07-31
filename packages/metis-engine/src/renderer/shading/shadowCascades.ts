@@ -140,9 +140,34 @@ export class ShadowCascades {
         eye: vec3f(),
         offset: vec3f(),
         corner: vec3f(),
+        /** Separate output from `corner`'s, so the footprint pass can't disturb the fit. */
+        footCorner: vec3f(),
         // The eight frustum-slice corners, reused every cascade.
         corners: Array.from({length: 8}, () => vec3f()),
     };
+
+    /**
+     * Per cascade, the light-space XY region its shadow map is actually
+     * *sampled* over, as up to 8 inward-facing edge lines `(nx, ny, d)` — a
+     * point is inside when `nx*x + ny*y + d >= 0` for every edge.
+     *
+     * **A convex hull rather than an axis-aligned box, and that is the whole
+     * difference between this working and not.** A frustum slice projects to a
+     * long thin wedge pointing along the view direction; a box aligned to the
+     * light's own axes bounds that wedge enormously loosely as soon as the
+     * camera looks diagonally, and swallows exactly the near-camera geometry the
+     * test is supposed to reject. Measured: the box form rejected 27% of cascade
+     * draws, the hull 63%, on the same scene in the same sitting.
+     */
+    private readonly hullPlanes = new Float32Array(CASCADE_COUNT * 8 * 3);
+    private readonly hullCounts = new Int32Array(CASCADE_COUNT);
+    /** The light basis those hulls are expressed in, as plain floats. */
+    private readonly lightAxisX = new Float32Array(3);
+    private readonly lightAxisY = new Float32Array(3);
+    /** Scratch for the 8 projected slice corners and their hull. */
+    private readonly hullX = new Float64Array(8);
+    private readonly hullY = new Float64Array(8);
+    private readonly hullOrder = new Int32Array(16);
 
     /**
      * Per-cascade copy of the `viewProj` its depth layer was last rendered with.
@@ -175,19 +200,57 @@ export class ShadowCascades {
      * clipped anyway. The fixtures assert that — they come back byte-identical
      * either way.
      *
-     * **Off by default, on measurement rather than principle.** On the only
-     * scene the bench can build it rejects ~16-20% of cascade draws and produces
-     * *no* frame-time change that survives this machine's run-to-run drift,
-     * while costing per-frame CPU: four sphere tests per instance, plus run
-     * fragmentation, since a culled instance splits an instanced draw
-     * (`forEachDrawRun`). Turn it on for a world genuinely larger than the
-     * cascades — see CLAUDE.md "Per-cascade frustum culling measured as
-     * nothing" for why this bench cannot show that and what would.
+     * **On by default**, since the sweep test replaced the ortho-box one (see
+     * {@link cullMode}). Measured at `--lights 300 --helmets 500 --orbit 0.1`,
+     * alternating runs in one sitting: **18.9 ms -> 15.0 ms**, i.e. 52 -> 67
+     * fps, with the four cascade passes going 7.3 ms -> 3.9 ms and cascade 3
+     * alone 2.21 -> 0.81 ms. It rejects 53% of cascade draws where the box test
+     * rejected 16%.
      *
-     * A/B with `bench:lights --helmets 400 --no-shadow-cache --cascade-cull`,
-     * alternating runs; the cache has to be off or there is nothing to cull.
+     * **Free when it does nothing.** The cull loop runs inside the per-cascade
+     * pass, which the cascade cache skips entirely for an unchanged fit — so a
+     * static camera pays nothing at all (measured: a wash). The cost only
+     * arrives on the frames that were going to render cascades anyway, which is
+     * exactly when it pays.
+     *
+     * It was off for a long time because the *box* test measured as nothing.
+     * That was true, and it was also measured against a static camera where the
+     * cascades never ran — see CLAUDE.md.
+     *
+     * A/B with `bench:lights --lights 300 --helmets 500 --orbit 0.1
+     * --cascade-cull` against a run without it; `--cascade-cull-box` selects the
+     * old test. Use `--orbit` or `--no-shadow-cache`, or the cache leaves
+     * nothing to cull.
      */
-    cullPerCascade = false;
+    cullPerCascade = true;
+
+    /**
+     * Which test {@link cullPerCascade} uses.
+     *
+     * - **`"shadow-sweep"`** (default) asks the question that actually matters:
+     *   *could this caster's shadow land on anything this cascade shades?* A
+     *   shadow travels along the light axis, so projecting both the caster and
+     *   the cascade's receiver slice onto the light's XY plane collapses that to
+     *   a 2D overlap test. A caster whose shadow only ever falls inside a nearer
+     *   cascade's slice drops out of the far ones — which is most of the scene
+     *   in a world where the near cascades cover where the objects are.
+     * - **`"ortho-box"`** is the original: caster's sphere vs the cascade's
+     *   fitted ortho frustum. Kept only so the two can be A/B'd in one sitting
+     *   (`bench:lights --cascade-cull --cascade-cull-box`).
+     *
+     * **The box test is structurally weak and that is why this exists.** The
+     * ortho box is fit to the slice's bounding *sphere*, which is isotropic;
+     * for the far cascades that sphere swallows the entire scene, so the test
+     * answers "yes" for nearly everything. The slice's thinness *in depth* is
+     * the whole signal, and the sphere discards it. Measured: the box test
+     * rejects ~16% of cascade draws where the sweep test rejects far more.
+     *
+     * Neither can be replaced by "skip what a nearer cascade already drew" —
+     * see the receiver/occluder note in CLAUDE.md. Cascades partition
+     * *receivers*; a near occluder with a low sun casts into far slices and
+     * genuinely belongs in their maps. The sweep test keeps exactly those.
+     */
+    cullMode: "shadow-sweep" | "ortho-box" = "shadow-sweep";
 
     /** Draws issued / casters considered, summed over all four cascades last frame. */
     lastDrawnInstances = 0;
@@ -372,10 +435,18 @@ export class ShadowCascades {
             let filter: ((instance: SceneInstance, index: number) => boolean) | null = castsShadow;
             if (this.cullPerCascade) {
                 // Tested once per instance here, in a plain loop, because the
-                // sphere test is real work and the counters are a side effect —
+                // test is real work and the counters are a side effect —
                 // `forEachDrawRun` may consult its predicate twice at a run
                 // boundary, so what it gets is the pure lookup below.
-                frustumFromViewProj(this.renderMatrices[cascade]!, this.cascadeFrustum);
+                const box = this.cullMode === "ortho-box";
+                if (box) {
+                    frustumFromViewProj(this.renderMatrices[cascade]!, this.cascadeFrustum);
+                }
+                const edges = this.hullCounts[cascade]!;
+                const hullBase = cascade * 8 * 3;
+                const planes = this.hullPlanes;
+                const axx = this.lightAxisX[0]!, axy = this.lightAxisX[1]!, axz = this.lightAxisX[2]!;
+                const ayx = this.lightAxisY[0]!, ayy = this.lightAxisY[1]!, ayz = this.lightAxisY[2]!;
                 for (let k = 0; k < instances.length; k++) {
                     if (!instances[k]!.castsShadow) {
                         visible[k] = 0;
@@ -383,10 +454,26 @@ export class ShadowCascades {
                     }
                     this.lastCandidateInstances++;
                     const b = k * 4;
-                    const inside = sphereInFrustum(
-                        this.cascadeFrustum,
-                        spheres[b]!, spheres[b + 1]!, spheres[b + 2]!, spheres[b + 3]!,
-                    );
+                    const cx = spheres[b]!, cy = spheres[b + 1]!, cz = spheres[b + 2]!, r = spheres[b + 3]!;
+                    let inside: boolean;
+                    if (box) {
+                        inside = sphereInFrustum(this.cascadeFrustum, cx, cy, cz, r);
+                    } else {
+                        // Project the caster onto the light's XY plane and test
+                        // against this cascade's receiver hull. Collapsing along
+                        // the light axis IS the shadow sweep: wherever this
+                        // caster's shadow lands, it lands at this XY.
+                        const lx = cx * axx + cy * axy + cz * axz;
+                        const ly = cx * ayx + cy * ayy + cz * ayz;
+                        inside = true;
+                        for (let e = 0; e < edges; e++) {
+                            const o = hullBase + e * 3;
+                            if (planes[o]! * lx + planes[o + 1]! * ly + planes[o + 2]! < -r) {
+                                inside = false; // wholly outside one edge
+                                break;
+                            }
+                        }
+                    }
                     visible[k] = inside ? 1 : 0;
                     if (inside) {
                         this.lastDrawnInstances++;
@@ -500,6 +587,69 @@ export class ShadowCascades {
     }
 
     /**
+     * Turns the 8 projected slice corners in {@link hullX}/{@link hullY} into
+     * cascade `c`'s inward-facing edge lines, pushed out by `pad`.
+     *
+     * Andrew's monotone chain — 8 points, four times a frame, so the sort is
+     * irrelevant and the clarity is worth more than a hand-rolled special case
+     * for "wedge projected from some direction", which has several degenerate
+     * shapes (the sun straight down the view axis collapses it to a quad).
+     *
+     * **Degenerate input yields zero edges, which means "accept everything".**
+     * A collinear or zero-area projection (sun exactly along a frustum edge)
+     * must fail open: culling too little costs time, culling too much silently
+     * deletes shadows.
+     */
+    private buildFootprintHull(c: number, pad: number) {
+        const xs = this.hullX;
+        const ys = this.hullY;
+        const order = this.hullOrder;
+        const idx: number[] = [0, 1, 2, 3, 4, 5, 6, 7];
+        idx.sort((a, b) => (xs[a]! - xs[b]!) || (ys[a]! - ys[b]!));
+
+        const cross = (o: number, a: number, b: number) =>
+            (xs[a]! - xs[o]!) * (ys[b]! - ys[o]!) - (ys[a]! - ys[o]!) * (xs[b]! - xs[o]!);
+
+        let k = 0;
+        for (let i = 0; i < 8; i++) {
+            const p = idx[i]!;
+            while (k >= 2 && cross(order[k - 2]!, order[k - 1]!, p) <= 0) k--;
+            order[k++] = p;
+        }
+        const lower = k + 1;
+        for (let i = 6; i >= 0; i--) {
+            const p = idx[i]!;
+            while (k >= lower && cross(order[k - 2]!, order[k - 1]!, p) <= 0) k--;
+            order[k++] = p;
+        }
+        const count = k - 1; // last point repeats the first
+        const base = c * 8 * 3;
+        if (count < 3) {
+            this.hullCounts[c] = 0; // degenerate — fail open
+            return;
+        }
+        for (let e = 0; e < count; e++) {
+            const a = order[e]!;
+            const b = order[(e + 1) % count]!;
+            const ex = xs[b]! - xs[a]!;
+            const ey = ys[b]! - ys[a]!;
+            // CCW hull, so the interior lies to the left of each edge.
+            let nx = -ey;
+            let ny = ex;
+            const len = Math.hypot(nx, ny) || 1;
+            nx /= len;
+            ny /= len;
+            const o = base + e * 3;
+            this.hullPlanes[o] = nx;
+            this.hullPlanes[o + 1] = ny;
+            // Pushed outward by `pad`, so a caster just outside the true edge
+            // whose PCF footprint still reaches inside is kept.
+            this.hullPlanes[o + 2] = -(nx * xs[a]! + ny * ys[a]!) + pad;
+        }
+        this.hullCounts[c] = count;
+    }
+
+    /**
      * Fits one orthographic frustum per cascade to a slice of the camera
      * frustum. Cascades subdivide `[camera.near, shadowDistance]` by the
      * practical split scheme; each is fit to the slice's *bounding sphere*
@@ -539,8 +689,19 @@ export class ShadowCascades {
         const xAxis = Vec3.normalize(S.xAxis, Vec3.cross(S.xAxis, up, zAxis));
         const yAxis = Vec3.cross(S.yAxis, zAxis, xAxis);
 
+        // Light-space XY basis as plain floats — the footprint loop below dots
+        // every corner against both, and `Vec3.dot` on a buffer view per corner
+        // per cascade is needless indirection in a loop that runs 32 times.
+        const ax = xAxis.view();
+        const ay = yAxis.view();
+        this.lightAxisX[0] = ax[0]!; this.lightAxisX[1] = ax[1]!; this.lightAxisX[2] = ax[2]!;
+        this.lightAxisY[0] = ay[0]!; this.lightAxisY[1] = ay[1]!; this.lightAxisY[2] = ay[2]!;
+
         const cascades: Cascade[] = [];
         let sliceNear = near;
+        // Start of the slice *before* this one, so the blend band that makes
+        // cascade c sampled slightly early can be added to its footprint.
+        let prevSliceNear = near;
         for (let c = 0; c < CASCADE_COUNT; c++) {
             const sliceFar = splitFar[c]!;
 
@@ -594,7 +755,51 @@ export class ShadowCascades {
             // then fans it out to the forward uniform. The matrix used to be
             // allocated here and copied into both.
             Mat4.multiply(this.renderMatrices[c]!, proj, lightView);
+
+            // ── Receiver footprint, in light-space XY ───────────────────────
+            //
+            // The region this cascade's map is actually *sampled over*, which
+            // is NOT the volume it renders. Everything above fits an ortho box
+            // to the slice's bounding **sphere** — isotropic and, for the far
+            // cascades, enormous (it swallows the whole scene), which is why a
+            // caster-vs-box test rejects almost nothing. The slice itself is
+            // thin in depth, and that thinness is the entire signal; the sphere
+            // throws it away.
+            //
+            // Projecting along the light axis collapses "does this caster's
+            // shadow land on anything this cascade shades" to a 2D overlap
+            // test, because a shadow travels along exactly that axis. Computed
+            // from the slice corners rather than its sphere, so it stays tight.
+            //
+            // Deliberately independent of the fit above: the matrices, the
+            // snap and the radius are all untouched, so this cannot move a
+            // rendered pixel — it only decides what is worth drawing.
+            //
+            // The near edge is pulled back by the *previous* cascade's blend
+            // band, because `sampleSunShadow` cross-fades into cascade c while
+            // still inside cascade c-1's slice — so this map is sampled a
+            // little before its own slice begins.
+            const band = (sliceNear - prevSliceNear) * CASCADE_BLEND_FRACTION;
+            const footNear = c === 0 ? near : Math.max(near, sliceNear - band);
+            let n2 = 0;
+            for (const d of [footNear, sliceFar]) {
+                for (const sx of [-1, 1]) {
+                    for (const sy of [-1, 1]) {
+                        Vec3.set(S.corner, sx * d * tanHalfX, sy * d * tanHalfY, -d);
+                        const w = Vec3.transformMat4(S.footCorner, S.corner, S.invView).view();
+                        this.hullX[n2] = w[0]! * ax[0]! + w[1]! * ax[1]! + w[2]! * ax[2]!;
+                        this.hullY[n2] = w[0]! * ay[0]! + w[1]! * ay[1]! + w[2]! * ay[2]!;
+                        n2++;
+                    }
+                }
+            }
+            // Pad by what can reach across the footprint edge: the receiver's
+            // normal offset, plus the 3x3 PCF kernel's reach (each tap is itself
+            // a 2x2 bilinear compare, hence 2 texels, not 1.5).
+            this.buildFootprintHull(c, normalOffset + 2 * worldPerTexel);
+
             cascades.push({radius, splitFar: sliceFar, normalOffset});
+            prevSliceNear = sliceNear;
             sliceNear = sliceFar;
         }
         return cascades;

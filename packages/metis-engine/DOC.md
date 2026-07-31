@@ -553,7 +553,7 @@ class ClusteredForwardRenderer {
     readonly ao: AmbientOcclusion;
     shadowDistance: number;       // far reach of the cascaded shadows (default 400)
     cascadeSplitLambda: number;   // practical-split blend, 1=log 0=uniform (default 0.85)
-    readonly shadows: ShadowCascades;      // .cacheEnabled, .cullPerCascade, .lastRenderedCascades
+    readonly shadows: ShadowCascades;      // .cacheEnabled, .cullPerCascade, .cullMode, .lastRenderedCascades
     frustumCulling: boolean;               // camera-frustum cull, default true
     readonly lastDrawnInstances: number;   // forward-pass draws / candidates last frame
     readonly lastCandidateInstances: number;
@@ -614,14 +614,36 @@ entirely in front of the camera and therefore the wrong witness — they reject
 world larger than the screen. A/B with `--no-frustum-cull` / `--cascade-cull`,
 alternating runs.
 
-**`renderer.shadows.cullPerCascade`** (default **off**) frustum-culls each
-cascade's draws against its own ortho volume. It is pixel-exact — the fixtures are
-byte-identical either way — but it measured as *no* frame-time change on the
-bench scene while costing per-frame CPU, because a cascade is fit to the camera
-frustum and so contains nearly everything visible. Turn it on for a world
-genuinely larger than `shadowDistance`, and A/B it yourself:
-`bun run bench:lights --helmets 400 --no-shadow-cache --cascade-cull`,
-alternating runs. See CLAUDE.md before trusting any single pair of runs.
+**`renderer.shadows.cullPerCascade`** (default **on**) drops a caster from a
+cascade when its shadow cannot reach anything that cascade shades. It is
+pixel-exact — all 14 fixtures are byte-identical either way, which is the
+assertion, since culling may change what is *drawn* but never what is *seen*.
+
+**`renderer.shadows.cullMode`** picks the test:
+
+- `"shadow-sweep"` (default) projects the caster and the cascade's receiver
+  slice onto the light's XY plane and tests overlap there. A shadow travels
+  along the light axis, so that projection *is* the shadow sweep: a caster whose
+  shadow only lands inside a nearer cascade's slice drops out of the far ones,
+  while a near caster under a low sun — whose shadow genuinely does reach them —
+  is kept.
+- `"ortho-box"` is the old caster-sphere-vs-cascade-frustum test, kept only for
+  A/B. It is much weaker: the ortho box is fit to the slice's bounding *sphere*,
+  which for the far cascades contains the whole scene.
+
+Measured at `--lights 300 --helmets 500 --orbit 0.1`: 18.9 ms with no culling,
+18.5 with `ortho-box`, **15.0 with `shadow-sweep`** (52 -> 67 fps), rejecting 53%
+of cascade draws against the box test's 16%. With a *still* camera it is free
+and worthless in equal measure — the cascade cache skips the passes, so there is
+nothing to cull and nothing to pay. A/B it yourself:
+`bun run bench:lights --lights 300 --helmets 500 --orbit 0.1 --no-cascade-cull`
+(and `--cascade-cull-box`), alternating runs. See CLAUDE.md before trusting any
+single pair of runs.
+
+**Do not replace this with "skip what a nearer cascade already drew."** Cascades
+partition *receivers*, not occluders; a near occluder can cast into a far
+cascade's region, so that rule deletes real shadows. CLAUDE.md has the full
+argument.
 
 Fixed internals: `SHADOW_MAP_SIZE = 2048` per cascade, one `depth32float`
 `2d-array` with a layer per cascade; VRAM ≈ 67 MB. The per-cascade normal-offset
@@ -643,7 +665,7 @@ for the design.
    below binds that one group and issues **instanced** draws over runs of
    consecutive instances sharing a mesh.
 2. Write cluster params + pack the point-light array.
-3. **Cascaded shadow passes** (`cullMode: "none"`): one single-sample depth-only pass per cascade, each into its own `depth_2d_array` layer — **skipped when cached** (above).
+3. **Cascaded shadow passes** (`cullMode: "none"`): one single-sample depth-only pass per cascade, each into its own `depth_2d_array` layer — **skipped when cached** (above). Casters are **culled per cascade** by default (`shadows.cullPerCascade`, `shadows.cullMode`): a caster is drawn into a cascade only when its shadow can reach what that cascade shades, tested by projecting both onto the light's XY plane. Worth ~3.9 ms of a 18.9 ms frame with a moving camera and nothing at all with a still one (the cache skips the pass). Set `cullPerCascade = false` to disable, or `cullMode = "ortho-box"` for the older, much weaker caster-vs-frustum test.
 3b. **Spot shadow passes**, one per `MAX_SHADOW_SPOTS` layer. A layer without an active caster is cleared (so a stale map can't be sampled) but draws nothing — and once cleared it is **skipped entirely** on later frames, since nothing else writes it. Draws are **frustum-culled per light** against each instance's world bounding sphere.
 4. **Cluster build** (compute) — per-cluster view-space AABBs.
 5. **Light cull** (compute) — sphere-vs-AABB, writes per-cluster light index lists.

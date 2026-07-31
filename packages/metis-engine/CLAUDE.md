@@ -1640,23 +1640,90 @@ for the same reason.
 **"Measured as nothing" was also measured against a static camera, where the
 cache means the cascades never run and there is nothing to cull.** Re-measured
 under `--orbit 0.1 --lights 300 --helmets 500`, where all four cascades do run:
-18.63 ms with culling vs 19.06 ms without (two runs each, both on-runs beating
-both off-runs). That is a real ~2%, not nothing — but it is not the fix either,
-because it only rejects 16% of cascade draws and the cascades still cost ~7 ms.
-Still off by default; the reasoning below is unchanged, only better quantified.
+18.63 ms with culling vs 19.06 ms without. A real ~2%, not nothing — but still
+not the fix, because it only rejects 16% of cascade draws.
 
-**Why culling cannot fix the far cascades, and this is the conceptual point:
-cascades partition *receivers*, not *occluders*.** The splits divide the camera's
-depth range, so a fragment reads exactly one cascade (plus the blend band). But
-an occluder near the camera can cast a shadow that lands far away — at a low sun
-angle, arbitrarily far — so it genuinely belongs in the far cascade's map too.
-That is what `CASCADE_ORTHO_NEAR_SCALE` extends the ortho volume toward the sun
-*for*. A cascade therefore cannot skip geometry merely because a nearer cascade
-already covers it; the near cascades and the far ones legitimately share
-casters, and any scheme that "partitions" casters by depth will drop shadows
-that should exist. The redundancy is real work, not waste — what makes it
-expensive is that it is done at full mesh detail (above), which is an LOD
-problem.
+**Then the test itself turned out to be the wrong question**, which is the real
+content of this section now. See below.
+
+### The right question is "where does this caster's shadow land", not "is it in the box"
+
+`cullMode` is **`"shadow-sweep"`** by default, and `cullPerCascade` is now **on**.
+
+**The conceptual starting point: cascades partition *receivers*, not
+*occluders*.** The splits divide the camera's depth range, so a fragment reads
+exactly one cascade (plus the blend band). But an occluder near the camera can
+cast a shadow that lands far away — at a low sun angle, arbitrarily far — so it
+genuinely belongs in the far cascade's map too. **So "skip what a nearer cascade
+already drew" is not a legal rule**: near and far cascades legitimately share
+casters, and any scheme that partitions casters the way receivers are
+partitioned deletes shadows that should exist.
+
+What *is* legal is asking whether a caster's shadow can reach the region a given
+cascade actually shades. **A shadow travels along the light axis**, so
+projecting both the caster and the cascade's receiver slice onto the light's XY
+plane collapses that to a 2D overlap test — the sweep is the projection. A
+caster whose shadow only ever falls inside a nearer cascade's slice drops out of
+the far ones; the low-sun lamppost, whose shadow does reach them, is kept. The
+same test separates both cases, which is the property the box test never had.
+
+**Two things had to be right, and the first attempt got the second wrong:**
+
+- **The footprint is derived from the slice, independently of the fit.** The
+  matrices, the texel snap and the bounding-sphere radius are untouched, so this
+  cannot move a rendered pixel — it only decides what is worth drawing. It is
+  padded by the receiver's normal offset plus the PCF kernel's reach, and its
+  near edge is pulled back by the previous cascade's blend band, because
+  `sampleSunShadow` cross-fades into cascade *c* while still inside *c-1*'s
+  slice.
+- **It must be a convex hull, not an axis-aligned box.** The first version took
+  the light-space XY *AABB* of the slice corners and rejected only 27%. A
+  frustum slice projects to a long thin wedge pointing along the view direction;
+  an axis-aligned bound around that wedge is enormously loose the moment the
+  camera looks diagonally, and it swallows exactly the near-camera geometry the
+  test exists to reject. The hull (Andrew's monotone chain over 8 points, four
+  times a frame) rejects **53%**. Same idea, same scene, 2x the rejection —
+  the bound's *shape* was as load-bearing as the idea.
+
+**Measured, alternating in one sitting**, at `--lights 300 --helmets 500
+--orbit 0.1`:
+
+| | GPU frame | cascade passes | cascade draws |
+|---|---|---|---|
+| no culling | 18.9 ms | 7.3 ms | 2004 / 2004 |
+| `ortho-box` | 18.5 ms | ~7.0 ms | 1679 / 2004 |
+| `shadow-sweep` | **15.0 ms** | **3.9 ms** | 946 / 2004 |
+
+52 -> 67 fps. Cascade 3 alone goes 2.21 -> 0.81 ms, which is the prediction the
+receiver-region reasoning makes: its slice is 69–400 in view depth and the
+bench's geometry ends at ~72, so almost nothing it draws can shadow anything it
+shades.
+
+**Free when it does nothing**, which is why it can default on: the cull loop
+lives inside the per-cascade pass, and the cascade cache skips that pass
+entirely for an unchanged fit. A static camera measured as a wash (10.91/11.03
+off vs 10.98/10.95 on). The cost only arrives on frames that were going to
+render cascades anyway.
+
+**Verified byte-exact**: with `cullPerCascade` forced on for the whole fixture
+set, all 14 goldens reproduced with zero differing bytes. That is the assertion
+that matters — culling may change what is drawn but never what is seen.
+`test/cascadeCull.test.ts` pins it, pairing "changes no pixels" with "actually
+rejected something" (either alone passes trivially, per `frustumCull.test.ts`).
+Its low-sun case is **mutation-checked**: building the light basis as though the
+sun were overhead — the "shadows drop straight down" assumption — makes the cull
+keep the same caster count regardless of the real sun angle and deletes the long
+shadows, and both tests were watched failing that way.
+
+**One honest gap:** the PCF/normal-offset pad is *not* covered. Removing it
+entirely leaves both tests passing, so no scene here places a caster close
+enough to a footprint edge to need it. It is reasoned-for, not verified; a test
+with a caster straddling a cascade boundary would close that.
+
+**What this does not fix.** The remaining ~3.9 ms is still full-detail geometry
+in coarse maps — cascade 2 is now the most expensive at 1.6 ms, covering where
+the objects actually are. That is the LOD problem below, and culling has taken
+what it can take.
 
 **The methodological finding is the valuable part of this exercise.** On this
 GTX 1070, a *GPU-bound* profiler span swings enormously run to run while the
