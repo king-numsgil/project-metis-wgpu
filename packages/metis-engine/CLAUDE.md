@@ -1984,11 +1984,52 @@ when a scene outgrows the budget, raise it rather than suppressing zones. An
 untimed span is a measurement you silently do not have, and `allocSpan`'s -1
 degrade path is a guard, not a design.
 
-The merge also earns its keep in the **console** summary now, not just the
-widget: `bench/lights.ts` prints its pass breakdown through `profileSpansToRows`
-rather than walking `profiler.spans` directly, because at `--helmets 100` the raw
-tree is 100 consecutive identical `gltf-mesh-0-0` lines with the passes buried
-under them.
+The merge earns its keep in the **console** summary too, not just the widget —
+at `--helmets 100` an unmerged tree is 100 consecutive identical
+`gltf-mesh-0-0` lines with the passes buried under them. `bench/lights.ts` no
+longer calls `profileSpansToRows` for that summary (the HUD widget still does);
+it applies the same same-label sibling merge inside its own accumulator, because
+it needs the numbers rather than the formatted strings `TreeRow` carries.
+
+### The bench's pass breakdown is accumulated, not a snapshot
+
+It used to print `profiler.spans` for **one** frame — whichever was last. That is
+the wrong summary for anything that varies, and under an orbiting camera almost
+everything does. It now folds every sampled frame into min/avg/max per span.
+
+The first run of it made the point immediately: `pcf-cascade-3-depth` measures
+**0.006 to 1.599 ms** across a single orbit, a 250x swing as the camera sweeps
+the sun-culled field past the cascade. The snapshot reported one number from
+that range, and this file quoted it as though it characterised the pass.
+
+Three things the accumulator has to get right, all of which are easy to get
+wrong:
+
+- **`spans` repeats until a new readback lands.** It holds the *last completed*
+  frame's tree and lags a few frames, so accumulating unconditionally counts the
+  same frame two or three times and narrows min/max toward whichever frames
+  stalled. The guard is object identity — a fresh `roots` array is built per
+  completed frame — which is why `GpuProfiler` must keep allocating one rather
+  than mutating in place.
+- **A pass can be absent, not zero.** A cached cascade and an idle spot layer
+  encode no pass at all, so they contribute no span and simply do not appear in
+  the table. That is honest but silent, hence the footnote; the "Sun cascades
+  re-rendered" line above it is what actually reports the skipping.
+- **`avg` and `%frame` answer different questions and are computed over
+  different denominators.** `avg` is over the frames a pass *ran in* (what it
+  costs when it runs); `%frame` divides by *all* sampled frames (its share of the
+  mean frame, so the column still adds up). They coincide only for a pass present
+  in every frame. A pass present in a fraction of frames is annotated with that
+  fraction.
+
+That last annotation is currently never triggered by any standard
+configuration, and the reason is worth recording: **the cascade cache has no
+partial credit even at a crawl.** At `--orbit 0.008` — 0.008 rev/s, so slow the
+camera is nearly still — all four cascades still re-render every frame, 0%
+skipped. Texel snapping quantizes the *fit*, but the bounding-sphere centre
+moves enough to cross a texel every frame at any nonzero speed. The presence
+column is there for scheduled cascade updates, which is the change that would
+make it read anything other than 100%.
 
 **`test/output/debug-widgets.png` is not a byte-exact golden and cannot be.**
 It renders live GPU timings *as text*, so two consecutive runs of identical code

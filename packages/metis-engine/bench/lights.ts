@@ -14,6 +14,8 @@
 //   bun run bench/lights.ts --width 1920 --height 1080
 //   bun run bench/lights.ts --fps 60           # cap at 60 fps ("what it looks like live")
 //   bun run bench/lights.ts --profile            # per-pass GPU timings via timestamp queries
+//                                                # (min/avg/max accumulated over every sampled
+//                                                #  frame, not a last-frame snapshot)
 //   bun run bench/lights.ts --no-prepass         # disable the depth prepass (on by default)
 //
 // **The helmet field exists because this bench had one axis and needed two.**
@@ -59,6 +61,7 @@ import {
     NUM_CLUSTERS,
     plane,
     type Light,
+    type ProfileSpan,
     profileSpansToRows,
     RenderContext,
     Scene,
@@ -66,7 +69,6 @@ import {
     loadGltf,
     mat4f,
     quatf,
-    type TreeRow,
 } from "metis-engine/renderer";
 import { Mat4, Vec3 } from "metis-data";
 import { vec3f } from "metis-engine/renderer";
@@ -386,6 +388,78 @@ if (profiler) {
 }
 const gpuHistory = new History(120);
 
+// ── Per-pass accumulation ────────────────────────────────────────────────────
+//
+// The summary used to print `profiler.spans` for **one** frame — whichever
+// happened to be last. That is the wrong summary for anything that varies, and
+// most of what is interesting here varies: an orbiting camera swings the cascade
+// passes frame to frame, and a pass can be *absent* entirely (a cached cascade
+// or an idle spot layer encodes no pass at all, so it contributes no span). A
+// single frame reports one arbitrary sample of that and hides the rest.
+//
+// Accumulated here into min/avg/max per span, plus how many frames each was
+// seen in — a pass present in a third of frames is a very different fact from
+// one present in all of them, and it is invisible in a snapshot.
+interface SpanStat {
+    label: string;
+    depth: number;
+    order: number;
+    /** Largest sibling-merge count seen (the `xN` in the tree). */
+    merged: number;
+    min: number;
+    max: number;
+    sum: number;
+    /** Frames this span appeared in — may be < the number sampled. */
+    frames: number;
+}
+
+const spanStats = new Map<string, SpanStat>();
+/** `frameTotalMs` for each frame actually accumulated, so percentages use a mean. */
+const profileFrameTotals: number[] = [];
+/** Identity of the last span tree consumed — `spans` repeats until a new readback lands. */
+let lastSpansSeen: readonly ProfileSpan[] | null = null;
+let spanOrder = 0;
+
+/**
+ * Folds one frame's span tree into {@link spanStats}, merging same-label
+ * siblings exactly as `profileSpansToRows` does for display — otherwise 76
+ * instanced draw runs would become 76 rows here too.
+ */
+function accumulateSpans(list: readonly ProfileSpan[], parentPath: string, depth: number) {
+    const merged = new Map<string, {ms: number; n: number; kids: ProfileSpan[]}>();
+    const order: string[] = [];
+    for (const s of list) {
+        let m = merged.get(s.label);
+        if (!m) {
+            m = {ms: 0, n: 0, kids: []};
+            merged.set(s.label, m);
+            order.push(s.label);
+        }
+        m.ms += s.gpuMs;
+        m.n++;
+        for (const k of s.children) {
+            m.kids.push(k);
+        }
+    }
+    for (const label of order) {
+        const m = merged.get(label)!;
+        const path = `${parentPath}/${label}`;
+        let stat = spanStats.get(path);
+        if (!stat) {
+            stat = {label, depth, order: spanOrder++, merged: m.n, min: Infinity, max: -Infinity, sum: 0, frames: 0};
+            spanStats.set(path, stat);
+        }
+        stat.merged = Math.max(stat.merged, m.n);
+        stat.min = Math.min(stat.min, m.ms);
+        stat.max = Math.max(stat.max, m.ms);
+        stat.sum += m.ms;
+        stat.frames++;
+        if (m.kids.length > 0) {
+            accumulateSpans(m.kids, path, depth + 1);
+        }
+    }
+}
+
 const scene = new Scene();
 scene.environment = createExteriorEnvironment({ambientIntensity: 0.02});
 // Radius/height the camera sits at, static or orbiting — see ORBIT_RPS.
@@ -623,6 +697,19 @@ while (running) {
         acquireSamples.push(r.acquireMs);
         gpuSamples.push(gpuMs);
         cascadeSamples.push(forward.shadows.lastRenderedCascades);
+        // Outside both timed windows (encode ended at t2, the GPU wait above),
+        // so folding these in cannot perturb what is being measured.
+        //
+        // Guarded on identity: `spans` holds the last *completed* frame's tree
+        // and readback lags a few frames, so it repeats until a new result
+        // lands. Accumulating unconditionally would count the same frame two or
+        // three times and quietly narrow min/max toward whichever frames
+        // happened to stall.
+        if (profiler && profiler.spans.length > 0 && profiler.spans !== lastSpansSeen) {
+            lastSpansSeen = profiler.spans;
+            profileFrameTotals.push(profiler.frameTotalMs);
+            accumulateSpans(profiler.spans, "", 0);
+        }
     }
 
     // Smooth on-screen fps for the HUD; refresh the text ~4x/sec.
@@ -679,25 +766,36 @@ if (gpuSamples.length === 0) {
         console.log(`       Something costly is running inside beginFrame — go measure it.`);
     }
 
-    if (profiler && profiler.spans.length > 0) {
+    if (profiler && profileFrameTotals.length > 0) {
+        const n = profileFrameTotals.length;
+        const meanTotal = profileFrameTotals.reduce((s, x) => s + x, 0) / n;
         console.log(`
-  GPU pass breakdown  (timestamp queries, last completed frame)`);
-        // The same merge the on-screen widget uses, and here it is not cosmetic:
-        // raw spans carry one per-draw zone per instance, so at the default
-        // --helmets 100 an unmerged tree prints 100 consecutive identical
-        // `gltf-mesh-0-0` lines and buries the passes worth reading. Merged, they
-        // collapse to one `xN` row holding their summed time.
-        const printRow = (row: TreeRow, depth: number) => {
-            const indent = "    " + "  ".repeat(depth + 1);
-            const pct = (row.fraction ?? 0) * 100;
-            console.log(`${indent}${row.label.padEnd(30 - depth * 2)} ${(row.value ?? "").padStart(10)}  ${pct.toFixed(1).padStart(5)}%`);
-            for (const child of row.children ?? []) {
-                printRow(child, depth + 1);
-            }
-        };
-        for (const row of profileSpansToRows(profiler.spans, profiler.frameTotalMs)) {
-            printRow(row, 0);
+  GPU pass breakdown  (timestamp queries, ${n} frames — ms)`);
+        console.log(`    ${"pass".padEnd(30)} ${"avg".padStart(8)} ${"min".padStart(8)} ${"max".padStart(8)}  %frame`);
+        // Insertion order is first-appearance order, which is encode order, so
+        // printing the map straight through already nests correctly — depth
+        // only supplies the indent.
+        const stats = [...spanStats.values()].sort((a, b) => a.order - b.order);
+        for (const s of stats) {
+            const indent = "    " + "  ".repeat(s.depth + 1);
+            // avg is over the frames the pass *ran in*, so a pass that runs
+            // rarely still reports what it costs when it does. Its share of the
+            // frame is a different question and uses the sum over all frames,
+            // so the column still adds up.
+            const avg = s.sum / s.frames;
+            const pct = ((s.sum / n) / (meanTotal || 1)) * 100;
+            const label = s.merged > 1 ? `${s.label} x${s.merged}` : s.label;
+            const seen = s.frames < n ? `  (in ${((s.frames / n) * 100).toFixed(0)}% of frames)` : "";
+            console.log(
+                `${indent}${label.padEnd(30 - s.depth * 2)} ${avg.toFixed(3).padStart(8)} ` +
+                `${s.min.toFixed(3).padStart(8)} ${s.max.toFixed(3).padStart(8)}  ` +
+                `${pct.toFixed(1).padStart(5)}%${seen}`,
+            );
         }
+        console.log(`    avg is over the frames a pass ran in; %frame is its share of the mean frame,`);
+        console.log(`    so a pass that is often skipped shows a high avg and a small %frame.`);
+        console.log(`    A pass that never ran is absent, not zero — a cached cascade or an idle spot`);
+        console.log(`    layer encodes no pass at all. See the cascade line above for the skip rate.`);
         if (!profiler.canProfileFrameTotal) {
             console.log(`    (no timestamp-query-inside-encoders — total is the sum of passes, excluding gaps between them)`);
         }
