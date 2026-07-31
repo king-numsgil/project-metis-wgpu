@@ -633,7 +633,10 @@ pass with no `wgpu` errors. Note that a scene pays 4× its shadow *draw* count
 under CSM — the standard cost, and the reason the per-cascade passes are now the
 thing to watch rather than any per-texel reconstruction.
 
-Known rough edges, deliberate for now: no per-cascade frustum culling (when a
+Known rough edges, deliberate for now: **no shadow-side LOD** — a cascade
+rasterises full-detail meshes however few texels they cover, which is what makes
+the far cascades the most expensive ones (see "Cascade shadow maps are cached"
+for the measurement); no per-cascade frustum culling by default (when a
 cascade does render, it redraws every instance — and because the cache's
 invalidation is frame-global, this is also why one moved object re-renders all
 four; see "Cascade shadow maps are cached"); the blend band double-samples two
@@ -683,6 +686,16 @@ Two more things that only became visible with real geometry in the scene:
   `onSubmittedWorkDone` before present), that made encode worth half the frame
   rate. See "Draw-call batching" and "The model uniform is computed once per
   frame" below for what it was made of and what has been done about it.
+
+  **That parity no longer holds, and the reason is that it was fixed.** It was
+  measured when the draw count equalled the instance count; instancing now
+  collapses a shared-mesh field into a handful of runs (501 instances → 76 draws
+  at `--helmets 500`, and 1 with culling off). Measured now at
+  `--lights 300 --helmets 500`: encode 1.37 / 1.85 / 1.34 ms against a GPU frame
+  of 11.19–11.59 ms — about 12%, not 50%. The frame is firmly GPU-bound again,
+  so **encode work is no longer the first place to look on this machine**; it
+  remains the trustworthy *signal* (it doesn't move with GPU clock state), which
+  is a different claim and still true.
 - **The shadow passes scale worse than the forward pass** — see the no
   per-cascade-frustum-culling rough edge above, which this now puts a number on.
   On the discrete GPU the four cascades measured *larger than the forward pass*
@@ -694,18 +707,67 @@ point at different things, because the two machines sit on opposite sides of the
 CPU/GPU balance. Two findings that only appear on the discrete GPU, both worth
 re-checking rather than assuming:
 
-- **The frame is vertex/draw-submission bound, not fill bound, once geometry is
-  in it.** At `--helmets 400`, dropping from 1280x720 to 320x240 — twelve times
-  fewer pixels — moved GPU frame time by roughly a tenth. Stripping the lights
-  and the spot shadows *as well* barely moved it further. Optimising shading
-  against that scene is optimising the wrong thing; `--width`/`--height` is the
-  cheap way to find out which regime you are in.
-- **The depth prepass is a net loss on a geometry-heavy, overdraw-light scene**,
-  on both GPU time and encode — exactly as `depthPrepass`'s own doc comment
-  predicts, which makes the bench's default scene an argument against the
-  engine's default setting. Not changed, because the default should be decided on
-  a scene that represents the game rather than on this one; but re-run
-  `--no-prepass` before treating "on" as settled.
+- **At `--lights 100`, the frame is vertex/draw-submission bound, not fill
+  bound, once geometry is in it.** At `--helmets 400`, dropping from 1280x720 to
+  320x240 — twelve times fewer pixels — moved GPU frame time by roughly a tenth.
+  Stripping the lights and the spot shadows *as well* barely moved it further.
+  `--width`/`--height` is the cheap way to find out which regime you are in —
+  and per the section below, **the answer changes with light count**, so run it
+  rather than quoting this.
+- **At `--lights 100`, the depth prepass is a net loss on a geometry-heavy,
+  overdraw-light scene**, on both GPU time and encode — as `depthPrepass`'s own
+  doc comment predicts. This was once read as an argument against the engine's
+  default setting. It is not: at higher light counts the sign flips hard, see
+  below. Re-run `--no-prepass` before treating either answer as settled.
+
+#### The bottleneck flips with light count, and both halves of this section were once wrong
+
+Everything above was measured at the bench's default `--lights 100`. At
+`--lights 300 --helmets 500` on the same GTX 1070, **both conclusions reverse**,
+and they reverse for one shared reason: the clustered light loop is the fragment
+shader's dominant term, so raising light count moves the frame from
+vertex-bound to fill-bound and makes killing occluded fragments valuable.
+
+| | with depth prepass | without |
+|---|---|---|
+| GPU frame | 11.4 ms | 17.9 ms |
+| `forward` span | 9.0 ms | 15.7 ms |
+
+The prepass costs 0.88 ms and saves 6.7 — turning it **off** costs 36% of the
+frame rate. And the resolution probe inverts too: at 320x240 the `forward` span
+drops from 9.0 ms to 2.6 ms (3.4x) while `depth-prepass` is unchanged at
+0.85 ms, which is fill-bound by any reading.
+
+**The rule to take from this is not either set of numbers.** It is that
+"which resource is this frame short of" is a property of the *scene*, not of
+the machine, and this file spent a long while stating a light-count-specific
+result as a general one. `--lights` is as load-bearing an axis as `--helmets`
+when deciding what to optimise; sweep it before believing any bottleneck claim
+here, including these.
+
+**A consequence worth chasing: the rejected-levers table below was measured in
+the vertex-bound regime.** In the fill-bound one, spending more on culling to
+shrink per-fragment light lists pays differently. Doubling `CLUSTER_COUNT_Z`
+from 24 to 48 measured:
+
+| | `forward` span | `light-cull` |
+|---|---|---|
+| Z=24 | 8.986 / 8.983 / 9.042 ms | 0.106 ms |
+| Z=48 | 8.178 / 8.227 ms | 0.107 ms |
+
+**8.9% of the forward pass, for one microsecond of cull time and ~1.3 MB** —
+against a 0.06 ms spread on both sides, so roughly 13x the noise. Not applied:
+it is a global constant justified so far by one scene, and the win is
+regime-dependent. But it is the strongest open lever, the "raise `clusterNear`
+or lower `clusterFar` rather than adding slices" guidance below is what would
+have talked you out of trying it, and the finer-XY entry deserves the same
+re-test.
+
+**Measure the `forward` span, not the GPU frame mean.** The frame mean barely
+separated Z=48 from Z=24 (11.01 vs 11.42, overlapping); the span separated it
+cleanly, because it excludes the shadow/post/present noise that has nothing to
+do with the change. This is the practical form of the per-pass-vs-frame lesson
+this file already carries.
 
 `--spots <0..1>` sets what fraction of the field is spot lights (default 0.5).
 Two things to know before comparing runs across it. **Spots are slightly
@@ -1575,6 +1637,27 @@ to the worst case for culling. **Judge it on a world genuinely larger than
 `shadowDistance`, or not at all** — the same caveat the spot-shadow cull carries,
 for the same reason.
 
+**"Measured as nothing" was also measured against a static camera, where the
+cache means the cascades never run and there is nothing to cull.** Re-measured
+under `--orbit 0.1 --lights 300 --helmets 500`, where all four cascades do run:
+18.63 ms with culling vs 19.06 ms without (two runs each, both on-runs beating
+both off-runs). That is a real ~2%, not nothing — but it is not the fix either,
+because it only rejects 16% of cascade draws and the cascades still cost ~7 ms.
+Still off by default; the reasoning below is unchanged, only better quantified.
+
+**Why culling cannot fix the far cascades, and this is the conceptual point:
+cascades partition *receivers*, not *occluders*.** The splits divide the camera's
+depth range, so a fragment reads exactly one cascade (plus the blend band). But
+an occluder near the camera can cast a shadow that lands far away — at a low sun
+angle, arbitrarily far — so it genuinely belongs in the far cascade's map too.
+That is what `CASCADE_ORTHO_NEAR_SCALE` extends the ortho volume toward the sun
+*for*. A cascade therefore cannot skip geometry merely because a nearer cascade
+already covers it; the near cascades and the far ones legitimately share
+casters, and any scheme that "partitions" casters by depth will drop shadows
+that should exist. The redundancy is real work, not waste — what makes it
+expensive is that it is done at full mesh detail (above), which is an LOD
+problem.
+
 **The methodological finding is the valuable part of this exercise.** On this
 GTX 1070, a *GPU-bound* profiler span swings enormously run to run while the
 light passes in the same frame do not. Three consecutive runs of one unmodified
@@ -1736,6 +1819,26 @@ exists: per-cascade frustum culling (so a moved caster only dirties the cascades
 it is in), or scheduled cascade updates — refreshing distant cascades every Nth
 frame, which needs a fitting margin so the camera cannot leave a stale cascade's
 coverage, and accepts lag in far shadows.
+
+**What that costs, measured** (`--lights 300 --helmets 500`, one sitting):
+
+| | GPU frame | cascades |
+|---|---|---|
+| static camera | 11.4 ms | 0 of 4 re-rendered, ~0 ms |
+| `--orbit 0.1` | **19.1 ms** | 4 of 4, **7.1 ms — 39% of the frame** |
+
+So the static figure is 87 fps of headroom and the moving one is 52. Quoting
+the static number alone is quoting the benchmark, which is the whole reason
+`--orbit` exists.
+
+**The per-cascade cost rises with cascade index** — 0.88 / 1.86 / 2.12 /
+2.21 ms — which is the opposite of what the resolution they contribute would
+justify. Cascade 0's ortho volume is small, so most of the field is clipped
+cheaply; cascade 3's contains the entire scene and rasterises all of it, into
+texels ~0.4 world units across. **The far cascades are drawing full-detail
+geometry into a footprint of a few texels**, so the missing lever here is
+shadow-side LOD, not culling — see the per-cascade culling entry below for why
+culling cannot fix this one.
 
 `test/shadowCache.test.ts` pins all of this, and its invalidation case is
 **mutation-checked**: deleting the `modelChanged` term from `castersChanged`
