@@ -64,6 +64,13 @@ export class Material {
 
     private buffer: GpuBuffer | null = null;
     private bindGroup: GpuBindGroup | null = null;
+    /**
+     * Copy of the bytes last uploaded, so an unchanged material skips its
+     * `writeBuffer`. `null` until the first upload — which is what guarantees
+     * the first call always writes, rather than relying on a zero-filled buffer
+     * to differ from a material whose factors are legitimately all zero.
+     */
+    private writtenBytes: Uint8Array | null = null;
     /** Per-material CPU staging, created with the GPU buffer on first use. */
     private staging: {
         bytes: Uint8Array;
@@ -121,6 +128,29 @@ export class Material {
         s.metallicRoughness[1] = this.roughness;
         s.emissive.set(this.emissive);
 
+        // Upload only when a factor actually moved. Material factors are almost
+        // always static, and the buffer still holds exactly these bytes from the
+        // last upload — so the common case is a short byte compare instead of a
+        // JS -> napi -> Rust crossing, once per material per frame. Same trade
+        // as `SceneInstance.writeModel`'s model-matrix compare, and the same
+        // reason: comparing is far cheaper than the crossing it avoids.
+        const written = this.writtenBytes;
+        if (written) {
+            let changed = false;
+            for (let i = 0; i < written.length; i++) {
+                if (written[i] !== s.bytes[i]) {
+                    changed = true;
+                    break;
+                }
+            }
+            if (!changed) {
+                return this.bindGroup!;
+            }
+            written.set(s.bytes);
+        } else {
+            // First call: nothing has been uploaded, so this must always write.
+            this.writtenBytes = new Uint8Array(s.bytes);
+        }
         device.queue.writeBuffer(this.buffer!, 0, s.bytes);
         return this.bindGroup!;
     }
@@ -135,5 +165,9 @@ export class Material {
         this.buffer = null;
         this.bindGroup = null;
         this.staging = null;
+        // Must clear with the buffer it describes: a later `getBindGroup` builds
+        // a *new* buffer, and a surviving snapshot would match the staged bytes
+        // and skip the upload that new buffer has never had.
+        this.writtenBytes = null;
     }
 }

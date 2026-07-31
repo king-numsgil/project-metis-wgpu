@@ -106,6 +106,16 @@ export class AmbientOcclusion {
     // Rebuilt on resize (they reference the sized textures).
     private samplingBindGroup!: GpuBindGroup;
     private blurBindGroup!: GpuBindGroup;
+    /**
+     * Whether `aoResultTex` currently holds the all-white "fully open" clear, so
+     * {@link clearToWhite} can skip encoding a pass that would rewrite it.
+     *
+     * False whenever the contents are unknown or non-white: a freshly allocated
+     * texture (undefined contents) and after {@link render}'s blur has written
+     * real occlusion into it. Only this class ever writes that texture, which is
+     * what makes the flag sufficient rather than a guess.
+     */
+    private resultIsWhite = false;
 
     constructor(device: GpuDevice, modelBindGroupLayout: GpuBindGroupLayout) {
         this.device = device;
@@ -246,6 +256,9 @@ export class AmbientOcclusion {
         this.destroyTextures();
         this.width = width;
         this.height = height;
+        // A freshly created texture's contents are undefined, so whatever the
+        // old one held says nothing about the new one.
+        this.resultIsWhite = false;
         const size = {width, height};
 
         this.normalTex = this.device.createTexture({
@@ -295,8 +308,22 @@ export class AmbientOcclusion {
         });
     }
 
-    /** Clears `resultView` to white (fully open) — used when the technique is `None`. */
+    /**
+     * Clears `resultView` to white (fully open) — used when the technique is
+     * `None`, so the forward pass's AO multiply is a no-op.
+     *
+     * **Encodes a pass only when the texture isn't already white.** Nothing but
+     * this class writes `aoResultTex`, so once cleared it stays white until
+     * either {@link render} runs (the blur overwrites it) or {@link ensureSize}
+     * reallocates it. In the default `None` configuration that makes this a
+     * once-per-resize cost instead of a pass in every frame. The skip is total —
+     * no pass is encoded at all — which is why `ao-clear` disappears from the
+     * profiler tree rather than reading zero, exactly like a cached cascade.
+     */
     clearToWhite(encoder: GpuCommandEncoder, profiler?: GpuProfiler) {
+        if (this.resultIsWhite) {
+            return;
+        }
         const pass = encoder.beginRenderPass({
             label: "metis-engine/ao-clear",
             timestampWrites: profiler?.pass("ao-clear"),
@@ -305,6 +332,7 @@ export class AmbientOcclusion {
             ],
         });
         pass.end();
+        this.resultIsWhite = true;
     }
 
     /** Runs the prepass + selected AO technique + blur, leaving the result in `resultView`. Assumes `technique !== None`. */
@@ -377,6 +405,9 @@ export class AmbientOcclusion {
         blur.setBindGroup(0, this.blurBindGroup);
         blur.draw(3);
         blur.end();
+        // The blur just wrote real occlusion over the result, so a later switch
+        // back to `None` has to re-clear it.
+        this.resultIsWhite = false;
     }
 
     /** Releases the screen-sized targets and the kernel/noise/uniform buffers. */

@@ -71,6 +71,12 @@ export class LightCuller {
     /** Per-frame scratch, so `write` allocates no matrices. */
     private readonly viewScratch = mat4f();
     private readonly projScratch = mat4f();
+    /**
+     * Reusable "casters first, then the rest" ordering, used only when the scene
+     * actually has shadow-casting spots — with none, `scene.lights` is already
+     * in that order and is read directly.
+     */
+    private readonly orderedScratch: Light[] = [];
     private readonly clusterParamsBuffer: GpuBuffer;
     private readonly lightsBuffer: GpuBuffer;
     private readonly clusterAABBsBuffer: GpuBuffer;
@@ -264,8 +270,30 @@ export class LightCuller {
         // a plausible-looking image, not a crash. `orderedLights` is derived
         // once per frame by the renderer and shared with SpotShadows precisely
         // so the two cannot disagree.
-        const casters = new Set<Light>(shadowSpots);
-        const ordered: Light[] = [...shadowSpots, ...scene.lights.filter((l) => !casters.has(l))];
+        // With no casters the scene's own array is already the order we want, so
+        // the common case allocates and copies nothing at all. Otherwise fill a
+        // persistent array: casters first, then everything else. The membership
+        // test is a linear scan rather than a `Set` because `shadowSpots` holds
+        // at most MAX_SHADOW_SPOTS (4) entries — four reference compares beat
+        // allocating a hash set per frame, and the previous form allocated the
+        // set *and* two arrays sized by the whole light count.
+        let ordered: readonly Light[];
+        if (shadowSpots.length === 0) {
+            ordered = scene.lights;
+        } else {
+            const reordered = this.orderedScratch;
+            reordered.length = 0;
+            for (let i = 0; i < shadowSpots.length; i++) {
+                reordered.push(shadowSpots[i]!);
+            }
+            for (let i = 0; i < scene.lights.length; i++) {
+                const light = scene.lights[i]!;
+                if (shadowSpots.indexOf(light as SpotLight) < 0) {
+                    reordered.push(light);
+                }
+            }
+            ordered = reordered;
+        }
         const lightCount = Math.min(ordered.length, MAX_LIGHTS);
         p.lightCount[0] = lightCount;
         // True camera near — slice 0's AABB reaches down to this so geometry

@@ -71,17 +71,33 @@ let warnedTooMany = false;
  * would risk the two disagreeing, which would silently light fragments with the
  * wrong light's shadow map.
  */
-export function selectShadowCastingSpots(lights: Light[]): SpotLight[] {
-    const flagged = lights.filter((l): l is SpotLight => l.kind === "spot" && l.castsShadow === true);
-    if (flagged.length > MAX_SHADOW_SPOTS && !warnedTooMany) {
+export function selectShadowCastingSpots(lights: Light[], out: SpotLight[] = []): SpotLight[] {
+    // Walks the light array once and fills `out` in place: the previous
+    // `filter().slice()` allocated two arrays per frame, on a path the renderer
+    // runs unconditionally whether or not any spot casts. `out` is the
+    // renderer's persistent array; the default keeps the standalone call shape
+    // for tests and callers that don't own one.
+    out.length = 0;
+    let flagged = 0;
+    for (let i = 0; i < lights.length; i++) {
+        const light = lights[i]!;
+        if (light.kind !== "spot" || light.castsShadow !== true) {
+            continue;
+        }
+        flagged++;
+        if (out.length < MAX_SHADOW_SPOTS) {
+            out.push(light);
+        }
+    }
+    if (flagged > MAX_SHADOW_SPOTS && !warnedTooMany) {
         warnedTooMany = true;
         console.warn(
-            `metis-engine: ${flagged.length} spot lights are flagged castsShadow, but only ` +
+            `metis-engine: ${flagged} spot lights are flagged castsShadow, but only ` +
             `${MAX_SHADOW_SPOTS} can cast at once (MAX_SHADOW_SPOTS). The first ${MAX_SHADOW_SPOTS} ` +
             `in scene order win; the rest light normally but cast nothing.`,
         );
     }
-    return flagged.slice(0, MAX_SHADOW_SPOTS);
+    return out;
 }
 
 /**
@@ -125,6 +141,18 @@ export class SpotShadows {
     private readonly projScratch = mat4f();
     /** Scratch for the per-instance model matrix behind the frustum cull. */
     private readonly texelScaleScratch = new Float32Array(MAX_SHADOW_SPOTS);
+    /**
+     * Whether layer *i* currently holds nothing but the "no occluder" clear, so
+     * an unused layer's clear pass can be encoded once instead of every frame.
+     *
+     * Unused layers still must not carry a *previous* caster's depth — a light
+     * inheriting that index later would sample it — which is why they are
+     * cleared at all. But a layer that has already been cleared and not drawn
+     * into since is still clean, and nothing outside this class writes these
+     * layers. Starts all-false: a fresh texture's contents are undefined, so
+     * every layer is cleared on the first frame regardless.
+     */
+    private readonly layerCleared = new Array<boolean>(MAX_SHADOW_SPOTS).fill(false);
 
     /**
      * Instances actually drawn across all spot shadow passes last frame.
@@ -304,6 +332,14 @@ export class SpotShadows {
         this.lastCandidateInstances = 0;
 
         for (let i = 0; i < MAX_SHADOW_SPOTS; i++) {
+            // An unused layer that is already clear needs no pass at all: it
+            // holds the same "no occluder" depth the clear would rewrite, and
+            // nothing else can have touched it. An unused layer that is *not*
+            // clear still gets cleared, which is what keeps a previous caster's
+            // depth from being sampled by whichever light inherits this index.
+            if (i >= spots.length && this.layerCleared[i]) {
+                continue;
+            }
             const pass = encoder.beginRenderPass({
                 label: `metis-engine/spot-shadow-${i}-depth-pass`,
                 timestampWrites: profiler?.pass(`spot-shadow-${i}`),
@@ -315,8 +351,8 @@ export class SpotShadows {
                     depthClearValue: 1.0, // z=1 (farthest) = "no occluder here"
                 },
             });
-            // Unused layers still get the clear pass above — that's what makes a
-            // stale layer impossible — but draw nothing.
+            // A drawn-into layer is no longer clear; an unused one now is.
+            this.layerCleared[i] = i >= spots.length;
             if (i < spots.length) {
                 frustumFromViewProj(this.renderMatrices[i]!, this.frustum);
                 pass.setPipeline(this.pipeline);

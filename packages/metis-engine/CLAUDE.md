@@ -1828,6 +1828,112 @@ byte-exact fixture set described above despite living in the same folder — do
 not read a diff on it as a regression, and do not commit a regenerated one as if
 it were a baseline.
 
+### Per-frame fixed costs — the encode nobody was counting
+
+Every item below is a thing the frame did *unconditionally* that depends on
+state which almost never changes. None of them scale with instance count, which
+is exactly why they hid: the geometry-heavy bench configurations this file spends
+its time on are dominated by per-draw cost, and a flat ~0.2 ms sits inside their
+run-to-run drift. They are only visible in a **fixed-cost-dominated
+configuration**, and that is the measurement lesson here.
+
+What changed, all of it invalidation on identity or a byte compare:
+
+- **The AO clear is once per resize, not once per frame.** With `AoTechnique.None`
+  the renderer cleared the AO target to white every frame so the forward
+  multiply is a no-op — but nothing except that clear and the AO blur ever writes
+  that texture, so once white it stays white. `clearToWhite` now encodes no pass
+  at all in the steady state (`resultIsWhite`), the same total skip the cascade
+  cache uses. `None` is the **default**, so this is the common path.
+- **Group 0 is cached.** `render()` rebuilt an eight-entry bind group every frame;
+  seven entries are fixed for the renderer's lifetime and the eighth
+  (`ao.resultView`) changes only on resize. Keyed on that view's identity. Same
+  for `TonemapPass`'s bind group, keyed on `hdrColorView` — the pattern
+  `LuminanceAveragePass` already used and the other two hadn't adopted.
+- **Unused spot-shadow layers are cleared once.** All four layers got a clear
+  pass every frame even with zero casters, to stop a stale layer being sampled by
+  a light that inherits its index. A layer that has already been cleared and not
+  drawn into since is still clean, so it is skipped (`layerCleared`). Four
+  encoded passes per frame become zero in every scene that doesn't use spot
+  shadows — which is most of them, including the whole fixture set.
+- **Material uniforms upload only when a factor moved.** `getBindGroup` wrote its
+  buffer on every call. Now it byte-compares against the last upload first, the
+  same trade `SceneInstance.writeModel` makes: comparing is far cheaper than the
+  napi crossing it avoids.
+- **The light path stopped allocating per frame.** `selectShadowCastingSpots`
+  allocated two arrays via `filter().slice()`, and `LightCuller.write` allocated a
+  `Set` plus two spreads sized by the whole light count — every frame, on a path
+  that runs whether or not anything casts. Both fill persistent arrays now, and
+  with no casters `scene.lights` is already in the required order and is used
+  directly. The membership test is a linear scan precisely *because*
+  `shadowSpots` holds at most `MAX_SHADOW_SPOTS` (4): four reference compares beat
+  allocating a hash set, which is the same "a `Map`/`Set` keyed on objects is
+  worse than it looks" finding the ECS dispatch bench recorded.
+
+**Measured, A/B'd in one sitting by stashing the diff and re-running** (the
+standing requirement in this file). At `--helmets 0`, where fixed cost is the
+whole story, CPU encode dropped by roughly **a quarter**; the spread across three
+runs was under 2% on both sides, which is what makes a delta that size mean
+something here. Re-measure with:
+
+```powershell
+bun run bench:lights --helmets 0 --shadow-spots 0 --duration 8   # nothing but fixed cost
+bun run bench:lights --helmets 0 --duration 8                    # spot layers all in use
+bun run bench:lights --helmets 400 --duration 6                  # confirm no regression
+```
+
+Reporting the pair matters: the two `--helmets 0` configurations attribute the
+result, because the spot-layer skip only applies in the first. Roughly 60% of the
+win was the four skipped spot clear passes and the rest everything else — so
+**the single biggest item was encoding render passes that did nothing**, not any
+of the buffer work.
+
+**At `--helmets 400` the same change is not measurable, and that is the expected
+answer, not a disappointment.** Fixed cost is a small slice of an encode
+dominated by ~400 draws, and this bench's encode spread at that scale (~0.1 ms)
+is larger than the whole effect. A change that helps a flat cost has to be
+measured where flat cost dominates; quoting the 400-helmet number either way
+would be measuring the benchmark.
+
+**Bounding spheres are recomputed only when they can have changed**, keyed on
+`modelChanged`, `DrawOrder.resorted`, and the instance's `Mesh` identity. The
+mesh check is not redundant: swapping `instance.mesh` in place changes
+`boundingRadius` while the transform and the slot both stay put, and unlike a
+stale *sort* — a missed optimisation — a stale *radius* is a wrong cull, i.e. an
+object that silently stops being drawn. Exactly the hazard, and the same fix, as
+the mesh hash in `ShadowCascades.castersChanged`. `DrawOrder` had to start
+reporting `resorted` for this, because a re-sort moves instances between slots
+without any of them having moved in the world.
+
+**The spot-layer skip is the one that needed a new test, and the existing suite
+could not have caught it.** Every case in `spotShadow.test.ts` built a fresh
+renderer, so none of them saw state a renderer carries *between* frames — which
+is the entirety of what `layerCleared` is. `renderToggleSequence` renders several
+frames through one renderer, toggling `castsShadow`, and pins both transitions: a
+layer going idle, and **an idle layer being reclaimed by a caster**. The second is
+the dangerous one, and it is **mutation-checked** — dropping the `i >= spots.length`
+term (skipping any layer merely because it is clean) leaves the reclaiming frame
+sampling an empty depth map, and it was watched failing exactly that way, with the
+deck coming back at full unshadowed brightness. Per this file's standing rule, that
+is the point: the passing test meant nothing until it had failed for the right reason.
+
+Worth recording because it narrows a claim this file used to make: the comment
+said an uncleared layer "would be sampled by whichever light inherited that index
+later". That cannot actually happen — a layer is only sampled when
+`lightIndex < activeCount`, and any such layer is re-rendered in the same frame —
+so the clear is defence in depth rather than the load-bearing thing it was
+described as. The skip is safe for a stronger reason than the one originally
+written down.
+
+That one is **correct and provably cheaper but below this bench's noise floor**,
+and it is recorded that way rather than as a win. Isolated in a calibrated
+microbenchmark (trials grown past ~60 ms first, per the ECS bench's tier-up
+lesson), the loop costs ~24 µs/frame at 400 instances and the guard removes 96%
+of it — about 0.02 ms, against an encode spread five times that. At 2000
+instances it is ~0.12 ms and starting to matter. It scales linearly with instance
+count, so it is a change that pays in a large world and is invisible in this one;
+don't go looking for it in the bench output.
+
 ### Known limitations (not yet done)
 
 - No image-based lighting / environment reflections — a pure metal with no texture is lit only by direct lights, nothing else (see `math/PBR shading formulas.md`'s "Where the real handwave lives").

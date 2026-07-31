@@ -1,4 +1,5 @@
 import {
+    type GpuBindGroup,
     type GpuBindGroupLayout,
     type GpuCommandEncoder,
     type GpuDevice,
@@ -7,6 +8,7 @@ import {
     type GpuShaderModule,
     GPUShaderStage,
     type GPUTextureFormat,
+    type GpuTextureView,
 } from "metis-native";
 import type { ExposureState } from "./exposureState.ts";
 import type { PostProcessFrameContext, PostProcessPass } from "./pipeline.ts";
@@ -27,14 +29,22 @@ export class TonemapPass implements PostProcessPass {
      */
     execute(encoder: GpuCommandEncoder, ctx: PostProcessFrameContext): void {
         const pipeline = this.getPipeline(ctx.outputFormat);
-        const bindGroup = this.device.createBindGroup({
-            label: "metis-engine/tonemap-bind-group",
-            layout: this.bindGroupLayout,
-            entries: [
-                {binding: 0, textureView: ctx.hdrColorView},
-                {binding: 1, buffer: {buffer: this.exposure.buffer}},
-            ],
-        });
+        // Cached across frames: the exposure buffer is fixed for this pass's
+        // lifetime and the HDR view only changes when the targets are
+        // reallocated, so this is keyed on that view's identity — the same
+        // pattern `LuminanceAveragePass` uses for its own inputs.
+        if (!this.bindGroup || this.lastHdrView !== ctx.hdrColorView) {
+            this.bindGroup = this.device.createBindGroup({
+                label: "metis-engine/tonemap-bind-group",
+                layout: this.bindGroupLayout,
+                entries: [
+                    {binding: 0, textureView: ctx.hdrColorView},
+                    {binding: 1, buffer: {buffer: this.exposure.buffer}},
+                ],
+            });
+            this.lastHdrView = ctx.hdrColorView;
+        }
+        const bindGroup = this.bindGroup;
 
         const pass = encoder.beginRenderPass({
             label: "metis-engine/tonemap-pass",
@@ -58,6 +68,8 @@ export class TonemapPass implements PostProcessPass {
     private readonly pipelineLayout: GpuPipelineLayout;
     private readonly module: GpuShaderModule;
     private readonly pipelines = new Map<GPUTextureFormat, GpuRenderPipeline>();
+    private bindGroup: GpuBindGroup | null = null;
+    private lastHdrView: GpuTextureView | null = null;
 
     constructor(
         private readonly device: GpuDevice,

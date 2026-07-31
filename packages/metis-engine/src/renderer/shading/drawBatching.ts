@@ -89,6 +89,18 @@ export class DrawOrder {
     private readonly previous: SceneInstance[] = [];
 
     /**
+     * Whether the most recent {@link update} rebuilt the order rather than
+     * returning the previous one unchanged.
+     *
+     * Anything the renderer caches **per draw-order slot** has to invalidate on
+     * this: a re-sort moves instances between slots, so slot *i* may now hold a
+     * different instance than the value cached against it. The per-frame
+     * bounding spheres are exactly that, and they are otherwise keyed only on
+     * whether an instance *moved* — which a re-sort does not make true.
+     */
+    resorted = true;
+
+    /**
      * Returns the sorted view of `instances`. The result is **owned by this
      * object and reused across frames** — read it within the frame, do not
      * retain it, and never mutate it.
@@ -98,8 +110,10 @@ export class DrawOrder {
      */
     update(instances: readonly SceneInstance[]): readonly SceneInstance[] {
         if (this.matchesPrevious(instances)) {
+            this.resorted = false;
             return this.ordered;
         }
+        this.resorted = true;
         this.previous.length = 0;
         this.ordered.length = 0;
         for (let i = 0; i < instances.length; i++) {
@@ -216,12 +230,16 @@ export class PassBinder {
     /**
      * Binds `material` at `slot`, skipped when it is already bound.
      *
-     * Note this also skips `Material.getBindGroup`, which uploads the material's
-     * uniform buffer every call — so a material whose factors are mutated
+     * Note this also skips `Material.getBindGroup`, which is where a material's
+     * uniform buffer is uploaded — so a material whose factors are mutated
      * *between two draws that share it* would not see the second change until
      * something else is bound in between. Materials are shared, immutable-ish
      * shading parameters; mutating one mid-frame is already meaningless, since
      * every draw sharing it reads one buffer.
+     *
+     * That upload is itself now conditional on the factors having changed, so a
+     * skipped bind saves a `setBindGroup` and an unchanged material costs no
+     * `writeBuffer` even when it *is* bound — the two are independent.
      */
     setMaterial(
         pass: GpuRenderPassEncoder,

@@ -410,6 +410,14 @@ the factors. This keeps one pipeline for all materials. Textures multiply their
 factor: albedo/emissive are sRGB source data, normal/metallic/roughness are
 linear; metallic and roughness read the **red channel**.
 
+**Mutating the factor fields is picked up automatically**, but the GPU upload
+happens only when the bytes actually differ from the last one — so a static
+material costs no `writeBuffer` per frame. Assign the fields directly
+(`material.roughness = 0.2`); there is nothing to invalidate by hand. The one
+case that does *not* take effect is mutating a material between two draws that
+share it within a single pass, which was already true (see `PassBinder`) and is
+meaningless anyway, since every draw sharing it reads one buffer.
+
 ### `Light` / `Environment`
 
 Local lights are a **discriminated union on `kind`**, all living in one
@@ -636,10 +644,10 @@ for the design.
    consecutive instances sharing a mesh.
 2. Write cluster params + pack the point-light array.
 3. **Cascaded shadow passes** (`cullMode: "none"`): one single-sample depth-only pass per cascade, each into its own `depth_2d_array` layer — **skipped when cached** (above).
-3b. **Spot shadow passes**, one per `MAX_SHADOW_SPOTS` layer. Layers without an active caster are still cleared (so a stale map can't be sampled) but draw nothing. Draws are **frustum-culled per light** against each instance's world bounding sphere.
+3b. **Spot shadow passes**, one per `MAX_SHADOW_SPOTS` layer. A layer without an active caster is cleared (so a stale map can't be sampled) but draws nothing — and once cleared it is **skipped entirely** on later frames, since nothing else writes it. Draws are **frustum-culled per light** against each instance's world bounding sphere.
 4. **Cluster build** (compute) — per-cluster view-space AABBs.
 5. **Light cull** (compute) — sphere-vs-AABB, writes per-cluster light index lists.
-6. **AO** — `clearToWhite` if `technique === None`, else prepass + SSAO/HBAO + blur.
+6. **AO** — `clearToWhite` if `technique === None`, else prepass + SSAO/HBAO + blur. The clear encodes a pass only when the AO target isn't already white, so in the default `None` configuration it costs one pass per resize rather than one per frame.
 7. **Forward pass** — one instanced draw per mesh+material run, bind groups `0=frame 1=material 2=model-array 3=cluster-lights`.
 
 Everything is internal; there are **no per-pass GPU timestamp hooks**. To time

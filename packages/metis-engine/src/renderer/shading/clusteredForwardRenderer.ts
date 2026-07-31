@@ -7,6 +7,7 @@ import {
     type GpuDevice,
     type GpuRenderPipeline,
     GPUShaderStage,
+    type GpuTextureView,
 } from "metis-native";
 import { Mat4 } from "metis-data";
 import { AmbientOcclusion } from "../ao/ambientOcclusion.ts";
@@ -14,7 +15,8 @@ import { AoTechnique } from "../ao/aoConfig.ts";
 import type { GpuProfiler } from "../debug/gpuProfiler.ts";
 import { type Mat4f, mat4f } from "../math/types.ts";
 import { DEPTH_FORMAT, HDR_COLOR_FORMAT, MSAA_SAMPLE_COUNT, type RenderTargets } from "../rhi/targets.ts";
-import { MESH_VERTEX_LAYOUT } from "../scene/mesh.ts";
+import { MESH_VERTEX_LAYOUT, type Mesh } from "../scene/mesh.ts";
+import type { SpotLight } from "../scene/light.ts";
 import type { Scene, SceneInstance } from "../scene/scene.ts";
 import { DrawOrder, forEachDrawRun, PassBinder } from "./drawBatching.ts";
 import { type Frustum, frustumFromViewProj, sphereInFrustum, worldBoundingSphereInto } from "../math/frustum.ts";
@@ -163,11 +165,35 @@ export class ClusteredForwardRenderer {
      * instance and nothing about the viewer.
      */
     private worldSpheres = new Float32Array(0);
+    /**
+     * The `Mesh` each slot's sphere was computed against, so an in-place mesh
+     * swap invalidates that slot. See the loop in `render()`.
+     */
+    private sphereMeshes: (Mesh | null)[] = [];
     /** Camera visibility for the frame's draw order; see `frustumCulling`. */
     private cameraVisible = new Uint8Array(0);
     private readonly cameraFrustum: Frustum = frustumFromViewProj(mat4f());
     /** Pass-scoped bind tracker for the prepass and forward passes; `begin()` per pass. */
     private readonly binder = new PassBinder();
+    /**
+     * Group 0, cached across frames.
+     *
+     * Seven of its eight entries are fixed for the renderer's lifetime — the two
+     * uniform buffers this class owns, and the shadow/spot resources its
+     * collaborators allocate once in their constructors. Only `ao.resultView`
+     * is reallocated, and only when the viewport size changes, so the cache is
+     * keyed on that view's identity. Rebuilding all eight entries every frame
+     * was a per-frame napi crossing marshalling eight descriptors for a value
+     * that changes on resize.
+     */
+    private frameBindGroup: GpuBindGroup | null = null;
+    private frameBindGroupAoView: GpuTextureView | null = null;
+    /**
+     * This frame's shadow-casting spots, refilled in place each frame and handed
+     * to *both* the culler and `SpotShadows` — the shared-derivation invariant
+     * is unchanged, this only stops it allocating two arrays per frame.
+     */
+    private readonly shadowSpotsScratch: SpotLight[] = [];
 
     constructor(device: GpuDevice) {
         this.device = device;
@@ -346,7 +372,7 @@ ${depthPrepassWgsl}`,
         // light's buffer index is also its shadow-map layer, and SpotShadows
         // renders the layers in the same order. Two independent derivations
         // could disagree and shadow fragments with the wrong light's map.
-        const shadowSpots = selectShadowCastingSpots(scene.lights);
+        const shadowSpots = selectShadowCastingSpots(scene.lights, this.shadowSpotsScratch);
         // Sorted once per frame and shared by every pass that draws: all four
         // cascades, every spot layer, the prepass and the forward pass walk the
         // *same* order, so the redundant binds each of them skips are the same
@@ -362,12 +388,31 @@ ${depthPrepassWgsl}`,
 
         // Bounding spheres once, for every consumer. `models.update` has just
         // written each instance's matrix, so `modelFloats` is this frame's.
+        let spheresStale = this.drawOrder.resorted;
         if (this.worldSpheres.length < instances.length * 4) {
             this.worldSpheres = new Float32Array(instances.length * 4);
             this.cameraVisible = new Uint8Array(instances.length);
+            this.sphereMeshes = new Array<Mesh | null>(instances.length).fill(null);
+            spheresStale = true; // a fresh array holds nothing
         }
+        // A sphere depends on the instance's model matrix and its mesh's local
+        // radius, and on nothing about the viewer — so an instance that did not
+        // move, was not re-slotted and did not swap meshes still has last
+        // frame's answer, and it is exactly right. Skipping recomputes three
+        // `Math.hypot`s per instance per frame.
+        //
+        // The mesh check is not redundant with `modelChanged`: reassigning
+        // `instance.mesh` in place changes `boundingRadius` while the transform
+        // and the draw order both stay put. Unlike a stale *sort*, which only
+        // costs binds, a stale radius is a wrong cull — an object that silently
+        // stops being drawn. Same hazard, and same reasoning, as the mesh hash
+        // in `ShadowCascades.castersChanged`.
         for (let i = 0; i < instances.length; i++) {
             const instance = instances[i]!;
+            if (!spheresStale && !instance.modelChanged && this.sphereMeshes[i] === instance.mesh) {
+                continue;
+            }
+            this.sphereMeshes[i] = instance.mesh;
             worldBoundingSphereInto(instance.modelFloats, instance.mesh.boundingRadius, this.worldSpheres, i * 4);
         }
 
@@ -411,20 +456,27 @@ ${depthPrepassWgsl}`,
             this.ao.render(encoder, scene, instances, modelBindGroup, cameraFilter, targets, this.profiler);
         }
 
-        const frameBindGroup = this.device.createBindGroup({
-            label: "metis-engine/frame-bind-group",
-            layout: this.frameBindGroupLayout,
-            entries: [
-                {binding: 0, buffer: {buffer: this.cameraBuffer}},
-                {binding: 1, buffer: {buffer: this.environmentBuffer}},
-                {binding: 2, textureView: this.spotShadows.depthArrayView},
-                {binding: 3, buffer: {buffer: this.spotShadows.uniformBuffer}},
-                {binding: 4, buffer: {buffer: this.shadows.uniformBuffer}},
-                {binding: 5, textureView: this.ao.resultView},
-                {binding: 6, textureView: this.shadows.depthArrayView},
-                {binding: 7, sampler: this.shadows.compareSampler},
-            ],
-        });
+        // Rebuilt only when AO's result texture was reallocated (a resize) —
+        // every other entry is fixed for this renderer's lifetime.
+        const aoView = this.ao.resultView;
+        if (!this.frameBindGroup || this.frameBindGroupAoView !== aoView) {
+            this.frameBindGroup = this.device.createBindGroup({
+                label: "metis-engine/frame-bind-group",
+                layout: this.frameBindGroupLayout,
+                entries: [
+                    {binding: 0, buffer: {buffer: this.cameraBuffer}},
+                    {binding: 1, buffer: {buffer: this.environmentBuffer}},
+                    {binding: 2, textureView: this.spotShadows.depthArrayView},
+                    {binding: 3, buffer: {buffer: this.spotShadows.uniformBuffer}},
+                    {binding: 4, buffer: {buffer: this.shadows.uniformBuffer}},
+                    {binding: 5, textureView: aoView},
+                    {binding: 6, textureView: this.shadows.depthArrayView},
+                    {binding: 7, sampler: this.shadows.compareSampler},
+                ],
+            });
+            this.frameBindGroupAoView = aoView;
+        }
+        const frameBindGroup = this.frameBindGroup;
 
         if (this.depthPrepass) {
             const pre = encoder.beginRenderPass({
