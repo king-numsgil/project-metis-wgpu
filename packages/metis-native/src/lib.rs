@@ -1,6 +1,7 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+mod audio;
 mod gltf;
 mod gpu;
 mod image;
@@ -86,6 +87,21 @@ pub use vector::{VectorContext, FontMetrics, DrawCall};
 pub use image::{
     ImageColorSpace, ImageLoadOptions, Ktx2LoadOptions, load_image_texture, load_ktx2_texture,
     read_texture_pixels, save_pixels_to_file, save_texture_to_file,
+};
+
+// ── Audio (decode -> mix -> SDL device) ───────────────────────────────────────
+//
+// Pure-Rust decoding via symphonia (same rule as the image loaders), a software
+// mixer whose one render function serves both the offline and the device path,
+// and the SDL3 stream/device bindings underneath. See `audio/mod.rs` for the
+// layering and for why positional audio isn't here yet.
+
+pub use audio::{
+    AudioClip, AudioDeviceInfo, AudioFileInfo, AudioFormatInfo, AudioLoadOptions, AudioMixer,
+    AudioMixerOptions, AudioPlayOptions, SdlAudioFormat, SdlAudioSpecJs, SdlAudioStream,
+    decode_audio_clip, inspect_audio_file, load_audio_clip, sdl_create_audio_stream,
+    sdl_get_audio_drivers, sdl_get_audio_playback_devices, sdl_get_audio_recording_devices,
+    sdl_get_current_audio_driver,
 };
 
 // ── glTF 2.0 import (file -> GPU buffers/textures + scene graph) ───────────────

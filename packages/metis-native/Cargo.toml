@@ -47,6 +47,13 @@ gltf = { version = "1.4.1", default-features = false, features = [
 serde_json = "1"
 base64 = "0.22"
 percent-encoding = "2"
+# Audio decoding. Pure Rust, same rule as the image decoders — no C decoder in
+# the path (see CLAUDE.md, "Why SDL3_image is gone"). `all` turns on every
+# royalty-free codec and container symphonia ships (wav/flac/mp3/aac/alac/
+# vorbis/adpcm + mkv/isomp4/ogg/caf/aiff) plus the metadata readers; the set is
+# a compile-time cost only, and a game that can't open the file the artist
+# handed it is a worse trade than a slightly longer link.
+symphonia = { version = "0.6", features = ["all"] }
 
 [build-dependencies]
 napi-build = "2"

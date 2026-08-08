@@ -1,8 +1,9 @@
 # metis-native — API reference
 
-Practical usage guide for the napi-rs binding that exposes **WebGPU (wgpu 30)**
-and **SDL3** to Bun. `CLAUDE.md` (this package) covers the Rust-side build rules,
-napi constraints, and internals. This file covers *calling it from TypeScript*.
+Practical usage guide for the napi-rs binding that exposes **WebGPU (wgpu 30)**,
+**SDL3** and **audio** (symphonia decode + a software mixer) to Bun. `CLAUDE.md`
+(this package) covers the Rust-side build rules, napi constraints, and
+internals. This file covers *calling it from TypeScript*.
 
 > ## `index.d.ts` is ground truth
 >
@@ -1016,6 +1017,171 @@ on first use — a one-time blocking hitch, then cache hits.
 
 `metis-engine`'s `VectorText` wraps all of this (pipeline + ortho projection +
 palette paint colours) — prefer it if you're already in the engine.
+
+---
+
+## 9b. Audio — decode, mix, play
+
+Three layers. Each works without the ones above it, which is also how they're
+tested (see `CLAUDE.md`).
+
+```
+loadAudioClip  ──>  AudioClip  ──>  AudioMixer  ──>  SDL device
+   (symphonia)      (f32 PCM)        (voices)        (speakers)
+```
+
+### Loading
+
+```ts
+import { loadAudioClip, decodeAudioClip, inspectAudioFile, AudioClip } from "metis-native"
+
+const shot  = await loadAudioClip("sfx/shot.wav")
+const music = await loadAudioClip("music/theme.ogg", {
+  targetSampleRate: 48_000,   // resample once at load instead of per-voice
+  forceMono: true,            // downmix; what positional panning wants
+  maxFrames: 48_000 * 30,     // cap a long file
+})
+
+const bytes = await Bun.file("sfx/hit.flac").bytes()
+const hit   = await decodeAudioClip(bytes, { hint: "flac" })
+
+const info = await inspectAudioFile("music/theme.ogg")  // header only, no decode
+// { container: "ogg", codec: "vorbis", sampleRate, channels, frameCount, duration, bitsPerSample }
+```
+
+Containers: WAV, AIFF, CAF, MP4, MKV, OGG. Codecs: PCM, ADPCM, FLAC, ALAC, MP3,
+AAC, Vorbis. Detection is by content; the extension (or `hint`) only breaks ties.
+
+`AudioClip` exposes `sampleRate`, `channels`, `frameCount`, `duration`, `peak`,
+`getSamples()` (interleaved copy) and `getChannel(i)`. Build one without a file
+with `AudioClip.fromSamples(f32, rate, channels)` or `AudioClip.silence(...)` —
+the procedural-audio route, and what the mixer tests use.
+
+**`loadAudioClip` decodes the entire file into RAM.** There is no streaming
+decoder; a 5-minute stereo track at 48 kHz costs ~110 MB as f32. Use
+`targetSampleRate`/`forceMono` to cut that, or `maxFrames` to bound it.
+
+### Mixing
+
+```ts
+import { AudioMixer } from "metis-native"
+
+const mixer = new AudioMixer({ sampleRate: 48_000, channels: 2 })
+
+const voice = mixer.play(shot, {
+  gain: 0.8,        // linear
+  pan: -0.4,        // -1 left … +1 right
+  loop: false,
+  rate: 1.0,        // speed *and* pitch, like a tape machine
+  startTime: 0,     // seconds into the clip
+})
+
+mixer.setVoiceGain(voice, 0.5)
+mixer.setVoicePan(voice, 0.7)
+mixer.voiceTime(voice)        // playhead in seconds, or null once it has ended
+mixer.isVoiceActive(voice)
+mixer.stop(voice)
+mixer.stopAll()
+mixer.masterGain = 0.6
+```
+
+Voice IDs are **never reused**, so `isVoiceActive(id) === false` unambiguously
+means "that sound has finished". A voice holds its own reference to the clip's
+samples — dropping the `AudioClip` mid-playback is safe.
+
+**Output is not clamped.** Sum enough loud voices and samples exceed ±1, and the
+driver hard-clips them. Duck with `masterGain`; there is no limiter, by design.
+
+**Panning is asymmetric between mono and stereo sources, deliberately.** A mono
+clip is *placed*: constant power, so centre is −3 dB (0.707 each side). A stereo
+clip is *balanced*: centre is unity, so a music file plays back at the level it
+was authored. See `CLAUDE.md` for why.
+
+### Playing
+
+```ts
+import { sdlInit, SdlInitFlag, sdlGetAudioPlaybackDevices } from "metis-native"
+
+sdlInit(SdlInitFlag.Audio)
+
+const devices = sdlGetAudioPlaybackDevices()   // [{ id, name, format, bufferFrames }]
+
+mixer.openDevice()            // or openDevice(devices[0].id)
+mixer.resume()                // devices start PAUSED — queue voices first
+// …
+mixer.pause()
+mixer.close()
+```
+
+Mixing happens on SDL's audio thread, in Rust. **There is no JS audio callback
+and there will not be one** — a napi hop from the audio thread waits behind the
+event loop and the next GC pause, which is a dropout. JS sets parameters; Rust
+does the per-sample work.
+
+> **Close the mixer before `sdlQuit()`.**
+>
+> `sdlQuit()` destroys SDL's audio streams and devices. A mixer finalised after
+> that used to double-free and corrupt the heap at process exit. It is now
+> guarded — late teardown is a no-op rather than a crash — but the guard makes
+> forgetting *survivable*, not correct. Same rule, same reason as
+> `GpuSurface.destroy()` before `sdlQuit()`.
+
+### Rendering without a device
+
+Two ways, and both are useful outside tests — offline bounce, headless servers,
+CI:
+
+```ts
+// 1. Straight from the mixer. No SDL involved at all.
+const frames = mixer.renderFrames(48_000)     // Float32Array, interleaved
+
+// 2. Through the real SDL stream + audio callback, bound to no device.
+mixer.openCapture()
+const same = mixer.capture(48_000)
+mixer.close()
+```
+
+`renderFrames` throws while the mixer is open — the callback is already
+consuming those voices, and two consumers of one playhead produce audio that
+belongs to neither.
+
+### `SdlAudioStream` — format conversion on its own
+
+```ts
+import { sdlCreateAudioStream, SdlAudioFormat } from "metis-native"
+
+const s = sdlCreateAudioStream(
+  { format: SdlAudioFormat.F32, channels: 2, freq: 48_000 },
+  { format: SdlAudioFormat.S16, channels: 1, freq: 22_050 },
+)
+s.putSamples(interleavedF32)   // source format
+s.flush()                      // else the tail waits for more input
+const out = s.getBytes(1024)   // destination format
+s.destroy()
+```
+
+Unbound, this needs no audio device and no driver. `getSamples()` (f32) is
+refused unless the destination format *is* f32 — reinterpreting s16 bytes as
+floats is the byte-vs-value trap §4 warns about. Use `getBytes()` otherwise.
+
+### Testing audio without hearing it
+
+Select SDL's null backend **before** `sdlInit`:
+
+```ts
+sdlSetHint("SDL_AUDIO_DRIVER", "dummy")
+sdlInit(SdlInitFlag.Audio)
+```
+
+`tests/helpers/dsp.ts` has the analysis side — `goertzel` (energy at one
+frequency), `rms`, `peak`, `stereo`, `maxAbsDiff` — and `tests/helpers/wav-build.ts`
+writes fixture WAVs. Assert on *content*, not shape: almost every audio bug
+produces a buffer of the right length full of plausible floats.
+
+### Not implemented
+
+Positional/binaural audio (Steam Audio is the intended route — see `CLAUDE.md`),
+streaming decode, recording, and surround output beyond the front pair.
 
 ---
 

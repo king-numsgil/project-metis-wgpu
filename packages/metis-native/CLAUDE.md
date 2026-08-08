@@ -4,7 +4,8 @@
 
 A Bun/TypeScript game-engine foundation built on a Rust napi-rs library that exposes:
 - **WebGPU** (wgpu 30) — close to the real WebGPU spec so tutorials work
-- **SDL3** — windowing, input, timing, cursor, joystick, gamepad
+- **SDL3** — windowing, input, timing, cursor, joystick, gamepad, audio devices
+- **Audio** — pure-Rust decoding (symphonia) plus a software mixer that feeds SDL
 
 The Rust crate is at the repo root; the generated JS binding is `index.js` / `index.d.ts` (written directly by `napi build`).
 
@@ -157,6 +158,7 @@ once it does, rather than assuming either answer.
 - **napi-rs**: 3.x — uses `#[napi]`, `#[napi(object)]`, `Reference<T>`, async napi fns
 - **SDL3**: built from source via `sdl3-sys = { version = "0.6.7", features = ["build-from-source-static"] }` (bundles SDL 3.4.12)
 - **Image decoding**: `image = { version = "0.25", default-features = false, features = ["png", "jpeg", "tga", "hdr"] }` — pure Rust, no C decoder. Plus `half` for the f32→f16 conversion HDR needs. (SDL3_image was removed; see "Why SDL3_image is gone" below.)
+- **Audio decoding**: `symphonia = { version = "0.6", features = ["all"] }` — pure Rust, same rule as the image decoders. `all` enables every royalty-free codec and container it ships; the cost is compile time only, and a game that cannot open the file the artist handed it is the worse trade. **Steam Audio / `audionimbus` is deliberately absent** — see the positional-audio section below.
 - **Compressed textures**: `ktx2` (container parsing, zero transitive deps) and `ruzstd` (zstd supercompression). Both pure Rust — deliberately *not* the `zstd` crate, which is C bindings, nor any Basis transcoder. Same rule as the decoder above.
 - **glTF**: `gltf = "1.4"` with `default-features = false` — the crate's own `import` feature is deliberately off, so this crate resolves URIs itself and the resource-override hook has somewhere to live (see the glTF section below). Plus `serde_json` (raw extension passthrough), `base64` (`data:` URIs) and `percent-encoding` (URI unescaping). All pure Rust.
 - **wgpu**: 30.0.0 with WGSL feature
@@ -226,6 +228,18 @@ src/
     save.rs       — the write half: saveTextureToFile, readTexturePixels,
                     savePixelsToFile. GPU readback (row-unpadding, BGRA swizzle)
                     + encoding. Replaced tests/helpers/screenshot.ts
+  audio/
+    mod.rs        — module root: the three-layer diagram, and what is not here
+                    (positional audio, streaming decode, recording) with why
+    clip.rs       — AudioClip: interleaved f32 in an Arc, shared with every
+                    playing voice so dropping the JS handle mid-playback is safe
+    decode.rs     — symphonia: file/bytes -> AudioClip. Probe, packet loop,
+                    downmix, and the linear resampler the mixer also uses
+    mixer.rs      — voices, panning, and `render_into` — the ONE mix function,
+                    reachable directly, via a device, or via openCapture(). Owns
+                    the SDL audio callback (which runs in Rust, never in JS)
+    device.rs     — SDL3 drivers/devices/SdlAudioStream, plus
+                    `audio_subsystem_alive()`, which every teardown path checks
 ```
 
 ---
@@ -1208,6 +1222,171 @@ did. Both directions are now complete. **If you add a texture format, add it to
 both maps** — unlike `FEATURES`, these two can't be collapsed into one table,
 because ASTC is a single wgpu variant with block/channel fields rather than one
 variant per name.
+
+### Audio: three layers, and why each boundary is where it is
+
+`src/audio/` decodes files (symphonia), mixes voices, and feeds an SDL device.
+`DOC.md` §9b covers what to call. What follows is the reasoning.
+
+**The layering is the test strategy, not tidiness.** `decode.rs` needs no SDL
+and no device; `mixer.rs` needs no device; only `device.rs` touches hardware.
+Every boundary can therefore be checked by comparing numbers on a headless
+machine — which matters more here than anywhere else in this package, because
+**almost every audio bug produces a buffer of the correct length full of
+plausible floats.** Swapped stereo channels, a resampler that shifts pitch, a
+pan that goes the wrong way, a decoder reading with the wrong stride: all of
+them pass `frameCount`, `length`, `rms` and `peak` checks. Only asking *which
+channel* and *which frequency* catches them, which is what `tests/helpers/dsp.ts`
+(`goertzel`) exists for.
+
+**There is exactly one mixing function, `MixerState::render_into`, reachable
+three ways.** That is the load-bearing design decision of the module:
+
+| Entry point | Path | Proves |
+|---|---|---|
+| `renderFrames(n)` | direct | the arithmetic |
+| `openCapture()` + `capture(n)` | real `SDL_AudioStream` + real callback, **no device** | the SDL wiring, headlessly |
+| `openDevice()` | the same callback, bound to a device | a device accepts it |
+
+The middle row is the useful invention. `openCapture` builds the *production*
+stream and the *production* C callback and simply binds no device, so a test can
+pull frames through it and compare them byte-for-byte against `renderFrames`.
+Mutation-checked: dropping the `SDL_PutAudioStreamData` call fails exactly those
+three tests and leaves the other 93 green — so `capture` genuinely exercises a
+different path rather than restating `renderFrames`.
+
+**No JS audio callback, ever.** `SDL_SetAudioStreamGetCallback` runs on SDL's
+audio thread under a hard deadline; reaching JS means a napi threadsafe-function
+hop that queues onto the event loop and waits behind the next GC pause. It
+cannot be made to work from this side of the boundary. JS sets parameters, Rust
+does the per-sample work. `MixerState` sits behind a `Mutex` the audio thread
+takes — a priority-inversion hazard in theory, the standard trade in practice,
+with critical sections of one parameter write or one buffer fill. If it ever
+bites, the answer is a command queue into the audio thread, not a finer lock.
+The callback is wrapped in `catch_unwind` because a panic unwinding across
+`extern "C"` is UB and there is no JS on that thread to catch anything.
+
+**Output is deliberately not clamped, and a test pins that.** A limiter would
+make the output a nonlinear function of the input, and every exact-value
+assertion in `audio-mixer.test.ts` would then be testing the limiter's curve
+instead of the mixer's arithmetic. `masterGain` is the duck.
+
+**Panning is asymmetric between mono and stereo sources, on purpose.** A mono
+source is *placed* — plain cos/sin, constant power, centre at −3 dB. A stereo
+source is *balanced* — the same gains scaled by √2, so dead centre is unity.
+Without that scaling, loading a stereo music file and playing it untouched comes
+back quieter than the file, which reads as a bug every single time. Both halves
+are pinned by tests, because a future "simplification" to one rule would
+reintroduce it silently.
+
+**Resampling is linear interpolation, and that is a known ceiling.** It is exact
+at a rate of 1, good for small ratios, progressively soft in the top octave, and
+has **no anti-alias filter on downsampling**. It was chosen over a windowed sinc
+because it is deterministic and hand-checkable, so a test can assert an exact
+expected sample. `decode::resample_linear` and `Voice::sample_at` share the
+arithmetic deliberately — a clip resampled at load and a clip resampled
+per-voice must sound the same. Upgrading means changing both.
+
+**Decoding is eager and unbounded — the whole file lands in RAM.** Streaming
+playback is a deliberate non-goal for this version: it needs a decoder living on
+the audio thread plus a ring buffer, which is a different design from
+`AudioClip`'s immutable shared buffer. `maxFrames` is the escape hatch.
+
+`ClipData` lives behind an `Arc` that a playing voice clones, so a JS caller
+dropping an `AudioClip` mid-playback cannot pull memory out from under the audio
+thread. Pinned by a test that drops the handle and forces a GC.
+
+### An audio handle outliving `sdlQuit()` corrupts the heap
+
+**`SDL_Quit` destroys SDL's own audio streams and closes its devices.** An
+`AudioMixer` or `SdlAudioStream` finalised afterwards — because the caller never
+called `close()`/`destroy()` and left it to the garbage collector — destroys the
+same objects a second time. On Windows that is `STATUS_HEAP_CORRUPTION`
+(0xC0000374) at process exit, **deterministically**, reproduced on the first
+attempt and on all five repeats.
+
+Three properties made it nasty, and they are the same three as the
+surface-outliving-its-window bug above:
+
+1. **It kills the process, not the test.** When it first appeared it took the
+   whole test file down and reported results for *none* of the 23 tests in it —
+   a red run with no output, which reads as a broken machine rather than a bug.
+2. **It happens after the last line of user code.** Every marker prints, every
+   assertion passes, and then the process dies during exit.
+3. **Nothing in the failing code mentions audio teardown.** The trigger is
+   simply *not* calling `close()`, so code that never refers to the mixer again
+   still crashes.
+
+The fix is `audio::device::audio_subsystem_alive()` — an `SDL_WasInit(AUDIO)`
+check in every teardown path. If the subsystem is gone, SDL has already freed
+these objects, so the late path skips the SDL calls and only reclaims the Rust
+box holding the callback userdata. **This is better than the `GpuSurface` case,
+where the only available fix was to add a `destroy()` and document an ordering
+rule: here the subsystem can be asked, so forgetting degrades to a no-op instead
+of a crash.** Callers should still close explicitly; the guard makes forgetting
+survivable, not correct.
+
+`tests/audio-teardown.test.ts` pins it **in subprocesses**, for the reason (1)
+above — the same shape and the same reason as `surface-teardown.test.ts` and the
+VectorContext panic matrix. Mutation-checked: force `alive = true` and exactly
+the three GC-dependent cases fail while the three that close explicitly pass.
+
+An in-process version of this test was written first and removed. Worth
+recording: it did not fail on the mutation, it *crashed the runner*, discarding
+22 unrelated results. A test whose failure mode is a dead process belongs in a
+subprocess or nowhere.
+
+### Audio fixtures: self-authored, then somebody else's
+
+`audio-decode.test.ts` builds its WAVs byte by byte
+(`tests/helpers/wav-build.ts`), so every expected sample is a value the test
+computed — the same tier-1 approach as the inline KTX2 and glTF writers, and it
+buys exact assertions rather than tolerant ones.
+
+One trap found while writing it, worth not rediscovering: **PCM scales by
+`2^(bits-1)`, not `2^(bits-1) - 1`.** The writer first used `127.5` for u8, and
+the symptom was a round-trip error of 0.0085 against a tolerance of 0.0078 —
+close enough to look like ordinary rounding noise rather than a mismatched
+convention. It was settled by feeding known byte values through the decoder and
+reading the mapping off (symphonia gives exactly `(u - 128) / 128`), not by
+re-reading the spec. Do that again rather than reasoning about it.
+
+`audio-real-files.test.ts` is tier 2: real WAVs from `C:\Windows\Media`, at three
+different sample rates, encoded by someone with no interest in making these
+tests pass. It exists for the reason `gltf-samples.test.ts` does — the tier-1
+writer and its assertions were written by one person in one afternoon, so a
+misreading of the format would be baked into both sides. It **skips** rather
+than fails when the files are absent (Linux, trimmed Windows images).
+
+**The gap that remains: no compressed codec is covered by any test.** FLAC, MP3,
+Vorbis, AAC and ALAC decode through symphonia, which has its own test suite for
+them — but *this crate's* handling of a lossy stream (encoder delay/padding,
+channel-count inference from the first decoded buffer, per-packet error
+recovery) is untested, because nothing here or on a stock Windows install can
+encode one and a real codec cannot be hand-authored. Closing it needs a few
+short files in `tests/assets/` from `ffmpeg`; the header comment in
+`audio-real-files.test.ts` says how, and warns to assert on pitch and level
+rather than exact samples.
+
+### Positional audio: deferred, and the seam it plugs into
+
+Steam Audio via the `audionimbus` crate is the intended route. It is **not**
+wired up, and the reason is a build-environment cost rather than a design
+objection: `audionimbus-sys` runs `bindgen` (so `libclang.dll` must be on the
+build machine — this one has no LLVM and no Visual Studio LLVM component) and
+its `auto-install` feature downloads a prebuilt `phonon` shared library from
+Valve's GitHub releases at build time, which then has to ship next to the
+`.node`. That is a toolchain requirement and a runtime artefact this package
+otherwise does not have.
+
+The seam is already there, so this is a bounded change when it happens:
+`Voice::pan_gains` is the *only* thing turning a source into per-channel gains,
+and `render_into`'s per-voice inner loop is where an HRTF convolution would go.
+A voice would gain a position, and the two-gain result would become a filtered
+stereo pair.
+
+If it is picked up: gate it behind a cargo feature rather than making it
+unconditional, so a machine without libclang can still build this crate.
 
 ### Formats deliberately not supported (yet)
 
