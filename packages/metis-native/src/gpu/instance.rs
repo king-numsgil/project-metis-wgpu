@@ -47,7 +47,17 @@ fn parse_options(options: &Option<GpuRequestAdapterOptions>) -> napi::Result<(wg
 fn build_instance(backends: wgpu::Backends) -> Arc<wgpu::Instance> {
     let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
     desc.backends = backends;
-    desc.flags |= wgpu::InstanceFlags::ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER;
+    // Linux only, and deliberately not everywhere. Under WSL the only adapter is
+    // Mesa's `dzn` (Vulkan-on-D3D12) layer, which reports itself non-conformant,
+    // so wgpu enumerates nothing at all without this flag. On Windows the same
+    // flag *adds* adapters instead of rescuing the only one — old Intel drivers
+    // that wgpu correctly hides get picked up and fail later, in device creation
+    // or mid-frame. Keep the escape hatch where it's the difference between a
+    // GPU and no GPU.
+    #[cfg(target_os = "linux")]
+    {
+        desc.flags |= wgpu::InstanceFlags::ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER;
+    }
     Arc::new(wgpu::Instance::new(desc))
 }
 
