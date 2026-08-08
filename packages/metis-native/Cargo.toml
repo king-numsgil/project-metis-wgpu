@@ -78,3 +78,19 @@ codegen-units = 1
 inherits = "release"
 lto = false
 codegen-units = 16
+# Measured 2026-08-08, and the split between these two is the whole point:
+# `overflow-checks` costs roughly *half again* the time of the tightest
+# arithmetic loops here (the mixer's per-sample inner loop), while
+# `debug-assertions` is free — indistinguishable from baseline on the same
+# benchmark. Since `fastdev` is the profile used for perf work, an
+# overflow-checked build would make its own numbers lie, which is the one thing
+# it must not do. So: assertions on, overflow checks off.
+#
+# `overflow-checks` must be set explicitly — cargo defaults it to whatever
+# `debug-assertions` is, so omitting it silently turns it on.
+#
+# Re-measure with `bun run tests/audio-bench.ts` (arithmetic-bound) and
+# `bun test tests/napi-overhead.test.ts` (boundary-bound; expect no signal there
+# either way — those calls are marshalling and driver work, not arithmetic).
+debug-assertions = true
+overflow-checks = false

@@ -129,6 +129,35 @@ worth remembering: after a major wgpu upgrade, a *lockfile* left over from the
 old version can produce compile errors that appear to be upstream bugs. Check
 for duplicate versions of a shared dependency before believing them.
 
+### `debug-assertions` is free here; `overflow-checks` is not
+
+`fastdev` runs with `debug-assertions = true` and **`overflow-checks = false`**,
+and the split was measured rather than guessed (2026-08-08).
+
+- **`overflow-checks` costs about half again the time of the tightest
+  arithmetic loops** — the mixer's per-sample inner loop in `audio/mixer.rs`.
+  That is disqualifying for this profile specifically: `fastdev` exists to do
+  perf work in, so a build that distorts its own hot loops by that much makes
+  every number it produces a lie.
+- **`debug-assertions` alone is indistinguishable from baseline** on the same
+  benchmark, and no `debug_assert!` in this crate or in wgpu/naga/lyon/symphonia
+  fires across the whole suite. It turns on for free.
+
+`overflow-checks` **must be set explicitly** — cargo defaults it to whatever
+`debug-assertions` is, so writing only the latter silently enables both. That is
+how this was nearly shipped with a 1.5x mixer.
+
+**Measure it with `tests/audio-bench.ts`, not with `napi-overhead.test.ts`.**
+This is the part worth remembering: `napi-overhead` showed **no signal at all**
+for a flag that costs 50% in real arithmetic, because its calls are boundary
+marshalling and driver work with almost no arithmetic per call. Judging compiler
+flags on it alone gives a confident wrong answer. Use the boundary benchmark for
+boundary costs and `audio-bench.ts` for arithmetic costs.
+
+The honest limit of the win: enabling `debug-assertions` is cheap insurance, not
+a demonstrated catch — no past bug in this repo is known to have been one it
+would have found.
+
 **Any edit to `Cargo.toml` or `.cargo/config.toml` invalidates everything.**
 Changing rustflags forces a full rebuild of all dependencies (~2 min debug,
 ~4 min release). If builds suddenly feel slow, check whether you've been
