@@ -1203,6 +1203,16 @@ This covers the one thing the suite cannot: whether a *real* driver at a real
 buffer size keeps up. The tests run against SDL's `dummy` driver, so they prove
 the mix and the callback plumbing but never that audio comes out continuously.
 
+### One decoding quirk worth knowing
+
+**AAC-in-MP4 keeps its encoder delay.** A decoded AAC clip is longer than the
+audio that went in (48000 source frames come back as 49152) and starts slightly
+late, because symphonia's gapless trim doesn't apply to that combination. MP3,
+Vorbis, FLAC and ALAC all come back at exactly the source length.
+
+Irrelevant for music. For a sound effect that must fire on an exact frame,
+prefer FLAC or Vorbis, or trim the head yourself.
+
 ### Not implemented
 
 Positional/binaural audio (Steam Audio is the intended route — see `CLAUDE.md`),
