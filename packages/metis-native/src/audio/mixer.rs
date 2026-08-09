@@ -551,6 +551,41 @@ impl AudioMixer {
         }
     }
 
+    /// Move a voice's playhead, in seconds into its clip. Returns `false` if
+    /// the voice has already ended.
+    ///
+    /// The counterpart to `voiceTime`. Without it the only way to scrub is to
+    /// `stop()` and `play()` again with `startTime`, which mints a new voice ID
+    /// and drops whatever gain and pan were set on the old one — fine for a
+    /// sound effect, wrong for a music track a UI holds a handle to.
+    ///
+    /// Seeking a **looping** voice wraps, so a seek past the end lands where
+    /// playback would actually have been. Seeking a non-looping voice past its
+    /// end parks it at the end, and it is reaped on the next render — "seek to
+    /// the end" and "finished" being the same thing is the least surprising
+    /// reading.
+    #[napi]
+    pub fn seek_voice(&mut self, voice: u32, time: f64) -> bool {
+        if !time.is_finite() {
+            return false;
+        }
+        let mut state = self.lock();
+        match state.voices.iter_mut().find(|v| v.id == voice) {
+            Some(v) => {
+                let frames = v.clip.frames as f64;
+                let mut pos = (time * v.clip.sample_rate as f64).max(0.0);
+                if v.looping && frames > 0.0 {
+                    pos %= frames;
+                } else {
+                    pos = pos.min(frames);
+                }
+                v.pos = pos;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// A voice's playhead, in seconds into its clip.
     #[napi]
     pub fn voice_time(&self, voice: u32) -> Option<f64> {

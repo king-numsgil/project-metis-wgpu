@@ -25,6 +25,7 @@
   },
   "scripts": {
     "build": "napi build --platform --profile fastdev --no-const-enum",
+    "demo:audio": "bun run examples/audio-player.ts",
     "postbuild": "node scripts/prepend-dts-header.mjs",
     "build:debug": "napi build --platform --no-const-enum",
     "postbuild:debug": "node scripts/prepend-dts-header.mjs",

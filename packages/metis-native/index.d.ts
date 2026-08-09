@@ -262,6 +262,22 @@ export declare class AudioMixer {
   isVoiceActive(voice: number): boolean
   setVoiceGain(voice: number, gain: number): boolean
   setVoicePan(voice: number, pan: number): boolean
+  /**
+   * Move a voice's playhead, in seconds into its clip. Returns `false` if
+   * the voice has already ended.
+   *
+   * The counterpart to `voiceTime`. Without it the only way to scrub is to
+   * `stop()` and `play()` again with `startTime`, which mints a new voice ID
+   * and drops whatever gain and pan were set on the old one — fine for a
+   * sound effect, wrong for a music track a UI holds a handle to.
+   *
+   * Seeking a **looping** voice wraps, so a seek past the end lands where
+   * playback would actually have been. Seeking a non-looping voice past its
+   * end parks it at the end, and it is reaped on the next render — "seek to
+   * the end" and "finished" being the same thing is the least surprising
+   * reading.
+   */
+  seekVoice(voice: number, time: number): boolean
   /** A voice's playhead, in seconds into its clip. */
   voiceTime(voice: number): number | null
   get activeVoices(): number

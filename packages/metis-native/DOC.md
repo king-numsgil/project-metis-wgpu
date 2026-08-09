@@ -1079,6 +1079,7 @@ const voice = mixer.play(shot, {
 mixer.setVoiceGain(voice, 0.5)
 mixer.setVoicePan(voice, 0.7)
 mixer.voiceTime(voice)        // playhead in seconds, or null once it has ended
+mixer.seekVoice(voice, 42)    // move it; false if the voice already ended
 mixer.isVoiceActive(voice)
 mixer.stop(voice)
 mixer.stopAll()
@@ -1088,6 +1089,11 @@ mixer.masterGain = 0.6
 Voice IDs are **never reused**, so `isVoiceActive(id) === false` unambiguously
 means "that sound has finished". A voice holds its own reference to the clip's
 samples — dropping the `AudioClip` mid-playback is safe.
+
+`seekVoice` wraps on a looping voice and clamps to the end on a non-looping one
+(where "seek to the end" and "finished" are the same thing, so the voice is
+reaped on the next render). It returns `false` for a voice that has already
+ended — to scrub past that point, `play()` again with `startTime`.
 
 **Output is not clamped.** Sum enough loud voices and samples exceed ±1, and the
 driver hard-clips them. Duck with `masterGain`; there is no limiter, by design.
@@ -1177,6 +1183,22 @@ sdlInit(SdlInitFlag.Audio)
 frequency), `rms`, `peak`, `stereo`, `maxAbsDiff` — and `tests/helpers/wav-build.ts`
 writes fixture WAVs. Assert on *content*, not shape: almost every audio bug
 produces a buffer of the right length full of plausible floats.
+
+### …and hearing it, when you want to
+
+```powershell
+bun run demo:audio                              # the committed CC0 track
+bun run examples/audio-player.ts my-track.flac  # or your own
+```
+
+Arrow keys: up/down volume, left/right seek 10 s; space pauses, R restarts,
+Escape quits. It opens a small window purely to receive keyboard focus — **keep
+that window focused** or the keys go elsewhere — and prints its transport to the
+terminal.
+
+This covers the one thing the suite cannot: whether a *real* driver at a real
+buffer size keeps up. The tests run against SDL's `dummy` driver, so they prove
+the mix and the callback plumbing but never that audio comes out continuously.
 
 ### Not implemented
 

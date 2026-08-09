@@ -1343,6 +1343,26 @@ the audio thread plus a ring buffer, which is a different design from
 dropping an `AudioClip` mid-playback cannot pull memory out from under the audio
 thread. Pinned by a test that drops the handle and forces a GC.
 
+### `examples/` exists for what the suite structurally cannot check
+
+`examples/audio-player.ts` (`bun run demo:audio`) plays the committed track with
+arrow-key volume and seeking. It is a new directory rather than another script
+in `tests/`, because the things in `tests/` that aren't tests — `bench.ts`,
+`adapter-report.ts`, `audio-bench.ts` — are all non-interactive diagnostics, and
+an interactive demo filed among them would be found by nobody looking for a
+demo.
+
+Its purpose is specific: **the audio suite runs against SDL's `dummy` driver, so
+it can prove the mix and the callback plumbing but never that a real driver at a
+real buffer size keeps up.** Continuity under a live device is not assertable
+from inside the suite, and this is where it gets checked. A cheap signal that
+does not require ears: the transport clock must advance at wall-clock rate. If
+it drifts, the device is not being fed at the rate it asked for.
+
+If it stutters, suspect the callback's critical section in `mixer.rs` before
+suspecting the mix — the offline tests have already pinned the arithmetic
+sample-exactly, so a fault there would have failed them first.
+
 ### An audio handle outliving `sdlQuit()` corrupts the heap
 
 **`SDL_Quit` destroys SDL's own audio streams and closes its devices.** An

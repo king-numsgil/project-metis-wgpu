@@ -279,6 +279,57 @@ describe("voice lifecycle", () => {
     expect(m.voiceTime(9999)).toBeNull()
   })
 
+  test("seekVoice moves the playhead, forwards and backwards", () => {
+    const m = new AudioMixer({ sampleRate: RATE, channels: 1 })
+    const v = m.play(ramp(1000))
+
+    expect(m.seekVoice(v, 500 / RATE)).toBe(true)
+    let out = m.renderFrames(4)
+    expect(out[0]).toBeCloseTo(500, 3)
+
+    // Backwards too — a seek that only ever moved forward would pass a
+    // scrub-to-the-right test and fail every rewind.
+    expect(m.seekVoice(v, 100 / RATE)).toBe(true)
+    out = m.renderFrames(4)
+    expect(out[0]).toBeCloseTo(100, 3)
+
+    expect(m.voiceTime(v)).toBeCloseTo(104 / RATE, 6)
+  })
+
+  test("seekVoice clamps rather than reading out of bounds", () => {
+    const m = new AudioMixer({ sampleRate: RATE, channels: 1 })
+    const v = m.play(ramp(1000))
+
+    // Negative clamps to the start.
+    expect(m.seekVoice(v, -5)).toBe(true)
+    expect(m.voiceTime(v)).toBe(0)
+
+    // Past the end parks at the end, and the voice is reaped on the next
+    // render — "seek to the end" and "finished" being the same thing.
+    expect(m.seekVoice(v, 999)).toBe(true)
+    expect(peak(m.renderFrames(16))).toBe(0)
+    expect(m.isVoiceActive(v)).toBe(false)
+  })
+
+  test("seeking a looping voice wraps", () => {
+    const m = new AudioMixer({ sampleRate: RATE, channels: 1 })
+    const v = m.play(ramp(100), { loop: true })
+
+    // 250 frames into a 100-frame loop is frame 50, not the end.
+    expect(m.seekVoice(v, 250 / RATE)).toBe(true)
+    const out = m.renderFrames(4)
+    expect(out[0]).toBeCloseTo(50, 3)
+    expect(m.isVoiceActive(v)).toBe(true)
+  })
+
+  test("seekVoice reports failure on a dead voice and rejects nonsense", () => {
+    const m = new AudioMixer({ sampleRate: RATE, channels: 1 })
+    const v = m.play(ramp(100))
+    expect(m.seekVoice(999, 0)).toBe(false)
+    expect(m.seekVoice(v, Number.NaN)).toBe(false)
+    expect(m.seekVoice(v, Number.POSITIVE_INFINITY)).toBe(false)
+  })
+
   test("startTime skips into the clip", () => {
     const m = new AudioMixer({ sampleRate: RATE, channels: 1 })
     m.play(ramp(1000), { startTime: 100 / RATE })
