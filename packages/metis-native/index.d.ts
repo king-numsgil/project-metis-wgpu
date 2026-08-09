@@ -1594,7 +1594,33 @@ export interface AudioFileInfo {
 
 /** A device's or stream's current format, as reported by SDL. */
 export interface AudioFormatInfo {
-  /** SDL's own name for the format, e.g. `"SDL_AUDIO_F32LE"`. */
+  /**
+   * SDL's own name for the format, e.g. `"SDL_AUDIO_F32LE"`.
+   *
+   * **A string, while formats are *set* with the `SdlAudioFormat` enum. That
+   * asymmetry is deliberate — don't "fix" it without reading this.**
+   *
+   * The two directions do not have the same domain. `SdlAudioFormat` is a
+   * deliberately *narrowed* set: native-endian only, five members, because
+   * the big-endian variants exist for reading foreign files (the decoder's
+   * job, not the device's) and offering them would only be a way to get byte
+   * order wrong on a desktop target. But a *device* may report anything SDL
+   * supports, including those variants and whatever a future SDL adds. The
+   * reportable domain is strictly wider than the settable one.
+   *
+   * So an enum here would have to be either `Option<SdlAudioFormat>` —
+   * forcing every caller to handle a `null` that means "a real format we
+   * chose not to name" — or a widened enum that re-adds exactly the members
+   * that were excluded on purpose. Both are worse than a string for what
+   * this field is actually for: showing a human what the hardware settled
+   * on. Nothing branches on it, and nothing should; to *decide* something,
+   * compare `channels`/`freq`, or just send f32 and let SDL convert.
+   *
+   * Raised as a possible defect and kept as-is by an explicit call
+   * (2026-08-08). If it ever does need to be machine-readable, add a second
+   * typed field rather than changing this one — the human-readable name is
+   * the useful part and callers will already be printing it.
+   */
   format: string
   channels: number
   freq: number

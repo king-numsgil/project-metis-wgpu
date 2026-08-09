@@ -1111,6 +1111,9 @@ import { sdlInit, SdlInitFlag, sdlGetAudioPlaybackDevices } from "metis-native"
 sdlInit(SdlInitFlag.Audio)
 
 const devices = sdlGetAudioPlaybackDevices()   // [{ id, name, format, bufferFrames }]
+// device.format.format is a display string ("SDL_AUDIO_F32LE"), not SdlAudioFormat —
+// a device can report formats outside that enum. Don't branch on it; SDL converts
+// whatever you send. See CLAUDE.md if that asymmetry looks like a bug.
 
 mixer.openDevice()            // or openDevice(devices[0].id)
 mixer.resume()                // devices start PAUSED — queue voices first

@@ -1363,6 +1363,31 @@ If it stutters, suspect the callback's critical section in `mixer.rs` before
 suspecting the mix — the offline tests have already pinned the arithmetic
 sample-exactly, so a fault there would have failed them first.
 
+### `AudioFormatInfo.format` is a string on purpose
+
+Formats are *set* with the `SdlAudioFormat` enum and *read back* as a string
+(`"SDL_AUDIO_F32LE"`). That looks like the "requestable but not reportable"
+asymmetry the `convert.rs` FEATURES note warns about, and it was raised as one —
+then kept, by an explicit call (2026-08-08), because the two directions do not
+share a domain. `SdlAudioFormat` is deliberately narrowed to five native-endian
+members; a *device* can report anything SDL supports, including the big-endian
+variants that were excluded on purpose. Typing the report would mean either an
+`Option` whose `null` means "a real format we declined to name", or widening the
+enum back to the set that was narrowed deliberately.
+
+The distinction from the `convert.rs` case is that there, both directions
+described the *same* closed set and drifting apart was a bug. Here the
+reportable set is genuinely larger than the settable one.
+
+Note this is **not** the SDL-vs-symphonia split it can look like from outside.
+`AudioFormatInfo.format` is SDL's, from `SDL_GetAudioFormatName`.
+`AudioFileInfo.container`/`.codec` are symphonia's, and are strings for an
+unrelated reason: symphonia's codec registry is open-ended and grows with
+feature flags, so an enum would be a closed set over an open one.
+
+If a caller ever needs to branch on the device format, add a second typed field
+rather than changing this one.
+
 ### An audio handle outliving `sdlQuit()` corrupts the heap
 
 **`SDL_Quit` destroys SDL's own audio streams and closes its devices.** An
