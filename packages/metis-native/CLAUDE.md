@@ -1576,6 +1576,31 @@ Errors from Steam Audio mid-render **drop the voice and increment
 to and must not panic across the C boundary; silence from one sound beats a dead
 process, and the counter is what makes it diagnosable.
 
+### Known limits of the current HRTF, and the one fix that matters
+
+Confirmed by listening, 2026-08-09: a source **behind** localises clearly, while
+one **ahead** tends to collapse into the middle of the head. Neither is a bug,
+and both are worth writing down so they are not re-diagnosed as one.
+
+- **In-head imaging comes from rendering the direct path only.** Externalisation
+  is driven mostly by *early reflections* — the brain uses the room to decide a
+  sound is outside the skull. There are none here: no reflections, no reverb.
+  This is the textbook result of a dry HRTF, and **adding reflections is the
+  single biggest improvement available.** Steam Audio supports them, but they
+  need scene geometry, so it is a real feature rather than a flag. Agreed as
+  future work, deliberately not done now.
+- **Front/back confusion is inherent to a generic HRTF.** Telling ahead from
+  behind leans hardest on the shape of the listener's own outer ear, and this is
+  an averaged measurement from someone else's. The two things that resolve it
+  are head tracking and an individualised HRTF (`audionimbus` can load a SOFA
+  file via `HrtfSettings.sofa_information`). Both are out of scope for now.
+
+**`HrtfInterpolation::Bilinear` is not the answer to either**, despite being the
+one-word change nearest to hand. It smooths direction changes on a moving
+source; it does nothing for externalisation or front/back, and Valve's own
+guidance points it at sustained wide-band sounds rather than transients. Left on
+`Nearest` on purpose.
+
 ### Testing 3D audio without ears: assert the time difference, not the level
 
 Panning already makes a source louder on one side, so an interaural *level*
