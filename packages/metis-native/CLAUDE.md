@@ -1512,25 +1512,70 @@ test signal is excellent for pitch and useless for latency.
 
 Still uncovered: Opus, and the ADTS (bare `.aac`) container.
 
-### Positional audio: deferred, and the seam it plugs into
+### Spatial audio: the one accepted C++ dependency
 
-Steam Audio via the `audionimbus` crate is the intended route. It is **not**
-wired up, and the reason is a build-environment cost rather than a design
-objection: `audionimbus-sys` runs `bindgen` (so `libclang.dll` must be on the
-build machine — this one has no LLVM and no Visual Studio LLVM component) and
-its `auto-install` feature downloads a prebuilt `phonon` shared library from
-Valve's GitHub releases at build time, which then has to ship next to the
-`.node`. That is a toolchain requirement and a runtime artefact this package
-otherwise does not have.
+`audio/spatial.rs` renders mono sources through Steam Audio's HRTF, via
+`audionimbus`. `DOC.md` §9c covers the API.
 
-The seam is already there, so this is a bounded change when it happens:
-`Voice::pan_gains` is the *only* thing turning a source into per-channel gains,
-and `render_into`'s per-voice inner loop is where an HRTF convolution would go.
-A voice would gain a position, and the two-gain result would become a filtered
-stereo pair.
+**This knowingly breaks the pure-Rust rule that removed SDL3_image**, and the
+distinction that made it acceptable is worth stating: SDL3_image was a
+*decoder*, so untrusted asset bytes reached C parsing code, and a malformed PNG
+smashed the allocator. Steam Audio receives only f32 buffers this crate produced
+plus a direction vector — no file parsing, no attacker-controlled input. The
+alternative was not "write a pure-Rust HRTF renderer", it was "ship stereo
+panning and call it spatial audio".
 
-If it is picked up: gate it behind a cargo feature rather than making it
-unconditional, so a machine without libclang can still build this crate.
+Two costs, both real and both paid at *build* time by anyone building this
+crate: `audionimbus-sys` runs **bindgen** (libclang on the machine), and
+`auto-install` downloads a 173 MB Steam Audio release to extract a **~51 MB
+`phonon.dll`**.
+
+**That DLL is a load-time dependency of the `.node`, not an optional extra.**
+Without it beside the binary, `require()` fails outright — and napi reports it
+as its generic "Cannot find native binding … npm has a bug related to optional
+dependencies" message, which points nowhere near the cause. `scripts/copy-phonon.mjs`
+runs in `postbuild` to place it, and exists chiefly so that confusion does not
+recur. It is currently **gitignored**, so a fresh clone must build once before
+the addon loads — a deliberate departure from this repo's "commit the binary so
+it just works" habit, taken because a 51 MB blob per platform is permanent in
+git history and this repo has already paid for one `git filter-branch`.
+
+**Panning and HRTF are different features, not two settings of one.**
+`Voice::pan_gains` still handles `play`; `playSpatial` bypasses it entirely.
+Spatial voices take a *block-based* path through `render_into` because Steam
+Audio processes a fixed frame size, which is why `SpatialVoice` owns a FIFO and
+why spatial voices are reaped by an `alive` flag rather than by comparing the
+playhead to the clip length — their playhead runs a block ahead of what has been
+heard, so the old rule would cut the convolution tail off.
+
+Errors from Steam Audio mid-render **drop the voice and increment
+`spatialErrors`** rather than propagating. The audio thread has nowhere to throw
+to and must not panic across the C boundary; silence from one sound beats a dead
+process, and the counter is what makes it diagnosable.
+
+### Testing 3D audio without ears: assert the time difference, not the level
+
+Panning already makes a source louder on one side, so an interaural *level*
+difference proves nothing. What distinguishes a real HRTF is the interaural
+*time* difference: the near ear hears it first, by up to ~700 µs. **Panning
+produces a lag of exactly zero.**
+
+`audio-spatial.test.ts` measures it with `crossCorrelationLag` and gets ~33
+samples at 48 kHz (≈690 µs) for a source at 90°, mirrored for the opposite side,
+and ≈0 straight ahead. Distance follows inverse-distance exactly — ten times the
+distance, one tenth the level.
+
+**The stimulus is white noise, and that is load-bearing.** A periodic signal only
+determines lag modulo its period, so a tone would make the ITD measurement
+meaningless — the same trap that produced a bogus 1724-sample reading when
+measuring AAC's encoder delay. The test also verifies `crossCorrelationLag`
+against a known delay first, because a helper that returned 0 unconditionally
+would make every ITD assertion vacuous.
+
+**Front/back symmetry is deliberately not asserted.** Measured HRTFs come from
+real heads, which are not symmetric; a source straight ahead reads about 0.14
+against 0.18. What *is* asserted is that one placement matches its own mirror,
+which holds even for an asymmetric head.
 
 ### Formats deliberately not supported (yet)
 

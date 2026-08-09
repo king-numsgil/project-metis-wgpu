@@ -263,6 +263,40 @@ export declare class AudioMixer {
   setVoiceGain(voice: number, gain: number): boolean
   setVoicePan(voice: number, pan: number): boolean
   /**
+   * Play a clip placed in 3D, spatialised with an HRTF.
+   *
+   * Unlike `play`, this gives real localisation: the sound reaches the near
+   * ear first and is filtered by the shape of the head and outer ear, which
+   * is what lets a listener point at it. `pan` plays no part here — position
+   * does the work.
+   *
+   * Requires a **mono** clip, a **stereo** mixer, and a mixer rate of 44100
+   * or 48000. The HRTF is built on the first call and is slow (tens of
+   * milliseconds) — do it while loading, not mid-scene.
+   */
+  playSpatial(clip: AudioClip, options: SpatialPlayOptions): number
+  /**
+   * Move a spatial voice. Returns `false` if the voice has ended, or is not
+   * a spatial one.
+   */
+  setVoicePosition(voice: number, x: number, y: number, z: number): boolean
+  /**
+   * Place and orient the listener. Every spatial voice is rendered relative
+   * to it.
+   */
+  setListener(listener: ListenerOptions): void
+  /**
+   * Whether this mixer has an HRTF loaded — i.e. `playSpatial` has succeeded
+   * at least once.
+   */
+  get spatialActive(): boolean
+  /**
+   * How many times Steam Audio failed mid-render. Non-zero means spatial
+   * voices were dropped: the audio thread cannot throw, so this counter is
+   * the only evidence. Expected to stay at zero.
+   */
+  get spatialErrors(): number
+  /**
    * Move a voice's playhead, in seconds into its clip. Returns `false` if
    * the voice has already ended.
    *
@@ -3256,6 +3290,15 @@ export interface Ktx2LoadOptions {
   usage?: number
 }
 
+export interface ListenerOptions {
+  /** Defaults to the origin. */
+  position?: Array<number>
+  /** Facing direction. Defaults to `[0, 0, -1]`. */
+  forward?: Array<number>
+  /** Up vector. Defaults to `[0, 1, 0]`. */
+  up?: Array<number>
+}
+
 /**
  * Decode an audio file into memory. Decoding runs on a worker thread.
  *
@@ -4300,6 +4343,24 @@ export declare enum SdlWindowFlag {
   AlwaysOnTop = 65536,
   KeyboardGrabbed = 1048576,
   Transparent = 1073741824
+}
+
+export interface SpatialPlayOptions {
+  /**
+   * World position as `[x, y, z]`. Right-handed, -Z forward, +Y up — the same
+   * convention as glTF, so a scene-graph transform drops straight in.
+   */
+  position: Array<number>
+  /** Linear gain, applied before distance attenuation. Defaults to 1. */
+  gain?: number
+  loop?: boolean
+  rate?: number
+  startTime?: number
+  /**
+   * Distance at which the source plays at full gain; beyond it the level
+   * falls as `refDistance / distance`. Defaults to 1.
+   */
+  refDistance?: number
 }
 
 export interface SurfaceConfiguration {

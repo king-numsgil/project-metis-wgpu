@@ -26,11 +26,11 @@
   "scripts": {
     "build": "napi build --platform --profile fastdev --no-const-enum",
     "demo:audio": "bun run examples/audio-player.ts",
-    "postbuild": "node scripts/prepend-dts-header.mjs",
+    "postbuild": "node scripts/prepend-dts-header.mjs && node scripts/copy-phonon.mjs",
     "build:debug": "napi build --platform --no-const-enum",
-    "postbuild:debug": "node scripts/prepend-dts-header.mjs",
+    "postbuild:debug": "node scripts/prepend-dts-header.mjs && node scripts/copy-phonon.mjs",
     "build:release": "napi build --platform --release --no-const-enum",
-    "postbuild:release": "node scripts/prepend-dts-header.mjs",
+    "postbuild:release": "node scripts/prepend-dts-header.mjs && node scripts/copy-phonon.mjs",
     "version": "napi version"
   },
   "devDependencies": {

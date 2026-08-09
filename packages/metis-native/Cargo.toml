@@ -54,6 +54,20 @@ percent-encoding = "2"
 # a compile-time cost only, and a game that can't open the file the artist
 # handed it is a worse trade than a slightly longer link.
 symphonia = { version = "0.6", features = ["all"] }
+# Steam Audio, for HRTF binaural rendering. The one place this crate knowingly
+# takes on a C++ dependency, and it is not a small one:
+#
+#   - `audionimbus-sys` runs **bindgen** at build time, so the build machine
+#     needs libclang (`winget install LLVM.LLVM`).
+#   - `auto-install` downloads Valve's prebuilt Steam Audio release at build
+#     time (curl or wget) and links `phonon` dynamically — so `phonon.dll` must
+#     sit next to the `.node` at *runtime*, not just at link time.
+#
+# Both are real costs and both were the reason this was deferred when the audio
+# module first landed. Accepted deliberately: there is no pure-Rust HRTF
+# renderer of comparable quality, and hand-rolling one is a research project,
+# not a feature. See `audio/spatial.rs`.
+audionimbus = { version = "0.16", default-features = false, features = ["auto-install"] }
 
 [build-dependencies]
 napi-build = "2"

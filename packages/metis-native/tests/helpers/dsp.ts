@@ -132,6 +132,54 @@ export function goertzel(x: ArrayLike<number>, sampleRate: number, freq: number)
 }
 
 /**
+ * The lag, in samples, at which `b` best matches `a`.
+ *
+ * Positive means `b` is *delayed* relative to `a`. Used to measure the
+ * interaural time difference an HRTF produces: a source to the right reaches
+ * the right ear roughly 700 µs before the left, which is ~33 samples at 48 kHz,
+ * and that delay is the thing that distinguishes real binaural rendering from
+ * stereo panning — panning gives a lag of exactly zero.
+ *
+ * **The signal must be aperiodic.** A tone repeats, so correlation only
+ * determines the lag modulo its period and this returns whichever multiple
+ * happened to score best. Use noise or an impulse. (This is not hypothetical:
+ * the same mistake produced a bogus 1724-sample reading when measuring AAC's
+ * encoder delay — see `audio-codecs.test.ts`.)
+ */
+export function crossCorrelationLag(
+  a: ArrayLike<number>,
+  b: ArrayLike<number>,
+  maxLag = 64,
+): number {
+  let best = 0
+  let bestScore = -Infinity
+  for (let d = -maxLag; d <= maxLag; d++) {
+    let sum = 0
+    for (let i = maxLag; i < a.length - maxLag; i++) sum += a[i]! * b[i + d]!
+    if (sum > bestScore) {
+      bestScore = sum
+      best = d
+    }
+  }
+  return best
+}
+
+/**
+ * Deterministic white noise. Aperiodic (over any window shorter than the LCG's
+ * period), so it is the right stimulus for `crossCorrelationLag`, and seeded so
+ * a failure reproduces.
+ */
+export function noise(frames: number, seed = 12345, amplitude = 1): Float32Array {
+  let state = seed >>> 0
+  const out = new Float32Array(frames)
+  for (let i = 0; i < frames; i++) {
+    state = (Math.imul(state, 1664525) + 1013904223) >>> 0
+    out[i] = ((state / 4294967296) * 2 - 1) * amplitude
+  }
+  return out
+}
+
+/**
  * Which of `candidates` carries the most energy. Used to assert that a
  * resampled or rate-shifted signal landed on the pitch it should have, without
  * assuming anything about the ones it shouldn't.

@@ -94,11 +94,11 @@ pub use image::{
 // Pure-Rust decoding via symphonia (same rule as the image loaders), a software
 // mixer whose one render function serves both the offline and the device path,
 // and the SDL3 stream/device bindings underneath. See `audio/mod.rs` for the
-// layering and for why positional audio isn't here yet.
+// layering, and `audio/spatial.rs` for the HRTF path and its C++ dependency.
 
 pub use audio::{
     AudioClip, AudioDeviceInfo, AudioFileInfo, AudioFormatInfo, AudioLoadOptions, AudioMixer,
-    AudioMixerOptions, AudioPlayOptions, SdlAudioFormat, SdlAudioSpecJs, SdlAudioStream,
+    AudioMixerOptions, AudioPlayOptions, ListenerOptions, SpatialPlayOptions, SdlAudioFormat, SdlAudioSpecJs, SdlAudioStream,
     decode_audio_clip, inspect_audio_file, load_audio_clip, sdl_create_audio_stream,
     sdl_get_audio_drivers, sdl_get_audio_playback_devices, sdl_get_audio_recording_devices,
     sdl_get_current_audio_driver,

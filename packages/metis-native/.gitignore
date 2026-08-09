@@ -131,3 +131,9 @@ Cargo.lock
 
 # Downloaded Khronos glTF sample assets — re-fetched on demand.
 tests/assets-cache/
+
+# Steam Audio runtime library, copied next to the .node by scripts/copy-phonon.mjs
+# during `bun run build`. ~51 MB; see CLAUDE.md on whether this should be tracked.
+phonon.dll
+libphonon.so
+libphonon.dylib

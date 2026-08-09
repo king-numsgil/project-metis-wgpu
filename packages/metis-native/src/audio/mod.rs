@@ -22,16 +22,14 @@
 //!   and the real audio callback but binds no device, so the frames SDL pulls
 //!   through the production path can be compared against `renderFrames`.
 //!
-//! ## Not here yet
+//! ## Spatial audio
 //!
-//! **Positional/binaural audio.** The intended route is Steam Audio via the
-//! `audionimbus` crate, and the seam it plugs into already exists: `Voice`'s
-//! `pan_gains` is the only thing turning a source into per-channel gains, and
-//! `render_into`'s per-voice inner loop is where an HRTF convolution would go.
-//! It is not wired up because `audionimbus-sys` needs `bindgen` (so libclang on
-//! the build machine) plus a prebuilt `phonon` shared library downloaded from
-//! Valve at build time — a toolchain and a runtime artefact this package does
-//! not otherwise require. Deferred, not rejected.
+//! `spatial.rs` adds HRTF binaural rendering via Steam Audio, so a mono source
+//! can be *placed* rather than merely panned — the near ear hears it first, and
+//! the head and outer ear filter it by direction. It is the one place this
+//! package takes a C++ dependency, and the trade is argued in that file.
+//!
+//! ## Not here yet
 //!
 //! **Streaming playback.** `AudioClip` is a fully resident buffer, so a long
 //! music bed costs its whole decoded size in RAM. See `decode.rs`.
@@ -42,6 +40,7 @@ mod clip;
 mod decode;
 mod device;
 mod mixer;
+mod spatial;
 
 pub use clip::AudioClip;
 pub use decode::{
@@ -52,4 +51,6 @@ pub use device::{
     sdl_get_audio_recording_devices, sdl_get_current_audio_driver, AudioDeviceInfo,
     AudioFormatInfo, SdlAudioFormat, SdlAudioSpecJs, SdlAudioStream,
 };
-pub use mixer::{AudioMixer, AudioMixerOptions, AudioPlayOptions};
+pub use mixer::{
+    AudioMixer, AudioMixerOptions, AudioPlayOptions, ListenerOptions, SpatialPlayOptions,
+};

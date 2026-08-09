@@ -55,6 +55,7 @@ use sdl3_sys::audio::{
 
 use super::clip::{AudioClip, ClipData};
 use super::device::{audio_subsystem_alive, sdl_err};
+use super::spatial::{read_mono_block, Listener, SpatialEngine, SpatialVoice};
 
 /// Largest number of frames one `renderFrames`/`capture` call will produce.
 /// A guard against a typo'd argument asking for a multi-gigabyte allocation,
@@ -72,9 +73,20 @@ struct Voice {
     /// Clip frames consumed per output frame: `clip_rate / mixer_rate * rate`.
     step: f64,
     gain: f32,
-    /// -1 hard left, 0 centre, +1 hard right.
+    /// -1 hard left, 0 centre, +1 hard right. Ignored by a spatial voice, whose
+    /// placement comes from its position and the HRTF instead.
     pan: f32,
     looping: bool,
+    /// Present for a voice placed in 3D. Its existence is what routes the voice
+    /// down the block-based HRTF path in `render_into`.
+    spatial: Option<Box<SpatialVoice>>,
+    /// Spatial voices only: the clip has been fully fed to the effect. The voice
+    /// stays alive after this until the effect's tail has drained.
+    exhausted: bool,
+    /// Spatial voices only: still producing audio. Ordinary voices are reaped by
+    /// comparing `pos` against the clip length, which a spatial voice cannot use
+    /// because its playhead runs a block ahead of what has been heard.
+    alive: bool,
 }
 
 impl Voice {
@@ -128,6 +140,42 @@ impl Voice {
         let b = self.clip.sample(i1, channel);
         a + (b - a) * frac
     }
+
+    /// Render this voice through the HRTF into an interleaved stereo buffer.
+    ///
+    /// The scalars are copied into locals and written back afterwards rather
+    /// than borrowed in place: the closure feeding the effect needs the clip and
+    /// the playhead at the same time as the effect needs `&mut` access to its
+    /// own state, and both live on `self`. Copying three numbers is cheaper than
+    /// restructuring the type to satisfy the borrow checker.
+    fn render_spatial(
+        &mut self,
+        out: &mut [f32],
+        engine: &SpatialEngine,
+        listener: &Listener,
+    ) -> napi::Result<bool> {
+        let mut sp = match self.spatial.take() {
+            Some(sp) => sp,
+            None => return Ok(false),
+        };
+        let clip = Arc::clone(&self.clip);
+        let (mut pos, step, looping, gain) = (self.pos, self.step, self.looping, self.gain);
+        let mut exhausted = self.exhausted;
+
+        let result = sp.render_into(
+            out,
+            listener,
+            gain,
+            engine.hrtf(),
+            |block| read_mono_block(&clip, &mut pos, step, looping, block),
+            &mut exhausted,
+        );
+
+        self.pos = pos;
+        self.exhausted = exhausted;
+        self.spatial = Some(sp);
+        result
+    }
 }
 
 // ── Mixer state ───────────────────────────────────────────────────────────────
@@ -139,6 +187,13 @@ pub struct MixerState {
     sample_rate: u32,
     channels: u32,
     frames_rendered: u64,
+    /// Created lazily on the first spatial `play` — building an HRTF is
+    /// expensive and most mixers never need one.
+    spatial_engine: Option<SpatialEngine>,
+    listener: Listener,
+    /// Incremented when Steam Audio fails mid-render. The audio thread cannot
+    /// propagate an error, so the voice is dropped and this is left as evidence.
+    spatial_errors: u64,
     /// Reused by the device callback so a real-time fill allocates nothing
     /// once it has warmed up.
     scratch: Vec<f32>,
@@ -158,7 +213,35 @@ impl MixerState {
         }
         let frames = out.len() / channels;
 
+        // Disjoint field borrows: the engine is read-only here while the voices
+        // are mutated, which the compiler accepts because they are separate
+        // fields of `self`.
+        let listener = self.listener;
+        let mut spatial_errors = 0u64;
+        if let Some(engine) = self.spatial_engine.as_ref() {
+            for voice in self.voices.iter_mut() {
+                if voice.spatial.is_none() {
+                    continue;
+                }
+                match voice.render_spatial(out, engine, &listener) {
+                    Ok(alive) => voice.alive = alive,
+                    // The audio thread has nowhere to report an error to, and
+                    // must not panic across the C boundary. Drop the voice and
+                    // leave a count behind — silence from one sound beats a
+                    // dead process, and `spatialErrors` makes it diagnosable.
+                    Err(_) => {
+                        voice.alive = false;
+                        spatial_errors += 1;
+                    }
+                }
+            }
+        }
+        self.spatial_errors += spatial_errors;
+
         for voice in self.voices.iter_mut() {
+            if voice.spatial.is_some() {
+                continue;
+            }
             let (pan_l, pan_r) = voice.pan_gains();
             let gain = voice.gain;
             let clip_frames = voice.clip.frames;
@@ -221,7 +304,17 @@ impl MixerState {
 
         // A finished voice is dropped, not parked — voice IDs are never reused,
         // so "no voice with this ID" is an unambiguous "it ended".
-        self.voices.retain(|v| v.looping || v.pos < v.clip.frames as f64);
+        //
+        // Spatial voices use their own liveness flag: their playhead runs a
+        // block ahead of what has been heard, so comparing `pos` to the clip
+        // length would cut the HRTF's tail off.
+        self.voices.retain(|v| {
+            if v.spatial.is_some() {
+                v.alive
+            } else {
+                v.looping || v.pos < v.clip.frames as f64
+            }
+        });
 
         let master = self.master_gain;
         if master != 1.0 {
@@ -331,6 +424,41 @@ pub struct AudioPlayOptions {
     pub rate: Option<f64>,
     /// Start this many seconds into the clip. Defaults to 0.
     pub start_time: Option<f64>,
+}
+
+#[napi(object)]
+pub struct SpatialPlayOptions {
+    /// World position as `[x, y, z]`. Right-handed, -Z forward, +Y up — the same
+    /// convention as glTF, so a scene-graph transform drops straight in.
+    pub position: Vec<f64>,
+    /// Linear gain, applied before distance attenuation. Defaults to 1.
+    pub gain: Option<f64>,
+    pub loop_: Option<bool>,
+    pub rate: Option<f64>,
+    pub start_time: Option<f64>,
+    /// Distance at which the source plays at full gain; beyond it the level
+    /// falls as `refDistance / distance`. Defaults to 1.
+    pub ref_distance: Option<f64>,
+}
+
+#[napi(object)]
+pub struct ListenerOptions {
+    /// Defaults to the origin.
+    pub position: Option<Vec<f64>>,
+    /// Facing direction. Defaults to `[0, 0, -1]`.
+    pub forward: Option<Vec<f64>>,
+    /// Up vector. Defaults to `[0, 1, 0]`.
+    pub up: Option<Vec<f64>>,
+}
+
+fn vec3(v: &[f64], what: &str) -> napi::Result<[f32; 3]> {
+    if v.len() != 3 || !v.iter().all(|c| c.is_finite()) {
+        return Err(napi::Error::new(
+            napi::Status::InvalidArg,
+            format!("{what} must be three finite numbers"),
+        ));
+    }
+    Ok([v[0] as f32, v[1] as f32, v[2] as f32])
 }
 
 /// A software mixer. Holds voices, renders frames, and optionally drives an
@@ -450,6 +578,9 @@ impl AudioMixer {
                 sample_rate,
                 channels,
                 frames_rendered: 0,
+                spatial_engine: None,
+                listener: Listener::default(),
+                spatial_errors: 0,
                 scratch: Vec::new(),
             })),
             bound: None,
@@ -495,7 +626,18 @@ impl AudioMixer {
 
         let id = state.next_voice_id;
         state.next_voice_id = state.next_voice_id.wrapping_add(1).max(1);
-        state.voices.push(Voice { id, clip: clip_data, pos, step, gain, pan, looping });
+        state.voices.push(Voice {
+            id,
+            clip: clip_data,
+            pos,
+            step,
+            gain,
+            pan,
+            looping,
+            spatial: None,
+            exhausted: false,
+            alive: true,
+        });
         Ok(id)
     }
 
@@ -549,6 +691,156 @@ impl AudioMixer {
             }
             None => false,
         }
+    }
+
+    /// Play a clip placed in 3D, spatialised with an HRTF.
+    ///
+    /// Unlike `play`, this gives real localisation: the sound reaches the near
+    /// ear first and is filtered by the shape of the head and outer ear, which
+    /// is what lets a listener point at it. `pan` plays no part here — position
+    /// does the work.
+    ///
+    /// Requires a **mono** clip, a **stereo** mixer, and a mixer rate of 44100
+    /// or 48000. The HRTF is built on the first call and is slow (tens of
+    /// milliseconds) — do it while loading, not mid-scene.
+    #[napi]
+    pub fn play_spatial(
+        &mut self,
+        clip: &AudioClip,
+        options: SpatialPlayOptions,
+    ) -> napi::Result<u32> {
+        let position = vec3(&options.position, "position")?;
+        let gain = options.gain.unwrap_or(1.0);
+        let rate = options.rate.unwrap_or(1.0);
+        let start_time = options.start_time.unwrap_or(0.0);
+        let ref_distance = options.ref_distance.unwrap_or(1.0);
+        let looping = options.loop_.unwrap_or(false);
+
+        if !(rate.is_finite() && rate > 0.0) {
+            return Err(napi::Error::new(
+                napi::Status::InvalidArg,
+                format!("playSpatial: rate must be finite and greater than zero, got {rate}"),
+            ));
+        }
+        if !gain.is_finite()
+            || !start_time.is_finite()
+            || !ref_distance.is_finite()
+            || ref_distance <= 0.0
+        {
+            return Err(napi::Error::new(
+                napi::Status::InvalidArg,
+                "playSpatial: gain and startTime must be finite, and refDistance must be > 0",
+            ));
+        }
+        // A stereo source already carries its own left/right image, which fights
+        // any attempt to place it — the HRTF would be filtering a stereo field as
+        // though it came from one point. Rejected rather than silently
+        // downmixed, because a silent downmix discards the caller's stereo mix
+        // without saying so.
+        if clip.inner.channels != 1 {
+            return Err(napi::Error::new(
+                napi::Status::InvalidArg,
+                format!(
+                    "playSpatial needs a mono clip; this one has {} channels. Load it with \
+                     `forceMono: true`, or use play() with a pan.",
+                    clip.inner.channels
+                ),
+            ));
+        }
+
+        let mut state = self.lock();
+        if state.channels != 2 {
+            return Err(napi::Error::new(
+                napi::Status::InvalidArg,
+                format!(
+                    "playSpatial needs a stereo mixer; this one has {} output channels",
+                    state.channels
+                ),
+            ));
+        }
+        if state.spatial_engine.is_none() {
+            let engine = SpatialEngine::new(state.sample_rate)?;
+            state.spatial_engine = Some(engine);
+        }
+        let spatial = {
+            let engine = state.spatial_engine.as_ref().expect("just created");
+            Box::new(SpatialVoice::new(engine, position, ref_distance as f32)?)
+        };
+
+        let clip_data = Arc::clone(&clip.inner);
+        let step = clip_data.sample_rate as f64 / state.sample_rate as f64 * rate;
+        let pos = (start_time.max(0.0) * clip_data.sample_rate as f64).min(clip_data.frames as f64);
+
+        let id = state.next_voice_id;
+        state.next_voice_id = state.next_voice_id.wrapping_add(1).max(1);
+        state.voices.push(Voice {
+            id,
+            clip: clip_data,
+            pos,
+            step,
+            gain: gain as f32,
+            pan: 0.0,
+            looping,
+            spatial: Some(spatial),
+            exhausted: false,
+            alive: true,
+        });
+        Ok(id)
+    }
+
+    /// Move a spatial voice. Returns `false` if the voice has ended, or is not
+    /// a spatial one.
+    #[napi]
+    pub fn set_voice_position(&mut self, voice: u32, x: f64, y: f64, z: f64) -> bool {
+        if !(x.is_finite() && y.is_finite() && z.is_finite()) {
+            return false;
+        }
+        let mut state = self.lock();
+        match state.voices.iter_mut().find(|v| v.id == voice) {
+            Some(v) => match v.spatial.as_mut() {
+                Some(sp) => {
+                    sp.position = [x as f32, y as f32, z as f32];
+                    true
+                }
+                None => false,
+            },
+            None => false,
+        }
+    }
+
+    /// Place and orient the listener. Every spatial voice is rendered relative
+    /// to it.
+    #[napi]
+    pub fn set_listener(&mut self, listener: ListenerOptions) -> napi::Result<()> {
+        let position = match &listener.position {
+            Some(p) => vec3(p, "listener position")?,
+            None => [0.0; 3],
+        };
+        let forward = match &listener.forward {
+            Some(f) => vec3(f, "listener forward")?,
+            None => [0.0, 0.0, -1.0],
+        };
+        let up = match &listener.up {
+            Some(u) => vec3(u, "listener up")?,
+            None => [0.0, 1.0, 0.0],
+        };
+        self.lock().listener = Listener { position, forward, up };
+        Ok(())
+    }
+
+    /// Whether this mixer has an HRTF loaded — i.e. `playSpatial` has succeeded
+    /// at least once.
+    #[napi(getter)]
+    pub fn spatial_active(&self) -> bool {
+        self.lock().spatial_engine.is_some()
+    }
+
+    /// How many times Steam Audio failed mid-render. Non-zero means spatial
+    /// voices were dropped: the audio thread cannot throw, so this counter is
+    /// the only evidence. Expected to stay at zero.
+    #[napi(getter)]
+    pub fn spatial_errors(&self) -> i64 {
+        self.lock().spatial_errors as i64
     }
 
     /// Move a voice's playhead, in seconds into its clip. Returns `false` if

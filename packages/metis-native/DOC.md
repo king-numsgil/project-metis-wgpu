@@ -1215,8 +1215,57 @@ prefer FLAC or Vorbis, or trim the head yourself.
 
 ### Not implemented
 
-Positional/binaural audio (Steam Audio is the intended route — see `CLAUDE.md`),
-streaming decode, recording, and surround output beyond the front pair.
+Streaming decode, recording, and surround output beyond the front pair.
+
+---
+
+## 9c. Spatial audio — HRTF placement
+
+`play()` pans; `playSpatial()` **places**. The difference is audible and
+measurable: a placed source reaches the near ear ~700 µs earlier and is filtered
+by the shape of the head, which is what lets you point at it with your eyes shut.
+
+```ts
+import { AudioMixer, loadAudioClip } from "metis-native"
+
+// Mono only — a stereo file carries its own image and cannot be placed.
+const step = await loadAudioClip("sfx/footstep.wav", { forceMono: true })
+
+const mixer = new AudioMixer({ sampleRate: 48_000, channels: 2 })
+mixer.setListener({ position: [0, 0, 0], forward: [0, 0, -1], up: [0, 1, 0] })
+
+const voice = mixer.playSpatial(step, {
+  position: [3, 0, -2],   // right-handed, -Z forward, +Y up (same as glTF)
+  refDistance: 1,         // full gain within this radius, then 1/d
+  gain: 1, loop: false, rate: 1, startTime: 0,
+})
+
+mixer.setVoicePosition(voice, 4, 0, -1)   // per frame, as the emitter moves
+mixer.setListener({ position: cameraPos, forward: cameraFwd, up: cameraUp })
+```
+
+`stop`, `setVoiceGain`, `voiceTime`, `seekVoice` and `isVoiceActive` all work on
+a spatial voice. `pan` does not — position replaces it.
+
+**Requirements, each of which throws with the reason if unmet:** a mono clip, a
+stereo mixer, and a mixer rate of 44100 or 48000 (Steam Audio's default HRTF
+does not load at other rates).
+
+**The first `playSpatial` call builds the HRTF and is slow** — tens of
+milliseconds. Do it during loading, not when the first gunshot fires.
+`mixer.spatialActive` tells you whether it has happened.
+
+`mixer.spatialErrors` should stay `0`. Non-zero means Steam Audio failed
+mid-render and voices were dropped — the audio thread cannot throw, so this
+counter is the only evidence.
+
+> **Spatial audio needs `phonon.dll` next to the `.node`.**
+>
+> It is a load-time dependency: without it, `require("metis-native")` fails
+> outright with napi's misleading "Cannot find native binding" message.
+> `bun run build` places it automatically (`scripts/copy-phonon.mjs`), but it is
+> **not committed** — a fresh clone must build once. It also means shipping it
+> alongside your app.
 
 ---
 
