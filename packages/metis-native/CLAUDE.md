@@ -1398,22 +1398,37 @@ convention. It was settled by feeding known byte values through the decoder and
 reading the mapping off (symphonia gives exactly `(u - 128) / 128`), not by
 re-reading the spec. Do that again rather than reasoning about it.
 
-`audio-real-files.test.ts` is tier 2: real WAVs from `C:\Windows\Media`, at three
-different sample rates, encoded by someone with no interest in making these
-tests pass. It exists for the reason `gltf-samples.test.ts` does — the tier-1
+`audio-real-files.test.ts` is tier 2: a **CC0 MP3 committed to
+`tests/assets/`**, for the reason `gltf-samples.test.ts` exists — the tier-1
 writer and its assertions were written by one person in one afternoon, so a
-misreading of the format would be baked into both sides. It **skips** rather
-than fails when the files are absent (Linux, trimmed Windows images).
+misreading of the format would be baked into both sides. This file was made by
+an encoder that has never heard of this repo.
 
-**The gap that remains: no compressed codec is covered by any test.** FLAC, MP3,
-Vorbis, AAC and ALAC decode through symphonia, which has its own test suite for
-them — but *this crate's* handling of a lossy stream (encoder delay/padding,
-channel-count inference from the first decoded buffer, per-packet error
-recovery) is untested, because nothing here or on a stock Windows install can
-encode one and a real codec cannot be hand-authored. Closing it needs a few
-short files in `tests/assets/` from `ffmpeg`; the header comment in
-`audio-real-files.test.ts` says how, and warns to assert on pitch and level
-rather than exact samples.
+MP3 is deliberately the codec here, not a convenient WAV. It is lossy, so
+nothing round-trips sample-exactly, and it carries encoder delay and padding the
+decoder must trim — so it exercises the parts of `decode_source` that WAV cannot
+reach at all: the packet loop's tail handling, channel-count inference from the
+first decoded buffer, and the gapless trim. The assertion that earns its keep is
+**decoded frame count == the container's frame count** on a full decode; it
+fails if the loop drops the tail or trims delay inconsistently, and no
+level-based check would notice.
+
+**The first version of this file read WAVs out of `C:\Windows\Media`, and that
+was a mistake worth recording.** It passed, and it looked like real tier-2
+coverage — but it was Windows-only and *skipped* everywhere else, so on Linux
+the tier-2 layer silently did not exist while still appearing in the suite as
+green. A platform-conditional fixture is not a fixture. Committed assets cost
+repo size (5.4 MB here) and buy the same behaviour everywhere; take that trade.
+
+Assertions there are structural (frame counts, determinism, prefix stability) or
+statistical (`rms`, `peak`, per-channel difference), never exact samples. The
+per-channel one is load-bearing: a decoder that duplicated one channel into both
+passes every level check and fails only the "channels are not identical" test.
+
+Still uncovered: FLAC, Vorbis, AAC and ALAC. Symphonia tests its own decoders,
+so what is untested is this crate's handling of *those specific* streams — much
+narrower than before, since MP3 now covers the lossy shape. Adding one is a file
+in `tests/assets/` and a parameterised copy of this suite.
 
 ### Positional audio: deferred, and the seam it plugs into
 

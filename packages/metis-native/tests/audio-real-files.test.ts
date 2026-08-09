@@ -1,127 +1,208 @@
 /**
- * Tier 2: files this repo did not author.
+ * Tier 2: a real file this repo did not author, in a codec it cannot fake.
  *
  * `audio-decode.test.ts` builds its own WAVs, which makes its assertions exact
- * but leaves one gap that `gltf-samples.test.ts` exists to close for glTF: the
- * writer and the expectations were written by the same person on the same
- * afternoon, so a misreading of the format would be baked into both sides.
+ * but leaves the gap `gltf-samples.test.ts` exists to close for glTF: the
+ * writer and the expectations were written by one person in one afternoon, so a
+ * misreading of the format would be baked into both sides.
  *
- * Windows ships a set of real WAVs in `C:\Windows\Media`, encoded years ago by
- * someone with no interest in making these tests pass, at three different
- * sample rates. They are the cheapest available answer — no download, no
- * committed binary, no fixture generator.
+ * The fixture is `psychronic-road-to-nowhere-264422.mp3`, a CC0 track committed
+ * to `tests/assets/`. It closes two gaps at once:
  *
- * ## What is still missing, and how to fill it
+ *  - **A real encoder's output.** Nothing here made this file.
+ *  - **A compressed codec.** MP3 is the one that matters most: it is lossy, so
+ *    nothing round-trips sample-exactly, and it carries encoder delay and
+ *    padding the decoder has to trim. None of that can be hand-authored, and
+ *    none of it is reachable through the WAV fixtures.
  *
- * The compressed codecs — FLAC, MP3, Vorbis, AAC, ALAC — are **not covered by
- * any test**, because nothing in this repo or on a stock Windows install can
- * encode them, and a hand-written fixture is out of the question for a real
- * codec. Symphonia has its own extensive test suite for the decoders
- * themselves, so what is untested here is specifically *this crate's* handling
- * of them: whether `decode_source`'s packet loop, channel-count inference and
- * error recovery behave on a lossy stream with encoder delay and padding.
+ * This replaced an earlier version that read WAVs out of `C:\Windows\Media`.
+ * That worked, but only on Windows — everywhere else it skipped, so the tier-2
+ * layer silently did not exist on a platform this project also targets. A
+ * committed asset runs the same everywhere. The cost is 5.4 MB in the repo and
+ * the loss of the several-sample-rate coverage those files happened to give;
+ * `targetSampleRate` and the mixer's per-voice resampling cover rate conversion
+ * instead.
  *
- * To close it, put a few short encoded files in `tests/assets/` — `ffmpeg -i
- * tone.wav -c:a libmp3lame tone.mp3` and friends — and extend this file. The
- * assertions should be tolerant (lossy codecs do not round-trip sample-exactly,
- * and MP3 in particular adds encoder delay), so lean on `goertzel` for pitch
- * and `rms` for level rather than on exact samples.
+ * ## Assertion style
+ *
+ * Lossy, so no exact samples. Everything here is either structural (frame
+ * counts, channel counts, determinism, prefix stability) or statistical
+ * (`rms`, `peak`, per-channel comparison). That is not a weaker test, it is a
+ * different one: the failures it catches — a truncated packet loop, a dropped
+ * channel, a mis-trimmed delay — are all visible in those terms.
  */
 
-import { describe, expect, test } from "bun:test"
+import { beforeAll, describe, expect, test } from "bun:test"
 import { existsSync } from "node:fs"
+import { join } from "node:path"
 
-import { AudioMixer, inspectAudioFile, loadAudioClip } from "../index.js"
-import { peak, rms } from "./helpers/dsp.js"
+import { AudioClip, AudioMixer, inspectAudioFile, loadAudioClip } from "../index.js"
+import { maxAbsDiff, peak, rms, stereo } from "./helpers/dsp.js"
 
-const MEDIA = "C:/Windows/Media"
+const TRACK = join(import.meta.dir, "assets", "psychronic-road-to-nowhere-264422.mp3")
 
-/** Three real files, deliberately at three different sample rates. */
-const FILES = [
-  { name: "Alarm01.wav", sampleRate: 22_050 },
-  { name: "chimes.wav", sampleRate: 44_100 },
-  { name: "Windows Background.wav", sampleRate: 48_000 },
-]
+// The header's own numbers, pinned. If a decoder upgrade changes how delay and
+// padding are trimmed these move — which is exactly the kind of change someone
+// should have to look at rather than absorb silently.
+const RATE = 48_000
+const CHANNELS = 2
+const FRAMES = 8_449_920
 
-const available = FILES.filter((f) => existsSync(`${MEDIA}/${f.name}`))
+/** Ten seconds is plenty for content assertions and keeps the suite quick. */
+const SLICE_FRAMES = RATE * 10
 
-// Skipping rather than failing when the files are absent — on Linux, or a
-// trimmed Windows image, they simply are not there. A suite that goes red
-// because of the operating system teaches people to ignore red.
-const describeIfAvailable = available.length > 0 ? describe : describe.skip
+let slice: AudioClip
 
-describeIfAvailable("real-world WAV files", () => {
-  for (const file of available) {
-    const path = `${MEDIA}/${file.name}`
+beforeAll(async () => {
+  slice = await loadAudioClip(TRACK, { maxFrames: SLICE_FRAMES })
+})
 
-    test(`${file.name}: header and decode agree`, async () => {
-      const info = await inspectAudioFile(path)
-      const clip = await loadAudioClip(path)
+test("the fixture is committed", () => {
+  // A plain failure, not a skip. Unlike the Windows-media version this
+  // replaced, the file is in the repo — if it is missing, something is wrong
+  // with the checkout, not with the platform.
+  expect(existsSync(TRACK)).toBe(true)
+})
 
-      expect(info.container).toBe("wave")
-      expect(info.codec).toContain("pcm")
-      expect(info.sampleRate).toBe(file.sampleRate)
-      expect(clip.sampleRate).toBe(file.sampleRate)
-      expect(clip.channels).toBe(info.channels)
+describe("header", () => {
+  test("reports the container and codec without decoding", async () => {
+    const info = await inspectAudioFile(TRACK)
 
-      // The interesting assertion: the container's frame count and the number
-      // of frames actually decoded must match. They diverge when the packet
-      // loop mishandles a trailing partial packet, or when a chunk the reader
-      // skipped was counted as audio — neither of which any single-value check
-      // would notice.
-      expect(clip.frameCount).toBe(info.frameCount ?? -1)
-      // Both are optional in the type because a streamed container need not
-      // state a length; a RIFF file always does, so an absent one here is
-      // itself a failure worth catching rather than skipping past.
-      expect(info.duration).not.toBeNull()
-      expect(clip.duration).toBeCloseTo(info.duration ?? -1, 6)
-    })
-
-    test(`${file.name}: decodes to real audio, not silence`, async () => {
-      const clip = await loadAudioClip(path)
-      const samples = clip.getSamples()
-
-      expect(samples.length).toBe(clip.frameCount * clip.channels)
-      // A decoder that produced the right shape and no content — the failure
-      // mode an all-zero buffer sails through every structural check.
-      expect(peak(samples)).toBeGreaterThan(0.01)
-      expect(rms(samples)).toBeGreaterThan(0.001)
-      // And nothing pathological: no NaNs, nothing outside the format's range.
-      expect(peak(samples)).toBeLessThanOrEqual(1.0)
-      expect(samples.every((s) => Number.isFinite(s))).toBe(true)
-    })
-
-    test(`${file.name}: plays through a mixer at a different rate`, async () => {
-      const clip = await loadAudioClip(path)
-      // A 48 kHz mixer against a 22.05/44.1/48 kHz clip — the per-voice
-      // resampling path, on real content rather than a synthetic tone.
-      const mixer = new AudioMixer({ sampleRate: 48_000, channels: 2 })
-      const voice = mixer.play(clip)
-
-      const outFrames = Math.floor((clip.frameCount * 48_000) / clip.sampleRate)
-      const out = mixer.renderFrames(Math.min(outFrames, 48_000))
-
-      expect(peak(out)).toBeGreaterThan(0.005)
-      expect(out.every((s) => Number.isFinite(s))).toBe(true)
-      // Playback time must track wall-clock time, not frame count — that is
-      // what resampling is for, and getting it wrong makes long sounds drift.
-      expect(mixer.voiceTime(voice)).toBeCloseTo(Math.min(outFrames, 48_000) / 48_000, 3)
-    })
-  }
-
-  test("load-time resampling reaches a common rate", async () => {
-    const clips = await Promise.all(
-      available.map((f) => loadAudioClip(`${MEDIA}/${f.name}`, { targetSampleRate: 48_000 })),
-    )
-    for (const clip of clips) {
-      expect(clip.sampleRate).toBe(48_000)
-      expect(peak(clip.getSamples())).toBeGreaterThan(0.01)
-    }
+    expect(info.container).toBe("mp3")
+    expect(info.codec).toBe("mp3")
+    expect(info.sampleRate).toBe(RATE)
+    expect(info.channels).toBe(CHANNELS)
+    expect(info.frameCount).toBe(FRAMES)
+    expect(info.duration).toBeCloseTo(FRAMES / RATE, 3)
   })
 
-  test("forceMono collapses a real stereo file", async () => {
-    const clip = await loadAudioClip(`${MEDIA}/${available[0]!.name}`, { forceMono: true })
-    expect(clip.channels).toBe(1)
-    expect(peak(clip.getSamples())).toBeGreaterThan(0.005)
+  test("a lossy codec reports no bits-per-sample", async () => {
+    const info = await inspectAudioFile(TRACK)
+    // Pins why `bitsPerSample` is optional: for MP3 the notion does not apply,
+    // and inventing a number would be worse than omitting one. The WAV tests
+    // pin the other half (16, for pcm_s16le).
+    expect(info.bitsPerSample ?? null).toBeNull()
+  })
+})
+
+describe("full decode", () => {
+  test("decodes exactly as many frames as the header claims", async () => {
+    // The strongest structural assertion available on a lossy stream. It fails
+    // if the packet loop drops the tail, if encoder delay/padding is trimmed
+    // inconsistently with the container's count, or if a mid-stream decode
+    // error quietly ends the loop early.
+    //
+    // Deliberately does not call getSamples(): the full track is ~68 MB as f32,
+    // and copying it across the boundary to look at nothing would be the
+    // slowest thing in the suite.
+    const full = await loadAudioClip(TRACK)
+    expect(full.frameCount).toBe(FRAMES)
+    expect(full.sampleRate).toBe(RATE)
+    expect(full.channels).toBe(CHANNELS)
+    expect(full.duration).toBeCloseTo(FRAMES / RATE, 3)
+  }, 60_000)
+
+  test("decoding twice gives identical samples", async () => {
+    const a = await loadAudioClip(TRACK, { maxFrames: RATE })
+    const b = await loadAudioClip(TRACK, { maxFrames: RATE })
+    // Determinism is not free. A packet loop that read past a buffer, or reused
+    // a scratch vector without clearing it, would produce plausible audio that
+    // differed run to run.
+    expect(maxAbsDiff(a.getSamples(), b.getSamples())).toBe(0)
+  })
+
+  test("a capped decode is a true prefix of a longer one", async () => {
+    const short = await loadAudioClip(TRACK, { maxFrames: RATE })
+    const shortSamples = short.getSamples()
+    expect(short.frameCount).toBe(RATE)
+
+    // Same bytes at the same positions. Catches a cap that lands mid-packet and
+    // shifts everything after it — which would still produce the right count.
+    const prefix = slice.getSamples().subarray(0, shortSamples.length)
+    expect(maxAbsDiff(shortSamples, prefix)).toBe(0)
+  })
+})
+
+describe("content", () => {
+  test("decodes to real audio, not silence", () => {
+    const samples = slice.getSamples()
+    expect(samples.length).toBe(SLICE_FRAMES * CHANNELS)
+
+    // The track fades in — the first second peaks around 0.03 — so the level
+    // assertions look at the ten-second window rather than the opening, and sit
+    // well below the real level so a re-encode of the fixture doesn't break
+    // them.
+    expect(peak(samples)).toBeGreaterThan(0.05)
+    expect(rms(samples)).toBeGreaterThan(0.005)
+
+    // In range, and no NaN from an under-read.
+    expect(peak(samples)).toBeLessThanOrEqual(1.0)
+    expect(samples.every((s) => Number.isFinite(s))).toBe(true)
+  })
+
+  test("the two channels carry a real stereo image", () => {
+    const [l, r] = stereo(slice.getSamples())
+
+    expect(rms(l)).toBeGreaterThan(0.005)
+    expect(rms(r)).toBeGreaterThan(0.005)
+    // Both channels alive but *not* identical. A decoder that duplicated one
+    // channel into both, or read the same plane twice while de-interleaving,
+    // passes every level check above and fails only this one.
+    expect(maxAbsDiff(l, r)).toBeGreaterThan(0.001)
+  })
+})
+
+describe("load options on real content", () => {
+  test("forceMono collapses to one channel without losing level", async () => {
+    const mono = await loadAudioClip(TRACK, { forceMono: true, maxFrames: SLICE_FRAMES })
+    expect(mono.channels).toBe(1)
+    expect(mono.frameCount).toBe(SLICE_FRAMES)
+
+    // Averaging two correlated channels keeps roughly the original level.
+    // Halving would mean the downmix divided by the wrong count; doubling would
+    // mean it summed without dividing at all.
+    const stereoRms = rms(slice.getSamples())
+    const monoRms = rms(mono.getSamples())
+    expect(monoRms).toBeGreaterThan(stereoRms * 0.5)
+    expect(monoRms).toBeLessThan(stereoRms * 1.5)
+  })
+
+  test("targetSampleRate resamples and preserves duration", async () => {
+    const down = await loadAudioClip(TRACK, {
+      targetSampleRate: 24_000,
+      maxFrames: SLICE_FRAMES,
+    })
+    expect(down.sampleRate).toBe(24_000)
+    // maxFrames caps the decode *before* resampling, so ten seconds of source
+    // becomes ten seconds at the new rate — half the frames, same duration.
+    expect(down.frameCount).toBe(SLICE_FRAMES / 2)
+    expect(down.duration).toBeCloseTo(10, 3)
+    expect(peak(down.getSamples())).toBeGreaterThan(0.05)
+  })
+})
+
+describe("playback through the mixer", () => {
+  test("plays real compressed content at the mixer's own rate", () => {
+    const mixer = new AudioMixer({ sampleRate: RATE, channels: 2 })
+    const voice = mixer.play(slice)
+
+    const out = mixer.renderFrames(RATE)
+    expect(peak(out)).toBeGreaterThan(0.01)
+    expect(out.every((s) => Number.isFinite(s))).toBe(true)
+    expect(mixer.voiceTime(voice)).toBeCloseTo(1.0, 3)
+  })
+
+  test("plays through the per-voice resampler at a mismatched rate", () => {
+    // A 48 kHz clip in a 44.1 kHz mixer — the fractional-step path, on real
+    // content rather than a synthetic tone.
+    const mixer = new AudioMixer({ sampleRate: 44_100, channels: 2 })
+    const voice = mixer.play(slice)
+
+    const out = mixer.renderFrames(44_100)
+    expect(peak(out)).toBeGreaterThan(0.01)
+    expect(out.every((s) => Number.isFinite(s))).toBe(true)
+    // One second of output is one second of wall clock despite the rate
+    // mismatch — that is what the resampling is for.
+    expect(mixer.voiceTime(voice)).toBeCloseTo(1.0, 2)
   })
 })
