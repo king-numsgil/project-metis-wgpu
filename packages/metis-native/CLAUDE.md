@@ -1544,10 +1544,24 @@ Without it beside the binary, `require()` fails outright — and napi reports it
 as its generic "Cannot find native binding … npm has a bug related to optional
 dependencies" message, which points nowhere near the cause. `scripts/copy-phonon.mjs`
 runs in `postbuild` to place it, and exists chiefly so that confusion does not
-recur. It is currently **gitignored**, so a fresh clone must build once before
-the addon loads — a deliberate departure from this repo's "commit the binary so
-it just works" habit, taken because a 51 MB blob per platform is permanent in
-git history and this repo has already paid for one `git filter-branch`.
+recur. It is **gitignored**, so a fresh clone must build once before the addon loads — a
+deliberate departure from this repo's "commit the binary so it just works"
+habit, taken because a 51 MB blob per platform is permanent in git history and
+this repo has already paid for one `git filter-branch`.
+
+**Not for licensing reasons**, which is the intuitive guess and appears to be
+wrong. The release zip ships no licence for Steam Audio itself, only a
+`THIRDPARTY.md`; the most restrictive term in it (Intel IPP's Simplified
+Software License) *permits* binary redistribution, conditioned on reproducing
+the notice and terms in the accompanying documentation, and forbidding
+modification or reverse-engineering. The crate downloads at build time for a
+duller reason: crates.io caps package size, and vendoring 51 MB across ten
+platform targets is impractical.
+
+**The shipping consequence is attribution, not prohibition.** An application
+distributing `phonon.dll` should carry Steam Audio's `THIRDPARTY.md` alongside
+it. Verify against the zip for the version actually shipped rather than trusting
+this note — it records what one version's files said, not legal advice.
 
 **Panning and HRTF are different features, not two settings of one.**
 `Voice::pan_gains` still handles `play`; `playSpatial` bypasses it entirely.
