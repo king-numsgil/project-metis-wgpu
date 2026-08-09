@@ -1346,7 +1346,8 @@ thread. Pinned by a test that drops the handle and forces a GC.
 ### `examples/` exists for what the suite structurally cannot check
 
 `examples/audio-player.ts` (`bun run demo:audio`) plays the committed track with
-arrow-key volume and seeking. It is a new directory rather than another script
+arrow-key volume and seeking, and walks a looping footstep sound in a circle
+around the listener through the HRTF. It is a new directory rather than another script
 in `tests/`, because the things in `tests/` that aren't tests — `bench.ts`,
 `adapter-report.ts`, `audio-bench.ts` — are all non-interactive diagnostics, and
 an interactive demo filed among them would be found by nobody looking for a
@@ -1362,6 +1363,14 @@ it drifts, the device is not being fed at the rate it asked for.
 If it stutters, suspect the callback's critical section in `mixer.rs` before
 suspecting the mix — the offline tests have already pinned the arithmetic
 sample-exactly, so a fault there would have failed them first.
+
+The spatial half checks something the suite structurally cannot reach at all.
+`audio-spatial.test.ts` proves the interaural time difference is ~690 us and
+mirrors correctly, which is the *physics*; whether a circling source is heard as
+a circle rather than as a volume knob sweeping is a perceptual question, and only
+ears answer it. The demo also degrades rather than dying if `phonon.dll` is
+absent — the music still plays and the banner says why — because that is the
+expected state of a fresh clone.
 
 ### `AudioFormatInfo.format` is a string on purpose
 

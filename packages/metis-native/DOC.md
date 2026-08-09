@@ -1194,9 +1194,14 @@ bun run demo:audio                              # the committed CC0 track
 bun run examples/audio-player.ts my-track.flac  # or your own
 ```
 
+Plays the track *and* walks a looping footstep sound in a circle around the
+listener with `playSpatial`, so panned and placed audio are audible side by side.
+
 Arrow keys: up/down volume, left/right seek 10 s; space pauses, R restarts,
-Escape quits. It opens a small window purely to receive keyboard focus — **keep
-that window focused** or the keys go elsewhere — and prints its transport to the
+S toggles the footsteps, Escape quits. The transport controls act on the music
+only — the footsteps are a positioned loop, not a track. It opens a small window
+purely to receive keyboard focus — **keep that window focused** or the keys go
+elsewhere — and prints its transport, plus where the steps currently are, to the
 terminal.
 
 This covers the one thing the suite cannot: whether a *real* driver at a real
