@@ -12,7 +12,7 @@
 // against files that were not written to make these tests pass.
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 
 /** A scratch directory that lives for the process; fixtures are written into it. */
 export const FIXTURE_DIR = mkdtempSync(join(tmpdir(), "metis-gltf-"));
@@ -61,9 +61,24 @@ export function writeGltf(json: Record<string, unknown>, bin?: Uint8Array): stri
     return path;
 }
 
-/** The `uri` a `writeGltf` fixture's buffer should use to find its `.bin`. */
+/**
+ * The `uri` a `writeGltf`/`triangleGltf` fixture's buffer carries — i.e. the
+ * bare filename, matching what those functions actually write into the JSON
+ * (`{uri: "fixture-N.bin"}`). Reconstructed from the returned path so tests
+ * don't have to know the fixture counter.
+ *
+ * **Must use `basename`, not `split("/")`.** It did the latter, which is
+ * POSIX-only: `join()` produces backslashes on Windows, nothing splits, and
+ * this returned the whole absolute path with the extension swapped. The two
+ * tests that use it — the `inspectGltf` resource listing and the URI-matched
+ * `resourceOverrides` case — then failed on Windows while passing on Linux,
+ * and failed in a way that pointed at the *importer*: "expected an absolute
+ * path, got `fixture-0.bin`" reads as the importer under-resolving the URI,
+ * when in fact reporting the URI verbatim is exactly the contract those tests
+ * exist to pin.
+ */
 export function binUriFor(gltfPath: string): string {
-    return `${gltfPath.split("/").pop()!.replace(/\.gltf$/, "")}.bin`;
+    return `${basename(gltfPath).replace(/\.gltf$/, "")}.bin`;
 }
 
 /**

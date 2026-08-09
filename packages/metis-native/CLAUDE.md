@@ -1231,6 +1231,24 @@ inverse bind matrices), `SimpleSparseAccessor` (a sparse accessor and a `data:`
 URI). **The file skips rather than fails when the download is unreachable** — a
 suite that goes red because GitHub is slow teaches people to ignore red.
 
+**A POSIX-only path split in a test helper made two of these fail on Windows
+only, and blamed the wrong component.** `binUriFor` used
+`gltfPath.split("/").pop()`, which finds no separator in a `join()`-produced
+Windows path and therefore returned the whole absolute path. The two tests that
+use it — the `inspectGltf` resource listing and the URI-matched
+`resourceOverrides` case — then reported "expected an absolute path, received
+`fixture-0.bin`", which reads as *the importer failing to resolve a URI*. The
+importer was right: reporting the URI verbatim is the documented contract on
+`GltfResource::uri`, and is precisely what those tests exist to pin. Use
+`basename()` in test helpers, never a hand-rolled split.
+
+Worth knowing about that pair, established by mutation while fixing it: making
+`inspectGltf` report the *resolved* path instead of the verbatim URI fails only
+the listing test — the override test still passes, because it exercises the
+matcher rather than the manifest. The two are complementary, not redundant: one
+pins "what is reported", the other pins "what is matched", and together they pin
+that those are the same string. Don't drop either as duplicated coverage.
+
 One expectation there is worth not "fixing": DamagedHelmet has ~46 000 indices
 and ~14 500 vertices, so its index buffer is correctly `Uint16`. The widening
 rule follows the *vertex range*, not the index count, and that test is where
